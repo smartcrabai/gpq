@@ -76,6 +76,10 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [postgres, e2e, comfy, lifecycle, objectstore]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -89,16 +93,11 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      # These suites start their own PostgreSQL container, so they must not
-      # interleave with each other.
-      - name: Run integration and end-to-end tests
+      # Each matrix runner owns its PostgreSQL container, so suites run in
+      # parallel without sharing state.
+      - name: Run integration suite
         shell: bash
-        run: |
-          cargo test -p gpq-remote --test postgres -- --test-threads=1
-          cargo test -p gpq-remote --test e2e -- --test-threads=1
-          cargo test -p gpq-remote --test comfy -- --test-threads=1
-          cargo test -p gpq-remote --test lifecycle -- --test-threads=1
-          cargo test -p gpq-remote --test objectstore -- --test-threads=1
+        run: cargo test -p gpq-remote --test ${{ matrix.suite }} -- --test-threads=1
 
   clippy:
     runs-on: ubuntu-latest

@@ -1,0 +1,150 @@
+edition = "2024";
+
+// Catalog API (ADR 0012): Workers register immutable Model Versions by content
+// hash; Tenant APIs register immutable Workflow graphs and map aliases. Alias
+// deletion or reassignment never mutates versions or past Generations.
+package gpq.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "gpq/v1/common.proto";
+
+option features.field_presence = IMPLICIT;
+
+// Exact model material advertised by capable Workers.
+message ModelVersion {
+  string content_sha256 = 1;
+  Modality modality = 2;
+  google.protobuf.Duration execution_timeout = 3;
+  uint64 estimated_vram_bytes = 4;
+  // Workers that currently advertise this version and hold an online session.
+  uint32 online_worker_count = 5;
+  google.protobuf.Timestamp first_seen_at = 6;
+}
+
+// The minimal output and execution manifest Remote stores for a Workflow
+// Version (ADR 0007).
+message WorkflowManifest {
+  string output_node = 1;
+  string output_name = 2;
+  MediaKind artifact_kind = 3;
+  string artifact_mime = 4;
+  // Content hashes of Model Versions the graph loads.
+  repeated string required_model_sha256 = 5;
+  // Custom-node package name to exact installed version (ADR 0018).
+  map<string, string> required_custom_nodes = 6;
+  uint64 estimated_vram_bytes = 7;
+  google.protobuf.Duration execution_timeout = 8;
+}
+
+message WorkflowVersion {
+  string content_sha256 = 1;
+  Modality modality = 2;
+  WorkflowManifest manifest = 3;
+  google.protobuf.Timestamp created_at = 4;
+  // Whether an online Worker satisfies the manifest right now.
+  bool available = 5;
+}
+
+message ModelAlias {
+  string alias = 1;
+  string content_sha256 = 2;
+  Modality modality = 3;
+  bool available = 4;
+}
+
+message WorkflowAlias {
+  string alias = 1;
+  string content_sha256 = 2;
+  Modality modality = 3;
+  bool available = 4;
+}
+
+// A Device Pool's Active Runtime and Execution Slots as last reported.
+message PoolSummary {
+  string pool_id = 1;
+  BackendKind backend_kind = 2;
+  string backend_version = 3;
+  uint32 total_slots = 4;
+  uint32 free_slots = 5;
+  string resident_model_sha256 = 6;
+  uint64 accelerator_memory_bytes = 7;
+}
+
+message WorkerSummary {
+  string worker_id = 1;
+  string name = 2;
+  bool online = 3;
+  string worker_version = 4;
+  google.protobuf.Timestamp last_seen_at = 5;
+  repeated PoolSummary pools = 6;
+  repeated string model_sha256 = 7;
+  map<string, string> custom_nodes = 8;
+}
+
+message RegisterWorkflowVersionRequest {
+  // ComfyUI API-format graph, stored opaquely (ADR 0007).
+  google.protobuf.Struct graph = 1;
+  WorkflowManifest manifest = 2;
+  Modality modality = 3;
+}
+
+message RegisterWorkflowVersionResponse {
+  WorkflowVersion version = 1;
+}
+
+message SetModelAliasRequest {
+  string alias = 1;
+  string content_sha256 = 2;
+}
+
+message SetModelAliasResponse {
+  ModelAlias alias = 1;
+}
+
+message SetWorkflowAliasRequest {
+  string alias = 1;
+  string content_sha256 = 2;
+}
+
+message SetWorkflowAliasResponse {
+  WorkflowAlias alias = 1;
+}
+
+message DeleteAliasRequest {
+  string alias = 1;
+}
+
+message DeleteAliasResponse {}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated ModelAlias aliases = 1;
+  repeated ModelVersion versions = 2;
+}
+
+message ListWorkflowsRequest {}
+
+message ListWorkflowsResponse {
+  repeated WorkflowAlias aliases = 1;
+  repeated WorkflowVersion versions = 2;
+}
+
+message ListWorkersRequest {}
+
+message ListWorkersResponse {
+  repeated WorkerSummary workers = 1;
+}
+
+service CatalogService {
+  rpc RegisterWorkflowVersion(RegisterWorkflowVersionRequest) returns (RegisterWorkflowVersionResponse);
+  rpc SetModelAlias(SetModelAliasRequest) returns (SetModelAliasResponse);
+  rpc SetWorkflowAlias(SetWorkflowAliasRequest) returns (SetWorkflowAliasResponse);
+  rpc DeleteModelAlias(DeleteAliasRequest) returns (DeleteAliasResponse);
+  rpc DeleteWorkflowAlias(DeleteAliasRequest) returns (DeleteAliasResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc ListWorkflows(ListWorkflowsRequest) returns (ListWorkflowsResponse);
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+}

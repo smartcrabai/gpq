@@ -1,0 +1,3 @@
+# Pin Model and Workflow Versions at admission
+
+Workers automatically register immutable Model Versions by content hash and contribute their availability and capabilities; Tenant APIs map logical Model aliases to those versions. Tenant APIs likewise register immutable Workflow graphs and manifests and map Workflow aliases, without requiring Worker-side Workflow installation. Generation admission resolves aliases to hashes, and every retry must use those exact versions on a compatible Worker. Alias deletion or reassignment never mutates versions or past Generations; OpenAI model listing exposes aliases, while Native APIs expose online availability and detailed capabilities.

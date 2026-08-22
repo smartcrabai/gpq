@@ -1,0 +1,3 @@
+# Trust Remote and enforce database tenant isolation
+
+Remote is a trusted plaintext data processor: traffic uses TLS and storage uses platform encryption, but prompts and retained results are not end-to-end encrypted. Tenant-owned rows share one PostgreSQL schema with mandatory `tenant_id`, composite tenant-safe references, and forced row-level security; public requests, Worker sessions, scheduling, expiry, and cleanup run as tenant-scoped transactions under a non-owner role without `BYPASSRLS`. Migration ownership and administration use separate credentials. This preserves OpenAI client compatibility while making a missing application filter insufficient to cross Tenant boundaries.

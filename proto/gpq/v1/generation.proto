@@ -1,0 +1,138 @@
+edition = "2024";
+
+// Native Generation API (ADR 0006): submit, status, result, and event streaming
+// that survive disconnection. Served over the Connect protocol with binary or
+// JSON codecs (ADR 0004) and authenticated with the Tenant Master Key.
+package gpq.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "gpq/v1/common.proto";
+
+option features.field_presence = IMPLICIT;
+
+// One tenant request for one AI-generated result.
+message Generation {
+  string generation_id = 1;
+  GenerationState state = 2;
+  Modality modality = 3;
+  // The alias the caller named.
+  string alias = 4;
+  // Immutable version hash the alias resolved to at admission (ADR 0012).
+  string version_sha256 = 5;
+  uint32 priority = 6;
+  uint64 seed = 7;
+  google.protobuf.Duration execution_timeout = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  uint32 attempt_count = 11;
+  // Final LLM text, retained indefinitely (ADR 0008).
+  string output_text = 12;
+  repeated ArtifactRef output_artifacts = 13;
+  Usage usage = 14;
+  Failure failure = 15;
+  Progress latest_progress = 16;
+}
+
+message SubmitRequest {
+  // Exactly one alias; modality is derived from the resolved version (ADR 0006).
+  oneof target {
+    string model_alias = 1;
+    string workflow_alias = 2;
+  }
+  // Opaque backend-shaped payload; no universal parameter schema (ADR 0007).
+  google.protobuf.Struct parameters = 3;
+  repeated string input_artifact_ids = 4;
+  ArtifactPlacement output_placement = 5;
+  // Zero through nine; omitted means the Tenant default.
+  uint32 priority = 6;
+  uint64 seed = 7 [features.field_presence = EXPLICIT];
+  // May only shorten the resolved timeout (ADR 0003).
+  google.protobuf.Duration execution_timeout = 8 [features.field_presence = EXPLICIT];
+}
+
+message SubmitResponse {
+  Generation generation = 1;
+}
+
+message GetGenerationRequest {
+  string generation_id = 1;
+}
+
+message GetGenerationResponse {
+  Generation generation = 1;
+}
+
+message CancelGenerationRequest {
+  string generation_id = 1;
+}
+
+message CancelGenerationResponse {
+  Generation generation = 1;
+}
+
+message ListGenerationsRequest {
+  uint32 page_size = 1;
+  string page_token = 2;
+  GenerationState state = 3;
+}
+
+message ListGenerationsResponse {
+  repeated Generation generations = 1;
+  string next_page_token = 2;
+}
+
+message WatchGenerationRequest {
+  string generation_id = 1;
+}
+
+// A reconnected stream starts with a snapshot, then live events; token deltas
+// are never replayed and any gap is explicit (ADR 0006).
+message GenerationEvent {
+  google.protobuf.Timestamp emitted_at = 1;
+  oneof event {
+    Generation snapshot = 2;
+    StateChanged state_changed = 3;
+    Progress progress = 4;
+    TokenDelta token_delta = 5;
+    Discontinuity discontinuity = 6;
+  }
+}
+
+message StateChanged {
+  GenerationState state = 1;
+  uint32 attempt_count = 2;
+  Failure failure = 3;
+}
+
+message TokenDelta {
+  string text = 1;
+}
+
+// Emitted when live events were dropped, e.g. across a reconnect.
+message Discontinuity {
+  string reason = 1;
+}
+
+// Native input Artifacts use S3-compatible ephemeral placement so queued work
+// can move between Workers (ADR 0008); Remote alone holds S3 credentials and
+// issues object-scoped presigned URLs.
+message CreateInputArtifactRequest {
+  ArtifactManifest manifest = 1;
+}
+
+message CreateInputArtifactResponse {
+  string artifact_id = 1;
+  string upload_url = 2;
+  google.protobuf.Timestamp upload_url_expires_at = 3;
+}
+
+service GenerationService {
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+  rpc GetGeneration(GetGenerationRequest) returns (GetGenerationResponse);
+  rpc CancelGeneration(CancelGenerationRequest) returns (CancelGenerationResponse);
+  rpc ListGenerations(ListGenerationsRequest) returns (ListGenerationsResponse);
+  rpc WatchGeneration(WatchGenerationRequest) returns (stream GenerationEvent);
+  rpc CreateInputArtifact(CreateInputArtifactRequest) returns (CreateInputArtifactResponse);
+}

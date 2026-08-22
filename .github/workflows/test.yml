@@ -1,0 +1,88 @@
+name: Test
+
+on:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The database-backed suites provision their own PostgreSQL through
+    # testcontainers, so this job needs only the runner's Docker daemon.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Protobuf Edition 2024 schemas need protoc 33 or newer (ADR 0004).
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+
+      # Buf lints and compares schemas; it never generates code (ADR 0004).
+      - name: Lint protobuf schemas
+        shell: bash
+        run: buf lint
+
+      - name: Check protobuf breaking changes
+        shell: bash
+        run: buf breaking --against "https://github.com/${{ github.repository }}.git#branch=main"
+
+      - name: Install taplo
+        shell: bash
+        run: |
+          if ! command -v taplo &> /dev/null; then
+            curl -fsSL https://github.com/tamasfe/taplo/releases/latest/download/taplo-linux-x86_64.gz \
+              | gzip -d - | install -m 755 /dev/stdin /usr/local/bin/taplo
+          fi
+
+      - name: Lint Cargo manifests
+        shell: bash
+        run: taplo lint Cargo.toml crates/*/Cargo.toml
+
+      - name: Check Cargo manifest formatting
+        shell: bash
+        run: taplo fmt --check --option reorder_keys=true Cargo.toml crates/*/Cargo.toml
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        shell: bash
+        run: cargo fmt -- --check
+
+      - name: Run cargo check
+        shell: bash
+        run: cargo check --all-features
+
+      # Unit tests first: they need no container, so a failure there is not
+      # masked by infrastructure problems.
+      - name: Run unit tests
+        shell: bash
+        run: cargo test --all-features --bins --lib
+
+      - name: Build binaries for the end-to-end suite
+        shell: bash
+        run: cargo build --workspace --bins
+
+      # These suites start their own PostgreSQL container via testcontainers,
+      # so they must not interleave with each other.
+      - name: Run integration and end-to-end tests
+        shell: bash
+        run: |
+          cargo test -p gpq-remote --test postgres -- --test-threads=1
+          cargo test -p gpq-remote --test e2e -- --test-threads=1
+          cargo test -p gpq-remote --test comfy -- --test-threads=1
+          cargo test -p gpq-remote --test lifecycle -- --test-threads=1
+          cargo test -p gpq-remote --test objectstore -- --test-threads=1
+
+      - name: Run clippy
+        shell: bash
+        run: cargo clippy --all-targets --all-features -- -D warnings

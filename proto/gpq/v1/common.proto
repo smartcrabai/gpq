@@ -1,0 +1,140 @@
+edition = "2024";
+
+// Vocabulary shared by the Native, Catalog, Tenant, and Worker services.
+// ADR 0004 pins Protobuf Edition 2024 schemas; removed fields must reserve
+// their names and numbers, and breaking changes move to a new major package.
+package gpq.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option features.field_presence = IMPLICIT;
+
+// Generation lifecycle (ADR 0003).
+enum GenerationState {
+  GENERATION_STATE_UNSPECIFIED = 0;
+  GENERATION_STATE_QUEUED = 1;
+  GENERATION_STATE_RUNNING = 2;
+  GENERATION_STATE_CANCELLING = 3;
+  GENERATION_STATE_SUCCEEDED = 4;
+  GENERATION_STATE_FAILED = 5;
+  GENERATION_STATE_CANCELLED = 6;
+  GENERATION_STATE_EXPIRED = 7;
+}
+
+// Attempt lifecycle (ADR 0003).
+enum AttemptState {
+  ATTEMPT_STATE_UNSPECIFIED = 0;
+  ATTEMPT_STATE_LEASED = 1;
+  ATTEMPT_STATE_RUNNING = 2;
+  ATTEMPT_STATE_SUCCEEDED = 3;
+  ATTEMPT_STATE_FAILED = 4;
+  ATTEMPT_STATE_CANCELLED = 5;
+  ATTEMPT_STATE_LEASE_EXPIRED = 6;
+}
+
+// Artifact lifecycle (ADR 0008).
+enum ArtifactState {
+  ARTIFACT_STATE_UNSPECIFIED = 0;
+  ARTIFACT_STATE_PENDING = 1;
+  ARTIFACT_STATE_AVAILABLE = 2;
+  ARTIFACT_STATE_DELIVERING = 3;
+  ARTIFACT_STATE_CONSUMED = 4;
+  ARTIFACT_STATE_EXPIRED = 5;
+  ARTIFACT_STATE_LOST = 6;
+}
+
+// Derived after alias resolution; never supplied by callers (ADR 0006).
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  MODALITY_LLM = 1;
+  MODALITY_IMAGE = 2;
+  MODALITY_VIDEO = 3;
+  MODALITY_MUSIC = 4;
+}
+
+// Runtime kind occupying a Device Pool (ADR 0005).
+enum BackendKind {
+  BACKEND_KIND_UNSPECIFIED = 0;
+  BACKEND_KIND_LLAMA_CPP = 1;
+  BACKEND_KIND_COMFYUI = 2;
+}
+
+// Coarse Artifact classification.
+enum MediaKind {
+  MEDIA_KIND_UNSPECIFIED = 0;
+  MEDIA_KIND_IMAGE = 1;
+  MEDIA_KIND_VIDEO = 2;
+  MEDIA_KIND_AUDIO = 3;
+  MEDIA_KIND_TEXT = 4;
+  MEDIA_KIND_BINARY = 5;
+}
+
+// Where Artifact bytes live (ADR 0008).
+enum ArtifactPlacement {
+  ARTIFACT_PLACEMENT_UNSPECIFIED = 0;
+  ARTIFACT_PLACEMENT_OBJECT_STORE = 1;
+  ARTIFACT_PLACEMENT_WORKER_LOCAL = 2;
+  ARTIFACT_PLACEMENT_INLINE_RELAY = 3;
+}
+
+// Normalized backend failure causes (ADR 0003). Remote applies its retry policy
+// from this enum and never parses backend text.
+enum FailureKind {
+  FAILURE_KIND_UNSPECIFIED = 0;
+  FAILURE_KIND_INVALID_INPUT = 1;
+  FAILURE_KIND_UNSUPPORTED_CAPABILITY = 2;
+  FAILURE_KIND_MODEL_UNAVAILABLE = 3;
+  FAILURE_KIND_OUT_OF_MEMORY = 4;
+  FAILURE_KIND_BACKEND_CRASHED = 5;
+  FAILURE_KIND_EXECUTION_TIMED_OUT = 6;
+  FAILURE_KIND_CANCELLED = 7;
+  FAILURE_KIND_TRANSFER_FAILED = 8;
+  FAILURE_KIND_INTERNAL = 9;
+  FAILURE_KIND_WORKER_LOST = 10;
+  FAILURE_KIND_LEASE_EXPIRED = 11;
+}
+
+// The immutable description of an Artifact, fixed before transfer (ADR 0008).
+message ArtifactManifest {
+  uint64 size_bytes = 1;
+  // Lowercase hex SHA-256.
+  string digest_sha256 = 2;
+  MediaKind kind = 3;
+  string mime_type = 4;
+}
+
+// A referenced Artifact and where its bytes live.
+message ArtifactRef {
+  string artifact_id = 1;
+  ArtifactManifest manifest = 2;
+  ArtifactPlacement placement = 3;
+  ArtifactState state = 4;
+  // One-shot download path served by Remote over HTTP (ADR 0006).
+  string download_path = 5;
+}
+
+// Token accounting retained indefinitely for LLM work (ADR 0008).
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+  uint32 total_tokens = 3;
+}
+
+// A normalized failure plus diagnostic detail.
+message Failure {
+  FailureKind kind = 1;
+  // Raw backend text; diagnostic only.
+  string message = 2;
+  // The Worker's hint. Remote records it but does not obey it.
+  bool worker_retry_hint = 3;
+}
+
+// The latest progress snapshot of an Attempt (ADR 0008 retains only the latest).
+message Progress {
+  // 0.0 through 1.0 when the backend reports a fraction.
+  double fraction = 1;
+  string stage = 2;
+  uint32 step = 3;
+  uint32 total_steps = 4;
+  google.protobuf.Timestamp observed_at = 5;
+}

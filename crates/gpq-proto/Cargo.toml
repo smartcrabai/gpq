@@ -1,0 +1,29 @@
+[package]
+description = "Protobuf Edition 2024 schemas and generated Connect/gRPC stubs for gpq"
+edition.workspace = true
+license.workspace = true
+name = "gpq-proto"
+repository.workspace = true
+version.workspace = true
+
+[package.metadata.dist]
+# ADR 0020: cargo-dist ships only the Worker binary.
+dist = false
+
+[dependencies]
+buffa.workspace = true
+buffa-types.workspace = true
+connectrpc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+connectrpc-build.workspace = true
+# Generated code is not hand-maintained: it carries its own `#[allow]`
+# attributes and does not follow the workspace style lints (ADR 0004 keeps
+# code generation in build.rs rather than checking output in).
+[lints.clippy]
+allow_attributes = "allow"
+dbg_macro = "deny"
+expect_used = "deny"
+unwrap_used = "deny"

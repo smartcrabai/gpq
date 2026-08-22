@@ -1,0 +1,42 @@
+edition = "2024";
+
+// Tenant settings API (ADR 0006). Queue age, capacity, Artifact limits, timeout
+// ceilings, and default priority are readable and mutable with the Tenant
+// Master Key; credential and Tenant lifecycle stay in local administration
+// commands (ADR 0009).
+package gpq.v1;
+
+import "google/protobuf/duration.proto";
+
+option features.field_presence = IMPLICIT;
+
+message TenantSettings {
+  // Starvation guard for the utilization-first scheduler (ADR 0002).
+  google.protobuf.Duration maximum_queue_age = 1;
+  uint32 max_queued_generations = 2;
+  uint64 max_input_artifact_bytes = 3;
+  uint64 max_output_artifact_bytes = 4;
+  google.protobuf.Duration execution_timeout_ceiling = 5;
+  uint32 default_priority = 6;
+}
+
+message GetTenantSettingsRequest {}
+
+message GetTenantSettingsResponse {
+  TenantSettings settings = 1;
+}
+
+// Only the fields named in `update_mask` change; an empty mask replaces all.
+message UpdateTenantSettingsRequest {
+  TenantSettings settings = 1;
+  repeated string update_mask = 2;
+}
+
+message UpdateTenantSettingsResponse {
+  TenantSettings settings = 1;
+}
+
+service TenantService {
+  rpc GetTenantSettings(GetTenantSettingsRequest) returns (GetTenantSettingsResponse);
+  rpc UpdateTenantSettings(UpdateTenantSettingsRequest) returns (UpdateTenantSettingsResponse);
+}

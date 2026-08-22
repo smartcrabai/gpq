@@ -1,0 +1,291 @@
+edition = "2024";
+
+// Remote-to-Worker control plane (ADR 0004). Enrollment and the bidirectional
+// control Session require gRPC over HTTP/2 and are always initiated outbound by
+// the Worker; separate transfer RPCs carry Artifact chunks so bulk traffic
+// cannot block heartbeats and cancellation.
+package gpq.worker.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "gpq/v1/common.proto";
+import "gpq/v1/catalog.proto";
+
+option features.field_presence = IMPLICIT;
+
+// One-time enrollment authenticated by the Tenant Master Key, which is passed to
+// the Worker on standard input and never stored (ADR 0009).
+message EnrollRequest {
+  string worker_name = 1;
+  // Stable host identity: OS, architecture, and hostname.
+  string host_descriptor = 2;
+  uint32 protocol_major = 3;
+  uint32 protocol_minor = 4;
+  string worker_version = 5;
+}
+
+message EnrollResponse {
+  string worker_id = 1;
+  // Revocable machine credential limited to Worker protocol operations.
+  string worker_credential = 2;
+  string tenant_id = 3;
+}
+
+service WorkerEnrollmentService {
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Control session
+// ---------------------------------------------------------------------------
+
+message Handshake {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string worker_version = 3;
+  string host_descriptor = 4;
+  // Optional capability flags negotiated within one major version.
+  repeated string feature_flags = 5;
+}
+
+message HandshakeAck {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string session_id = 3;
+  google.protobuf.Duration heartbeat_interval = 4;
+  google.protobuf.Duration lease_ttl = 5;
+  // Attempts Remote still considers leased to this Worker, so a reconnecting
+  // Worker can resume them before expiry (ADR 0003).
+  repeated string resumable_attempt_ids = 6;
+}
+
+// One Execution Slot as advertised by the Worker.
+message SlotAdvertisement {
+  string slot_id = 1;
+  bool busy = 2;
+  string attempt_id = 3;
+}
+
+// A Device Pool, its Active Runtime, and its Slots (ADR 0005).
+message PoolAdvertisement {
+  string pool_id = 1;
+  gpq.v1.BackendKind backend_kind = 2;
+  string backend_version = 3;
+  bool ready = 4;
+  string unready_reason = 5;
+  repeated SlotAdvertisement slots = 6;
+  string resident_model_sha256 = 7;
+  uint64 accelerator_memory_bytes = 8;
+  // Content hashes of Model Versions installed for this Pool.
+  repeated string model_sha256 = 9;
+  // Installed custom nodes, package name to exact version.
+  map<string, string> custom_nodes = 10;
+  // Probe results per required backend operation (ADR 0005).
+  map<string, bool> probes = 11;
+}
+
+// Sent after the handshake and whenever capability or occupancy changes.
+message CapabilityReport {
+  repeated PoolAdvertisement pools = 1;
+}
+
+// Renews the leases of every named Attempt (ADR 0003).
+message Heartbeat {
+  repeated string attempt_ids = 1;
+  google.protobuf.Timestamp sent_at = 2;
+}
+
+message AttemptRunning {
+  string attempt_id = 1;
+}
+
+message AttemptProgress {
+  string attempt_id = 1;
+  gpq.v1.Progress progress = 2;
+}
+
+// Incremental LLM output, forwarded to connected callers and never persisted
+// (ADR 0008).
+message AttemptTokenDelta {
+  string attempt_id = 1;
+  string text = 2;
+}
+
+// A produced output Artifact. Worker-local placement keeps the bytes on the
+// Worker until Remote requests delivery.
+message AttemptOutput {
+  gpq.v1.ArtifactManifest manifest = 1;
+  gpq.v1.ArtifactPlacement placement = 2;
+  // Object key when the Worker already uploaded to object storage.
+  string object_key = 3;
+  // Opaque token the Worker accepts in DeliverArtifact for worker-local bytes.
+  string delivery_token = 4;
+}
+
+// Result commitment. Remote verifies the live lease, a nonterminal Generation,
+// and the absence of a prior Accepted Result before accepting (ADR 0003).
+message AttemptResult {
+  string attempt_id = 1;
+  string output_text = 2;
+  repeated AttemptOutput outputs = 3;
+  gpq.v1.Usage usage = 4;
+}
+
+message AttemptFailure {
+  string attempt_id = 1;
+  gpq.v1.Failure failure = 2;
+}
+
+message CancelAcknowledged {
+  string attempt_id = 1;
+}
+
+// The Worker declines a lease before execution starts; capability mismatches
+// discovered before execution do not create work (ADR 0003).
+message LeaseRejected {
+  string attempt_id = 1;
+  gpq.v1.Failure failure = 2;
+}
+
+message WorkerMessage {
+  oneof message {
+    Handshake handshake = 1;
+    CapabilityReport capability_report = 2;
+    Heartbeat heartbeat = 3;
+    AttemptRunning attempt_running = 4;
+    AttemptProgress attempt_progress = 5;
+    AttemptTokenDelta attempt_token_delta = 6;
+    AttemptResult attempt_result = 7;
+    AttemptFailure attempt_failure = 8;
+    CancelAcknowledged cancel_acknowledged = 9;
+    LeaseRejected lease_rejected = 10;
+  }
+}
+
+// An input Artifact the Attempt must read before execution.
+message LeaseInput {
+  string artifact_id = 1;
+  gpq.v1.ArtifactManifest manifest = 2;
+  gpq.v1.ArtifactPlacement placement = 3;
+  // Presigned GET URL when the Artifact lives in object storage; Remote alone
+  // holds the credentials (ADR 0008).
+  string download_url = 4;
+}
+
+// An Attempt assignment carrying everything needed to execute it.
+message LeaseAssignment {
+  string attempt_id = 1;
+  string generation_id = 2;
+  string pool_id = 3;
+  string slot_id = 4;
+  gpq.v1.Modality modality = 5;
+  // Pinned Model Version for llama.cpp work (ADR 0012).
+  string model_sha256 = 6;
+  // Pinned Workflow Version, its graph, and its manifest for ComfyUI work. The
+  // graph travels with the lease and the Worker revalidates before execution
+  // (ADR 0007).
+  string workflow_sha256 = 7;
+  google.protobuf.Struct workflow_graph = 8;
+  gpq.v1.WorkflowManifest workflow_manifest = 9;
+  // Opaque backend-shaped parameters (ADR 0007).
+  google.protobuf.Struct parameters = 10;
+  repeated LeaseInput inputs = 11;
+  gpq.v1.ArtifactPlacement output_placement = 12;
+  // Presigned PUT URL when outputs go to object storage.
+  string output_upload_url = 13;
+  string output_object_key = 14;
+  uint64 seed = 15;
+  google.protobuf.Duration execution_timeout = 16;
+  google.protobuf.Timestamp lease_expires_at = 17;
+  bool stream_tokens = 18;
+}
+
+// Cooperative cancellation. After lease expiry the Worker must cancel even
+// without this message (ADR 0003).
+message CancelRequest {
+  string attempt_id = 1;
+  string reason = 2;
+}
+
+// Remote asks the Worker to upload a worker-local output through
+// WorkerTransferService.DeliverArtifact, resuming at `offset` if needed.
+message DeliverRequest {
+  string artifact_id = 1;
+  string delivery_token = 2;
+  uint64 offset = 3;
+}
+
+// The output is no longer needed: the client disconnected, the Artifact expired,
+// or the result was rejected as stale or duplicate (ADR 0003, ADR 0008).
+message DiscardOutput {
+  string artifact_id = 1;
+  string delivery_token = 2;
+  string reason = 3;
+}
+
+message Shutdown {
+  string reason = 1;
+}
+
+message RemoteMessage {
+  reserved 6; // gap between discard (5) and shutdown (7); never reused.
+  oneof message {
+    HandshakeAck handshake_ack = 1;
+    LeaseAssignment lease = 2;
+    CancelRequest cancel = 3;
+    DeliverRequest deliver = 4;
+    DiscardOutput discard = 5;
+    Shutdown shutdown = 7;
+  }
+}
+
+service WorkerSessionService {
+  // Long-lived bidirectional control stream. Exempt from proxy timeouts
+  // (ADR 0019).
+  rpc Session(stream WorkerMessage) returns (stream RemoteMessage);
+}
+
+// ---------------------------------------------------------------------------
+// Artifact transfer
+// ---------------------------------------------------------------------------
+
+// Bounded one-MiB chunks with declared size and SHA-256 validation, no extra
+// compression (ADR 0008).
+message ArtifactChunk {
+  uint64 offset = 1;
+  bytes data = 2;
+  bool last = 3;
+}
+
+message FetchArtifactRequest {
+  string artifact_id = 1;
+  string attempt_id = 2;
+  uint64 offset = 3;
+}
+
+message DeliverArtifactRequest {
+  oneof message {
+    DeliverArtifactStart start = 1;
+    ArtifactChunk chunk = 2;
+  }
+}
+
+message DeliverArtifactStart {
+  string artifact_id = 1;
+  string delivery_token = 2;
+  gpq.v1.ArtifactManifest manifest = 3;
+  uint64 offset = 4;
+}
+
+message DeliverArtifactResponse {
+  bool accepted = 1;
+  string reason = 2;
+  // Byte offset Remote already holds, so an interrupted stream can resume.
+  uint64 committed_offset = 3;
+}
+
+service WorkerTransferService {
+  rpc FetchArtifact(FetchArtifactRequest) returns (stream ArtifactChunk);
+  rpc DeliverArtifact(stream DeliverArtifactRequest) returns (DeliverArtifactResponse);
+}

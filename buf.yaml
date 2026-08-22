@@ -1,0 +1,18 @@
+# Buf is used for lint and breaking-change comparison only; code generation runs
+# through connectrpc-build and Buffa in crates/gpq-proto/build.rs (ADR 0004).
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # The Worker control plane is a message-oriented bidirectional stream and the
+    # transfer RPCs stream chunks, so per-RPC request/response wrapper names would
+    # add types without adding meaning.
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
+breaking:
+  use:
+    - FILE

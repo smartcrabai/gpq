@@ -54,6 +54,9 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpq-ci
+          add-job-id-key: false
 
       - name: Check formatting
         shell: bash
@@ -76,6 +79,7 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -92,6 +96,9 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpq-ci
+          add-job-id-key: false
 
       # Each matrix runner owns its PostgreSQL container, so suites run in
       # parallel without sharing state.
@@ -102,6 +109,7 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: test
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -114,6 +122,9 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpq-ci
+          add-job-id-key: false
 
       - name: Run clippy
         shell: bash

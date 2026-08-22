@@ -6,6 +6,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # The database-backed suites provision their own PostgreSQL through
     # testcontainers, so this job needs only the runner's Docker daemon.
     steps:

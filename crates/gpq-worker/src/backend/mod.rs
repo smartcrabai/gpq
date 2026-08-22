@@ -91,7 +91,8 @@ pub enum ExecutionEvent {
 ///
 /// Remote applies the authoritative retry policy from `kind`; `retry_hint` is
 /// advisory context only, never a substitute for `FailureKind::is_retryable`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{kind}: {message}")]
 pub struct BackendError {
     /// The normalized cause.
     pub kind: FailureKind,
@@ -100,14 +101,6 @@ pub struct BackendError {
     /// The adapter's advisory opinion on whether a retry might succeed.
     pub retry_hint: bool,
 }
-
-impl std::fmt::Display for BackendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.kind, self.message)
-    }
-}
-
-impl std::error::Error for BackendError {}
 
 /// Observed capabilities of a probed or running backend (ADR 0005).
 #[derive(Debug, Clone, Default)]

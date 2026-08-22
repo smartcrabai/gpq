@@ -36,7 +36,7 @@ struct StoredManifest {
 }
 
 /// Handle to a freshly published Artifact.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactHandle {
     /// Identity assigned to the Artifact by this store.
     pub artifact_id: ArtifactId,
@@ -158,15 +158,6 @@ pub struct ReconcileReport {
     /// are reported `Lost` per ADR 0008 and cannot be served.
     pub lost: Vec<ArtifactId>,
 }
-
-// Manual PartialEq/Eq: ArtifactHandle has no derive, so implement by hand for
-// the report to stay comparable in tests.
-impl PartialEq for ArtifactHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.artifact_id == other.artifact_id && self.manifest == other.manifest
-    }
-}
-impl Eq for ArtifactHandle {}
 
 /// Crash-recoverable filesystem store for Worker-local output Artifacts.
 ///

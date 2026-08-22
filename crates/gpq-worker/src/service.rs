@@ -237,7 +237,7 @@ pub async fn uninstall() -> anyhow::Result<()> {
 /// Returns an error if the current OS has no supported service manager, or
 /// if invoking the service manager fails.
 pub async fn start() -> anyhow::Result<()> {
-    run_service_command(Action::Start).await
+    run_service_command("start").await
 }
 
 /// Stops the installed service.
@@ -247,19 +247,10 @@ pub async fn start() -> anyhow::Result<()> {
 /// Returns an error if the current OS has no supported service manager, or
 /// if invoking the service manager fails.
 pub async fn stop() -> anyhow::Result<()> {
-    run_service_command(Action::Stop).await
+    run_service_command("stop").await
 }
 
-enum Action {
-    Start,
-    Stop,
-}
-
-async fn run_service_command(action: Action) -> anyhow::Result<()> {
-    let verb = match action {
-        Action::Start => "start",
-        Action::Stop => "stop",
-    };
+async fn run_service_command(verb: &str) -> anyhow::Result<()> {
     match std::env::consts::OS {
         "linux" => run_command("systemctl", &[verb, SERVICE_NAME]).await,
         "macos" => run_command("launchctl", &[verb, LAUNCHD_LABEL]).await,

@@ -16,6 +16,7 @@ use anyhow::{Context, bail};
 
 /// Reverse-DNS service identity used for platform secret stores, matching the
 /// launchd label used elsewhere (ADR 0020).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const SERVICE_NAME: &str = "ai.smartcrab.gpq-worker";
 
 /// Environment variable systemd sets to the directory holding

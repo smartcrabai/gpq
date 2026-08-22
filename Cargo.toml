@@ -28,7 +28,7 @@ aws-sdk-s3 = { version = "1.116.0", default-features = false, features = [
   "rustls",
   "sigv4a",
 ] }
-axum = { version = "0.8.9", features = ["http2", "json", "macros", "ws"] }
+axum = { version = "0.8.9", features = ["http2", "json", "ws"] }
 base64 = "0.22.1"
 buffa = { version = "0.8.1", features = ["json"] }
 buffa-types = { version = "0.8.1", features = ["chrono", "json"] }
@@ -37,7 +37,7 @@ chrono = { version = "0.4.42", default-features = false, features = [
   "serde",
   "std",
 ] }
-clap = { version = "4.5.51", features = ["derive", "env"] }
+clap = { version = "4.5.51", features = ["derive"] }
 connectrpc = { version = "0.8.1", features = [
   "axum",
   "client",

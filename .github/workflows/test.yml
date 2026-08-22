@@ -73,8 +73,24 @@ jobs:
         shell: bash
         run: cargo build --workspace --bins
 
-      # These suites start their own PostgreSQL container via testcontainers,
-      # so they must not interleave with each other.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # These suites start their own PostgreSQL container, so they must not
+      # interleave with each other.
       - name: Run integration and end-to-end tests
         shell: bash
         run: |
@@ -83,6 +99,22 @@ jobs:
           cargo test -p gpq-remote --test comfy -- --test-threads=1
           cargo test -p gpq-remote --test lifecycle -- --test-threads=1
           cargo test -p gpq-remote --test objectstore -- --test-threads=1
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
 
       - name: Run clippy
         shell: bash

@@ -6,6 +6,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # The database-backed suites provision their own PostgreSQL through
     # testcontainers, so this job needs only the runner's Docker daemon.
     steps:
@@ -53,6 +54,9 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpq-ci
+          add-job-id-key: false
 
       - name: Check formatting
         shell: bash
@@ -72,16 +76,55 @@ jobs:
         shell: bash
         run: cargo build --workspace --bins
 
-      # These suites start their own PostgreSQL container via testcontainers,
-      # so they must not interleave with each other.
-      - name: Run integration and end-to-end tests
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [postgres, e2e, comfy, lifecycle, objectstore]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpq-ci
+          add-job-id-key: false
+
+      # Each matrix runner owns its PostgreSQL container, so suites run in
+      # parallel without sharing state.
+      - name: Run integration suite
         shell: bash
-        run: |
-          cargo test -p gpq-remote --test postgres -- --test-threads=1
-          cargo test -p gpq-remote --test e2e -- --test-threads=1
-          cargo test -p gpq-remote --test comfy -- --test-threads=1
-          cargo test -p gpq-remote --test lifecycle -- --test-threads=1
-          cargo test -p gpq-remote --test objectstore -- --test-threads=1
+        run: cargo test -p gpq-remote --test ${{ matrix.suite }} -- --test-threads=1
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpq-ci
+          add-job-id-key: false
 
       - name: Run clippy
         shell: bash

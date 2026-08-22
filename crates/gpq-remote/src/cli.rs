@@ -180,7 +180,7 @@ async fn run_serve() -> anyhow::Result<()> {
     db.assert_schema_current()
         .await
         .context("refusing to serve against an unexpected schema version")?;
-    let artifacts = ArtifactService::new(&config).await?;
+    let artifacts = ArtifactService::new(&config).await;
     let shutdown = tokio_util::sync::CancellationToken::new();
 
     // `crate::scheduler::spawn` needs a full `AppState` to reach the database,

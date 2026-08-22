@@ -201,11 +201,9 @@ async fn generation_row_to_proto(
 
     let generation_state = gpq_domain::GenerationState::from_str(&row.state).map_err(internal)?;
     let modality = gpq_domain::Modality::from_str(&row.modality).map_err(internal)?;
-    let execution_timeout = crate::db::catalog::interval_to_duration(
-        "generations.execution_timeout",
-        row.execution_timeout,
-    )
-    .map_err(internal)?;
+    let execution_timeout =
+        crate::db::interval_to_duration("generations.execution_timeout", row.execution_timeout)
+            .map_err(internal)?;
 
     let output_artifacts = outputs
         .iter()

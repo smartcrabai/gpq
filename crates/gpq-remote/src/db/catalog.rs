@@ -44,10 +44,12 @@ pub struct ResolvedWorkflow {
 }
 
 /// One registered Model alias.
+#[derive(sqlx::FromRow)]
 pub struct ModelAliasRow {
     /// The alias name.
     pub alias: String,
     /// Lowercase hex SHA-256 of the aliased Model Version.
+    #[sqlx(rename = "content_sha256")]
     pub content_hash: String,
     /// The stable modality name (`"llm"`, `"image"`, ...) of that version.
     pub modality: String,
@@ -56,10 +58,12 @@ pub struct ModelAliasRow {
 }
 
 /// One registered Workflow alias.
+#[derive(sqlx::FromRow)]
 pub struct WorkflowAliasRow {
     /// The alias name.
     pub alias: String,
     /// Lowercase hex SHA-256 of the aliased Workflow Version.
+    #[sqlx(rename = "content_sha256")]
     pub content_hash: String,
     /// The stable modality name of that version.
     pub modality: String,
@@ -125,16 +129,9 @@ fn decode_error(context: &str, err: impl std::fmt::Display) -> sqlx::Error {
 fn parse_content_hash(context: &str, raw: &str) -> Result<ContentHash, sqlx::Error> {
     ContentHash::from_str(raw).map_err(|err| decode_error(context, err))
 }
-
 fn parse_modality(context: &str, raw: &str) -> Result<Modality, sqlx::Error> {
     Modality::from_str(raw).map_err(|err| decode_error(context, err))
 }
-
-/// Re-exported so existing crate-internal callers (e.g. `native::generation`,
-/// decoding `generations.execution_timeout`) keep resolving
-/// `catalog::interval_to_duration` now that the canonical implementation
-/// lives in `db::mod`, shared by every interval-bearing table.
-pub(crate) use super::interval_to_duration;
 
 fn decode_workflow_manifest(
     context: &str,
@@ -294,7 +291,7 @@ fn decode_model_execution_limits(
     estimated_vram_bytes: Option<i64>,
 ) -> Result<ExecutionLimits, sqlx::Error> {
     let execution_timeout = execution_timeout
-        .map(|interval| interval_to_duration("model_versions.execution_timeout", interval))
+        .map(|interval| super::interval_to_duration("model_versions.execution_timeout", interval))
         .transpose()?;
     let estimated_vram_bytes = estimated_vram_bytes
         .map(|bytes| {
@@ -410,25 +407,6 @@ async fn workflow_version_exists(
     .await
 }
 
-#[derive(sqlx::FromRow)]
-struct ModelAliasRawRow {
-    alias: String,
-    content_sha256: String,
-    modality: String,
-    created_at: DateTime<Utc>,
-}
-
-impl From<ModelAliasRawRow> for ModelAliasRow {
-    fn from(raw: ModelAliasRawRow) -> Self {
-        Self {
-            alias: raw.alias,
-            content_hash: raw.content_sha256,
-            modality: raw.modality,
-            created_at: raw.created_at,
-        }
-    }
-}
-
 /// Points a Model alias at an already-registered content hash (ADR 0012).
 /// Reassigning an existing alias never touches past Generations, which
 /// pinned the previous hash at admission time.
@@ -446,7 +424,7 @@ pub async fn set_model_alias(
     if !model_version_exists(conn, tenant_id, content_hash).await? {
         return Err(CatalogError::UnknownVersion(content_hash));
     }
-    let raw: ModelAliasRawRow = sqlx::query_as(
+    let raw: ModelAliasRow = sqlx::query_as(
         "WITH upsert AS ( \
              INSERT INTO model_aliases (tenant_id, alias, content_sha256) \
              VALUES ($1, $2, $3) \
@@ -465,24 +443,7 @@ pub async fn set_model_alias(
     .bind(content_hash.to_hex())
     .fetch_one(&mut *conn)
     .await?;
-    Ok(raw.into())
-}
-
-#[derive(sqlx::FromRow)]
-struct WorkflowAliasRawRow {
-    alias: String,
-    content_sha256: String,
-    modality: String,
-}
-
-impl From<WorkflowAliasRawRow> for WorkflowAliasRow {
-    fn from(raw: WorkflowAliasRawRow) -> Self {
-        Self {
-            alias: raw.alias,
-            content_hash: raw.content_sha256,
-            modality: raw.modality,
-        }
-    }
+    Ok(raw)
 }
 
 /// Points a Workflow alias at an already-registered content hash (ADR 0012).
@@ -500,7 +461,7 @@ pub async fn set_workflow_alias(
     if !workflow_version_exists(conn, tenant_id, content_hash).await? {
         return Err(CatalogError::UnknownVersion(content_hash));
     }
-    let raw: WorkflowAliasRawRow = sqlx::query_as(
+    let raw: WorkflowAliasRow = sqlx::query_as(
         "WITH upsert AS ( \
              INSERT INTO workflow_aliases (tenant_id, alias, content_sha256) \
              VALUES ($1, $2, $3) \
@@ -519,7 +480,7 @@ pub async fn set_workflow_alias(
     .bind(content_hash.to_hex())
     .fetch_one(&mut *conn)
     .await?;
-    Ok(raw.into())
+    Ok(raw)
 }
 
 /// Deletes a Model alias. Returns whether an alias existed to delete; never
@@ -657,7 +618,7 @@ pub async fn list_model_aliases(
     conn: &mut PgConnection,
     tenant_id: TenantId,
 ) -> sqlx::Result<Vec<ModelAliasRow>> {
-    let rows: Vec<ModelAliasRawRow> = sqlx::query_as(
+    let rows: Vec<ModelAliasRow> = sqlx::query_as(
         "SELECT model_aliases.alias, model_aliases.content_sha256, model_versions.modality, \
                 model_aliases.created_at \
          FROM model_aliases \
@@ -670,7 +631,7 @@ pub async fn list_model_aliases(
     .bind(tenant_id.as_uuid())
     .fetch_all(&mut *conn)
     .await?;
-    Ok(rows.into_iter().map(ModelAliasRow::from).collect())
+    Ok(rows)
 }
 
 /// Lists every Workflow alias for a Tenant, alphabetically.
@@ -681,7 +642,7 @@ pub async fn list_workflow_aliases(
     conn: &mut PgConnection,
     tenant_id: TenantId,
 ) -> sqlx::Result<Vec<WorkflowAliasRow>> {
-    let rows: Vec<WorkflowAliasRawRow> = sqlx::query_as(
+    let rows: Vec<WorkflowAliasRow> = sqlx::query_as(
         "SELECT workflow_aliases.alias, workflow_aliases.content_sha256, workflow_versions.modality \
          FROM workflow_aliases \
          JOIN workflow_versions \
@@ -693,7 +654,7 @@ pub async fn list_workflow_aliases(
     .bind(tenant_id.as_uuid())
     .fetch_all(&mut *conn)
     .await?;
-    Ok(rows.into_iter().map(WorkflowAliasRow::from).collect())
+    Ok(rows)
 }
 
 #[cfg(test)]

@@ -114,14 +114,7 @@ impl ArtifactService {
     /// Builds the service. Without a configured object store this still
     /// succeeds — [`Self::object_store_available`] reports `false` and every
     /// S3-backed method fails explicitly instead of panicking (ADR 0008).
-    ///
-    /// # Errors
-    ///
-    /// Currently infallible: it never returns `Err`. It stays `async fn
-    /// -> Result` because credential-chain resolution through `aws_config`
-    /// is loaded here, and because it shares a signature with the rest of
-    /// this type's S3-backed constructors.
-    pub async fn new(config: &RemoteConfig) -> anyhow::Result<Self> {
+    pub async fn new(config: &RemoteConfig) -> Self {
         let (client, bucket, presign_ttl) = match &config.object_store {
             None => (None, String::new(), Duration::from_mins(15)),
             Some(object_store) => {
@@ -146,7 +139,7 @@ impl ArtifactService {
                 )
             }
         };
-        Ok(Self {
+        Self {
             inner: Arc::new(Inner {
                 client,
                 bucket,
@@ -154,7 +147,7 @@ impl ArtifactService {
                 local: Mutex::new(HashMap::new()),
                 deliveries: Mutex::new(HashMap::new()),
             }),
-        })
+        }
     }
 
     /// Whether S3-compatible object storage is configured.

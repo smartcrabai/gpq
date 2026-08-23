@@ -26,7 +26,7 @@ use connectrpc::{ConnectError, Protocol};
 use gpq_proto::gpq::v1 as pb;
 use gpq_proto::gpq::worker::v1 as wpb;
 use gpq_proto::gpq::worker::v1::__buffa::oneof::remote_message;
-use rand::RngCore;
+use rand::Rng;
 
 use crate::e2e_support::{Harness, wait_until};
 

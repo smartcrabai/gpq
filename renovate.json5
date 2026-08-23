@@ -26,6 +26,19 @@
         "github-actions"
       ],
       minimumReleaseAge: "7 days"
+    },
+    {
+      matchPackageNames: [
+        "buffa",
+        "buffa-types"
+      ],
+      allowedVersions: "<0.9.0"
+    },
+    {
+      matchPackageNames: [
+        "testcontainers"
+      ],
+      allowedVersions: "<0.28.0"
     }
   ]
 }

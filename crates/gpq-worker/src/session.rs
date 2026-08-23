@@ -31,7 +31,7 @@ use gpq_proto::gpq::worker::v1::{
     PoolAdvertisement, RemoteMessage, SlotAdvertisement, WorkerMessage, WorkerSessionServiceClient,
     WorkerTransferServiceClient, remote_message, worker_message,
 };
-use rand::Rng;
+use rand::{Rng, RngExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;

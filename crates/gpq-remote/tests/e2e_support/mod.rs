@@ -33,7 +33,7 @@ use connectrpc::{CodecFormat, Protocol};
 use fake_llama::FakeLlama;
 use gpq_proto::gpq::v1 as pb;
 use gpq_proto::gpq::worker::v1 as wpb;
-use rand::RngCore;
+use rand::Rng;
 use sqlx::PgPool;
 use tokio::process::{Child, Command};
 use tokio::runtime::Runtime;

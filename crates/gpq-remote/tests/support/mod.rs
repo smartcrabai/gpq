@@ -16,7 +16,7 @@ mod shared_container;
 pub use shared_container::reap_shared_container;
 
 use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use shared_container::maintenance_url;
 use sqlx::PgConnection;

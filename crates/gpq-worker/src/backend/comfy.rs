@@ -537,7 +537,7 @@ impl ComfyBackend {
         entry: &ViewRef,
         dest: &Path,
     ) -> Result<(ContentHash, u64), BackendError> {
-        let mut resp = self
+        let resp = self
             .client
             .get(self.url("/view"))
             .query(&[
@@ -563,11 +563,13 @@ impl ComfyBackend {
         })?;
         let mut hasher = Hasher::new();
         let mut size = 0_u64;
-        while let Some(chunk) = resp.chunk().await.map_err(|e| BackendError {
-            kind: FailureKind::TransferFailed,
-            message: format!("comfyui view transfer failed: {e}"),
-            retry_hint: true,
-        })? {
+        let mut chunks = resp.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|e| BackendError {
+                kind: FailureKind::TransferFailed,
+                message: format!("comfyui view transfer failed: {e}"),
+                retry_hint: true,
+            })?;
             hasher.update(&chunk);
             size += chunk.len() as u64;
             file.write_all(&chunk).await.map_err(|e| {

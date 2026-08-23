@@ -135,10 +135,11 @@ lto = true
 strip = true
 
 [workspace.metadata.dist]
-cargo-dist-version = ""
+cargo-dist-version = "0.32.0"
 ci = "github"
 install-path = "CARGO_HOME"
 installers = ["shell", "homebrew"]
+precise-builds = true
 publish-jobs = ["homebrew"]
 tap = "smartcrabai/homebrew-tap"
 targets = [
@@ -148,3 +149,8 @@ targets = [
   "x86_64-pc-windows-msvc",
   "aarch64-pc-windows-msvc",
 ]
+
+[workspace.metadata.dist.github-action-commits]
+"actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803"
+"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"

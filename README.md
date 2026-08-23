@@ -315,6 +315,19 @@ docker run --rm \
 
 The runtime image is non-root and expects TLS termination outside the container.
 
+## Worker releases
+
+`cargo-dist` publishes `gpq-worker`; `gpq-remote` continues to ship only as the OCI image above. Set the workspace version, commit it, then push a matching version tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The generated [release workflow](.github/workflows/release.yml) creates a GitHub Release containing Worker archives and SHA-256 checksums for the configured macOS, Linux, and Windows targets. It also creates a shell installer and publishes the Homebrew formula to `smartcrabai/homebrew-tap`.
+
+Configure the repository secret `HOMEBREW_TAP_TOKEN` with push access to that tap before publishing the first tag. Pull requests run the cargo-dist planning job without publishing a release.
+
 ## Testing
 
 Fast checks:

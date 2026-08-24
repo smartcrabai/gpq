@@ -124,8 +124,13 @@ impl ArtifactReader {
             self.done = true;
         }
         if read == 0 && offset == self.manifest.size_bytes {
-            // Nothing left to serve and nothing was read this call.
-            return Ok(None);
+            // Emit an empty final chunk so an empty Artifact, or a resume that
+            // already reached EOF, can complete the transfer protocol.
+            return Ok(Some(ArtifactChunkData {
+                offset,
+                data: buf,
+                last: true,
+            }));
         }
         Ok(Some(ArtifactChunkData {
             offset,
@@ -245,6 +250,15 @@ impl LocalArtifactStore {
         let artifact_id = Self::parse_token(token)?;
         let dir = self.dir_for(artifact_id);
         let stored = Self::read_manifest(&dir).await?;
+        if offset > stored.manifest.size_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "artifact offset {offset} exceeds size {}",
+                    stored.manifest.size_bytes
+                ),
+            ));
+        }
         let mut file = tokio::fs::File::open(dir.join(DATA_FILE)).await?;
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         Ok(ArtifactReader {
@@ -520,6 +534,50 @@ mod tests {
         assert_eq!(chunks[0].offset, TRANSFER_CHUNK_BYTES as u64);
         assert_eq!(chunks[0].data, data[TRANSFER_CHUNK_BYTES..]);
         assert!(chunks[0].last);
+    }
+
+    #[tokio::test]
+    async fn read_from_eof_emits_a_final_empty_chunk() {
+        let root = temp_store_root();
+        let store = open_store(root.path()).await;
+        let src = write_source(root.path(), "source.bin", b"payload").await;
+        let Ok(handle) = store
+            .publish(AttemptId::new(), &src, manifest(7, b"payload"))
+            .await
+        else {
+            panic!("publish should succeed for matching bytes")
+        };
+
+        let Ok(mut reader) = store.open_for_read(&handle.delivery_token(), 7).await else {
+            panic!("open_for_read should accept the end offset")
+        };
+        let Ok(Some(chunk)) = reader.next_chunk().await else {
+            panic!("EOF must produce a final chunk")
+        };
+        assert_eq!(chunk.offset, 7);
+        assert!(chunk.data.is_empty());
+        assert!(chunk.last);
+        assert!(reader.next_chunk().await.unwrap_or(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn open_for_read_rejects_an_offset_past_the_manifest() {
+        let root = temp_store_root();
+        let store = open_store(root.path()).await;
+        let src = write_source(root.path(), "source.bin", b"payload").await;
+        let Ok(handle) = store
+            .publish(AttemptId::new(), &src, manifest(7, b"payload"))
+            .await
+        else {
+            panic!("publish should succeed for matching bytes")
+        };
+
+        assert!(
+            store
+                .open_for_read(&handle.delivery_token(), 8)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

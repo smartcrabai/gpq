@@ -227,37 +227,51 @@ impl WorkerTransferService for TransferApi {
             ));
         };
 
+        let start_offset = start.offset;
         let (artifact_id, manifest) =
             validate_delivery_start(&self.state, tenant_id, *start).await?;
-        let receipt = receive_delivery_chunks(&self.state, artifact_id, &mut requests).await?;
-        let (received_bytes, digest) = match receipt {
-            ChunkReceipt::NoDownloader { received_bytes } => {
+        let receipt =
+            receive_delivery_chunks(&self.state, artifact_id, start_offset, &mut requests).await?;
+        let (committed_offset, digest) = match receipt {
+            ChunkReceipt::NoDownloader { committed_offset } => {
                 return Response::ok(DeliverArtifactResponse {
                     accepted: false,
                     reason: "no active download".to_owned(),
-                    committed_offset: received_bytes,
+                    committed_offset,
                     ..Default::default()
                 });
             }
             ChunkReceipt::Delivered {
-                received_bytes,
+                committed_offset,
                 digest,
-            } => (received_bytes, digest),
+            } => (committed_offset, digest),
         };
 
-        if let Err(mismatch) = manifest.verify(received_bytes, digest) {
-            let reason = mismatch.to_string();
+        let failure =
+            match validate_delivery_receipt(&manifest, start_offset, committed_offset, digest) {
+                DeliveryValidation::Accepted => None,
+                DeliveryValidation::Retryable(reason) => {
+                    Some(crate::artifacts::DeliveryChunk::Failed(reason))
+                }
+                DeliveryValidation::Rejected(reason) => {
+                    Some(crate::artifacts::DeliveryChunk::Rejected(reason))
+                }
+            };
+        if let Some(failure) = failure {
+            let reason = match &failure {
+                crate::artifacts::DeliveryChunk::Failed(reason)
+                | crate::artifacts::DeliveryChunk::Rejected(reason) => reason.clone(),
+                crate::artifacts::DeliveryChunk::Data(_)
+                | crate::artifacts::DeliveryChunk::Complete => unreachable!(),
+            };
             self.state
                 .artifacts
-                .push_delivery(
-                    artifact_id,
-                    crate::artifacts::DeliveryChunk::Failed(reason.clone()),
-                )
+                .push_delivery(artifact_id, failure)
                 .await;
             return Response::ok(DeliverArtifactResponse {
                 accepted: false,
                 reason,
-                committed_offset: received_bytes,
+                committed_offset,
                 ..Default::default()
             });
         }
@@ -270,7 +284,7 @@ impl WorkerTransferService for TransferApi {
         Response::ok(DeliverArtifactResponse {
             accepted: true,
             reason: String::new(),
-            committed_offset: received_bytes,
+            committed_offset,
             ..Default::default()
         })
     }
@@ -316,6 +330,12 @@ async fn validate_delivery_start(
             "delivered manifest does not match the recorded output manifest",
         ));
     }
+    if row.committed_offset != start.offset {
+        return Err(ConnectError::new(
+            ErrorCode::FailedPrecondition,
+            "delivery offset does not match the recorded progress",
+        ));
+    }
     match &row.delivery_token {
         Some(expected) if *expected == start.delivery_token => {}
         _ => {
@@ -328,16 +348,68 @@ async fn validate_delivery_start(
     Ok((artifact_id, manifest))
 }
 
+/// Whether a received delivery can complete, should be retried, or must be
+/// rejected permanently because retrying would bypass integrity validation.
+/// Resumed attempts cannot reproduce the prefix digest; that path is only
+/// reachable after a non-integrity interruption. A from-zero digest mismatch
+/// is terminal so it cannot be converted into an unverified resumed success.
+enum DeliveryValidation {
+    Accepted,
+    Retryable(String),
+    Rejected(String),
+}
+
+fn validate_delivery_receipt(
+    manifest: &ArtifactManifest,
+    start_offset: u64,
+    committed_offset: u64,
+    digest: ContentHash,
+) -> DeliveryValidation {
+    if start_offset == 0 {
+        return match manifest.verify(committed_offset, digest) {
+            Ok(()) => DeliveryValidation::Accepted,
+            Err(mismatch @ gpq_domain::ManifestMismatch::Digest { .. }) => {
+                DeliveryValidation::Rejected(mismatch.to_string())
+            }
+            Err(mismatch) => DeliveryValidation::Retryable(mismatch.to_string()),
+        };
+    }
+    if committed_offset != manifest.size_bytes {
+        return DeliveryValidation::Retryable(format!(
+            "resumed delivery ended at {committed_offset} bytes, expected {}",
+            manifest.size_bytes
+        ));
+    }
+    DeliveryValidation::Accepted
+}
+
 /// Outcome of receiving a Worker's `DeliverArtifact` chunk stream through to
 /// completion or a lost downloader (ADR 0008).
 enum ChunkReceipt {
     /// Every chunk reached the subscribed downloader; digest ready to verify.
     Delivered {
-        received_bytes: u64,
+        committed_offset: u64,
         digest: ContentHash,
     },
     /// No downloader was subscribed to receive the bytes.
-    NoDownloader { received_bytes: u64 },
+    NoDownloader { committed_offset: u64 },
+}
+
+/// Returns the offset immediately after a chunk, rejecting gaps, overlaps,
+/// and integer overflow in the worker-supplied chunk stream.
+fn next_delivery_offset(expected_offset: u64, chunk: &ArtifactChunk) -> Result<u64, String> {
+    if chunk.offset != expected_offset {
+        return Err(format!(
+            "artifact chunk offset {} does not match expected offset {}",
+            chunk.offset, expected_offset
+        ));
+    }
+    expected_offset
+        .checked_add(
+            u64::try_from(chunk.data.len())
+                .map_err(|_| "artifact chunk length cannot be represented as a u64".to_owned())?,
+        )
+        .ok_or_else(|| "artifact chunk offset overflows u64".to_owned())
 }
 
 /// Reads a Worker's `DeliverArtifact` chunk stream, relaying each chunk to
@@ -348,10 +420,11 @@ enum ChunkReceipt {
 async fn receive_delivery_chunks(
     state: &AppState,
     artifact_id: ArtifactId,
+    start_offset: u64,
     requests: &mut connectrpc::InboundStream<DeliverArtifactRequest>,
 ) -> Result<ChunkReceipt, ConnectError> {
     let mut hasher = Hasher::new();
-    let mut received_bytes: u64 = 0;
+    let mut next_offset = start_offset;
     let mut saw_last = false;
 
     while let Some(item) = requests.next().await {
@@ -362,9 +435,22 @@ async fn receive_delivery_chunks(
                 "expected an ArtifactChunk after DeliverArtifactStart",
             ));
         };
+        let following_offset = match next_delivery_offset(next_offset, &chunk) {
+            Ok(offset) => offset,
+            Err(reason) => {
+                state
+                    .artifacts
+                    .push_delivery(
+                        artifact_id,
+                        crate::artifacts::DeliveryChunk::Failed(reason.clone()),
+                    )
+                    .await;
+                return Err(ConnectError::new(ErrorCode::InvalidArgument, reason));
+            }
+        };
         hasher.update(&chunk.data);
-        received_bytes += chunk.data.len() as u64;
         let is_last = chunk.last;
+        next_offset = following_offset;
 
         let downloader_attached = state
             .artifacts
@@ -374,7 +460,9 @@ async fn receive_delivery_chunks(
             )
             .await;
         if !downloader_attached {
-            return Ok(ChunkReceipt::NoDownloader { received_bytes });
+            return Ok(ChunkReceipt::NoDownloader {
+                committed_offset: following_offset,
+            });
         }
         if is_last {
             saw_last = true;
@@ -397,7 +485,7 @@ async fn receive_delivery_chunks(
         ));
     }
     Ok(ChunkReceipt::Delivered {
-        received_bytes,
+        committed_offset: next_offset,
         digest: hasher.finish(),
     })
 }
@@ -454,6 +542,64 @@ mod tests {
         let chunks = build_chunks(&[], 0);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].last);
+    }
+
+    #[test]
+    fn delivery_chunks_must_start_at_the_recorded_offset() {
+        let chunk = ArtifactChunk {
+            offset: 10,
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+
+        assert_eq!(next_delivery_offset(10, &chunk), Ok(13));
+        assert!(next_delivery_offset(9, &chunk).is_err());
+        assert!(next_delivery_offset(13, &chunk).is_err());
+    }
+
+    #[test]
+    fn delivery_chunk_offset_overflow_is_rejected() {
+        let chunk = ArtifactChunk {
+            offset: u64::MAX,
+            data: vec![1],
+            ..Default::default()
+        };
+
+        assert!(next_delivery_offset(u64::MAX, &chunk).is_err());
+    }
+
+    #[test]
+    fn initial_digest_mismatch_is_permanently_rejected() {
+        let manifest = ArtifactManifest {
+            size_bytes: 4,
+            digest: ContentHash::digest(b"good"),
+            kind: MediaKind::Binary,
+            mime_type: "application/octet-stream".to_owned(),
+        };
+
+        assert!(matches!(
+            validate_delivery_receipt(&manifest, 0, 4, ContentHash::digest(b"bad!")),
+            DeliveryValidation::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn incomplete_delivery_remains_retryable() {
+        let manifest = ArtifactManifest {
+            size_bytes: 4,
+            digest: ContentHash::digest(b"good"),
+            kind: MediaKind::Binary,
+            mime_type: "application/octet-stream".to_owned(),
+        };
+
+        assert!(matches!(
+            validate_delivery_receipt(&manifest, 0, 3, ContentHash::digest(b"bad")),
+            DeliveryValidation::Retryable(_)
+        ));
+        assert!(matches!(
+            validate_delivery_receipt(&manifest, 3, 3, ContentHash::digest(b"bad")),
+            DeliveryValidation::Retryable(_)
+        ));
     }
 
     #[test]

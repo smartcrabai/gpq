@@ -74,8 +74,11 @@ pub enum DeliveryChunk {
     Data(Vec<u8>),
     /// The Worker finished sending; the caller already validated the digest.
     Complete,
-    /// The Worker (or Remote) aborted the delivery.
+    /// A retryable Worker or transport failure.
     Failed(String),
+    /// A permanent rejection, such as a manifest or progress-integrity
+    /// failure. Retrying from a later offset would bypass validation.
+    Rejected(String),
 }
 
 /// Artifact object storage, in-memory relay buffers, and download routing.
@@ -815,21 +818,40 @@ enum ChunkDrainOutcome {
 }
 
 /// Persists the newly committed delivery `offset` for `artifact` after a
-/// chunk was successfully relayed to the client, logging (never
-/// propagating) any database failure: a failure to persist here only risks
-/// re-delivering already-sent bytes on the next resume, which the
-/// downloading client tolerates by design (ADR 0008), so it must not abort
-/// an otherwise-successful chunk relay.
-async fn persist_delivery_offset(ctx: &DeliveryContext<'_>, offset: u64) {
-    if let Ok(mut conn) = ctx.state.db.begin_tenant(ctx.tenant).await {
-        if let Err(err) =
-            db_artifacts::commit_offset(&mut conn, ctx.tenant, ctx.artifact, offset).await
-        {
-            tracing::error!(%err, "failed to persist delivery offset");
-        } else if let Err(err) = conn.commit().await {
-            tracing::error!(%err, "failed to commit delivery-offset transaction");
+/// chunk was successfully relayed to the client. A failure is terminal for
+/// this one-shot response: continuing with an in-memory offset that the
+/// database does not know about would make the next resume fail strict
+/// progress validation (or require re-sending bytes already sent to the
+/// client).
+async fn persist_delivery_offset(ctx: &DeliveryContext<'_>, offset: u64) -> bool {
+    let mut conn = match ctx.state.db.begin_tenant(ctx.tenant).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::error!(%err, "failed to open transaction to persist delivery offset");
+            return false;
         }
+    };
+    if let Err(err) = db_artifacts::commit_offset(&mut conn, ctx.tenant, ctx.artifact, offset).await
+    {
+        tracing::error!(%err, "failed to persist delivery offset");
+        return false;
     }
+    if let Err(err) = conn.commit().await {
+        tracing::error!(%err, "failed to commit delivery-offset transaction");
+        return false;
+    }
+    true
+}
+
+async fn fail_delivery(
+    ctx: &DeliveryContext<'_>,
+    tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    reason: &str,
+    message: String,
+) {
+    ctx.state.artifacts.end_delivery(ctx.artifact);
+    mark_delivery_lost(ctx.state, ctx.tenant, ctx.artifact, reason).await;
+    let _ = tx.send(Err(std::io::Error::other(message))).await;
 }
 
 /// Relays [`DeliveryChunk`]s from the producing Worker to the downloading
@@ -837,6 +859,10 @@ async fn persist_delivery_offset(ctx: &DeliveryContext<'_>, offset: u64) {
 /// Worker goes quiet for [`DELIVERY_CHUNK_TIMEOUT`]. See
 /// [`request_worker_delivery`] for why this is split out of
 /// [`stream_worker_local`]; behavior is unchanged.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the delivery state machine is clearer as one match than as smaller one-use helpers"
+)]
 async fn drain_worker_chunks(
     ctx: &DeliveryContext<'_>,
     offset: &mut u64,
@@ -848,25 +874,19 @@ async fn drain_worker_chunks(
         let chunk = tokio::select! {
             chunk = rx.recv() => chunk,
             () = tokio::time::sleep(DELIVERY_CHUNK_TIMEOUT) => {
-                ctx.state.artifacts.end_delivery(ctx.artifact);
-                mark_delivery_lost(
-                    ctx.state,
-                    ctx.tenant,
-                    ctx.artifact,
+                fail_delivery(
+                    ctx,
+                    tx,
                     "delivery timed out waiting for the next chunk",
+                    "producing worker accepted delivery but sent nothing for too long".to_owned(),
                 )
                 .await;
-                let _ = tx
-                    .send(Err(std::io::Error::other(
-                        "producing worker accepted delivery but sent nothing for too long",
-                    )))
-                    .await;
                 return ChunkDrainOutcome::Done;
             }
         };
         match chunk {
             Some(DeliveryChunk::Data(bytes)) => {
-                *offset = offset.saturating_add(as_u64(bytes.len()));
+                *offset += as_u64(bytes.len());
                 if tx.send(Ok(Bytes::from(bytes))).await.is_err() {
                     discard_and_expire(
                         ctx.state,
@@ -879,7 +899,16 @@ async fn drain_worker_chunks(
                     .await;
                     return ChunkDrainOutcome::Done;
                 }
-                persist_delivery_offset(ctx, *offset).await;
+                if !persist_delivery_offset(ctx, *offset).await {
+                    fail_delivery(
+                        ctx,
+                        tx,
+                        "failed to persist delivery progress",
+                        "failed to persist artifact delivery progress".to_owned(),
+                    )
+                    .await;
+                    return ChunkDrainOutcome::Done;
+                }
             }
             Some(DeliveryChunk::Complete) => {
                 ctx.state.artifacts.end_delivery(ctx.artifact);
@@ -913,6 +942,16 @@ async fn drain_worker_chunks(
                     "worker-local delivery chunk failed, retrying"
                 );
                 return ChunkDrainOutcome::ResumeDelivery;
+            }
+            Some(DeliveryChunk::Rejected(reason)) => {
+                fail_delivery(
+                    ctx,
+                    tx,
+                    &reason,
+                    format!("artifact delivery rejected: {reason}"),
+                )
+                .await;
+                return ChunkDrainOutcome::Done;
             }
             None => {
                 ctx.state.artifacts.end_delivery(ctx.artifact);

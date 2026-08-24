@@ -192,9 +192,11 @@ fn worker_config_toml(
     )
 }
 
-fn write_credential_file(dir: &Path, worker_name: &str, credential: &str) -> anyhow::Result<()> {
+fn write_credential_file(dir: &Path, credential: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(worker_name);
+    // Match the destination name used by the installed systemd unit's
+    // `LoadCredential=gpq-worker:...` directive.
+    let path = dir.join("gpq-worker");
     std::fs::write(&path, credential)?;
     #[cfg(unix)]
     {
@@ -919,7 +921,7 @@ impl Harness {
         let worker_name = format!("e2e-worker-{suffix}");
         let (worker_id, worker_credential) =
             enroll_worker(&remote_uri, &tenant1_key.secret, &worker_name).await?;
-        write_credential_file(&credentials_dir, &worker_name, &worker_credential)?;
+        write_credential_file(&credentials_dir, &worker_credential)?;
 
         let config_path = tmp_root.join("worker.toml");
         std::fs::write(

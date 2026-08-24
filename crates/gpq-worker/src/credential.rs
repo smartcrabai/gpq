@@ -3,8 +3,8 @@
 //! The Worker Credential is a revocable machine credential distinct from the
 //! Tenant Master Key. It is stored in platform-appropriate secret storage:
 //! Keychain on macOS, Credential Manager on Windows, systemd credentials
-//! (read-only, `$CREDENTIALS_DIRECTORY/<name>`) for Linux services managed by
-//! systemd, and otherwise an owner-only mode-0600 file under the Worker's
+//! (read-only, `$CREDENTIALS_DIRECTORY/gpq-worker`) for Linux services managed
+//! by systemd, and otherwise an owner-only mode-0600 file under the Worker's
 //! state directory. The credential is never written to configuration,
 //! command arguments, environment variables, logs, or diagnostics, and unsafe
 //! file permissions or ownership stop startup rather than being silently
@@ -23,7 +23,6 @@ const SERVICE_NAME: &str = "ai.smartcrab.gpq-worker";
 /// `LoadCredential=` entries. Its presence means credential storage for this
 /// process is systemd-managed and read-only.
 const SYSTEMD_CREDENTIALS_DIR_VAR: &str = "CREDENTIALS_DIRECTORY";
-
 /// Platform-appropriate persistence for one Worker's revocable credential.
 pub struct CredentialStore {
     worker_name: String,
@@ -121,7 +120,13 @@ impl CredentialStore {
     /// if a fallback file's permissions or ownership are unsafe.
     pub fn load(&self) -> anyhow::Result<Option<String>> {
         if let Some(dir) = std::env::var_os(SYSTEMD_CREDENTIALS_DIR_VAR) {
-            return load_systemd_credential(Path::new(&dir), &self.worker_name);
+            let path = Path::new(&dir).join(crate::service::SERVICE_NAME);
+            return match std::fs::read_to_string(&path) {
+                Ok(contents) => Ok(Some(contents.trim_end_matches(['\n', '\r']).to_owned())),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(err)
+                    .with_context(|| format!("reading systemd credential {}", path.display())),
+            };
         }
         self.load_platform()
     }
@@ -196,17 +201,6 @@ impl CredentialStore {
     #[cfg(all(unix, not(target_os = "macos")))]
     const fn describe_platform() -> &'static str {
         "owner-only file (mode 0600)"
-    }
-}
-
-fn load_systemd_credential(dir: &Path, worker_name: &str) -> anyhow::Result<Option<String>> {
-    let path = dir.join(worker_name);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => Ok(Some(contents.trim_end_matches(['\n', '\r']).to_owned())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => {
-            Err(err).with_context(|| format!("reading systemd credential {}", path.display()))
-        }
     }
 }
 

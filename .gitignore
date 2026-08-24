@@ -1,1 +1,5 @@
 /target
+
+# graphify
+/graphify-out/cache/
+/graphify-out/converted/

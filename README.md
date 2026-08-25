@@ -42,6 +42,23 @@ TLS terminates at the ingress. `gpq-remote` itself serves plaintext HTTP/1.1 and
 - llama.cpp and/or ComfyUI installed on Worker hosts
 - Optional S3-compatible object storage for Native input Artifacts and object-store output placement
 
+## Install `gpq-worker`
+
+Download the latest prebuilt Worker on macOS or Linux:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/smartcrabai/gpq/releases/latest/download/gpq-worker-installer.sh | sh
+```
+
+Or use Homebrew:
+
+```sh
+brew install smartcrabai/tap/gpq-worker
+```
+
+Windows users can download the matching `gpq-worker-*.zip` archive from the [latest release](https://github.com/smartcrabai/gpq/releases/latest).
+
 ## Build
 
 ```sh

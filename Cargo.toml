@@ -137,6 +137,8 @@ strip = true
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
+# gpq-proto builds run protoc; runner images ship none (Edition 2024 needs 33+).
+github-build-setup = "../build-setup.yml"
 install-path = "CARGO_HOME"
 installers = ["shell", "homebrew"]
 precise-builds = true

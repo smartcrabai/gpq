@@ -127,6 +127,11 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Install protoc"
+        uses: "arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b"
+        with:
+          "repo-token": "${{ secrets.GITHUB_TOKEN }}"
+          "version": "35.1"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

@@ -6,6 +6,7 @@
 //! path, run once at process startup.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -62,13 +63,15 @@ pub struct PoolConfig {
     /// Pool as unready.
     #[serde(rename = "startup_timeout_secs", deserialize_with = "duration_secs")]
     pub startup_timeout: Duration,
-    /// Loopback address the backend listens on.
+    /// Unauthenticated HTTP(S) URL on a loopback IP address where the backend
+    /// listens.
     pub base_url: url::Url,
     /// Execution Slot count; defaults to [`BackendKind::default_slots`] when
     /// unset.
     #[serde(default)]
     pub slots: Option<u32>,
-    /// Model files this Pool expects to find on disk.
+    /// Model paths this Pool expects to find on disk; paths may name files or
+    /// directories.
     #[serde(default)]
     pub model_paths: Vec<PathBuf>,
     /// Expected SHA-256 hash per model path (ADR 0005); a mismatch is
@@ -97,7 +100,8 @@ impl WorkerConfig {
     /// Returns an error if the file cannot be read, does not parse as valid
     /// TOML for this schema, or fails validation (empty/duplicate pool keys,
     /// overlapping device selectors, a non-absolute executable, a zero
-    /// startup timeout, or a malformed expected model hash).
+    /// startup timeout, an invalid backend URL, an invalid mlx-dspark model
+    /// path, or a malformed expected model hash).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading worker config {}", path.display()))?;
@@ -145,6 +149,58 @@ impl PoolConfig {
             "pool `{}` startup_timeout_secs must be greater than zero",
             self.key
         );
+        ensure!(
+            self.base_url.username().is_empty() && self.base_url.password().is_none(),
+            "pool `{}` base_url must not contain credentials",
+            self.key
+        );
+        ensure!(
+            matches!(self.base_url.scheme(), "http" | "https"),
+            "pool `{}` base_url must use http or https",
+            self.key
+        );
+        ensure!(
+            self.base_url.query().is_none() && self.base_url.fragment().is_none(),
+            "pool `{}` base_url must not contain a query or fragment",
+            self.key
+        );
+        let host = self
+            .base_url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("pool `{}` base_url must have a host", self.key))?;
+        let host_ip: IpAddr = host.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "pool `{}` base_url host must be a loopback IP address, got `{host}`",
+                self.key
+            )
+        })?;
+        ensure!(
+            host_ip.is_loopback(),
+            "pool `{}` base_url host must be a loopback IP address, got `{host}`",
+            self.key
+        );
+        if self.backend == BackendKind::MlxDspark {
+            ensure!(
+                self.model_paths.len() == 1,
+                "pool `{}` mlx_dspark backend requires exactly one local model path",
+                self.key
+            );
+            ensure!(
+                self.model_paths[0].is_absolute(),
+                "pool `{}` mlx_dspark model path must be absolute, got `{}`",
+                self.key,
+                self.model_paths[0].display()
+            );
+            let model_root = std::fs::canonicalize(&self.model_paths[0])
+                .unwrap_or_else(|_| self.model_paths[0].clone());
+            let state_root =
+                std::fs::canonicalize(&self.state_dir).unwrap_or_else(|_| self.state_dir.clone());
+            ensure!(
+                !state_root.starts_with(&model_root),
+                "pool `{}` mlx_dspark state_dir must not be inside its model path",
+                self.key
+            );
+        }
         for (path, hash) in &self.expected_hashes {
             ensure!(
                 is_hex_sha256(hash),
@@ -280,6 +336,94 @@ CUDA_VISIBLE_DEVICES = "1"
         assert!(state.is_dir());
         assert!(pool_a.is_dir());
         assert!(pool_b.is_dir());
+    }
+
+    #[test]
+    fn parses_mlx_dspark_pool() {
+        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let state = root.path().join("state");
+        let pool_a = root.path().join("gpu0");
+        let pool_b = root.path().join("gpu1");
+        let contents = sample_toml(&state, &pool_a, &pool_b).replacen(
+            "backend = \"llama_cpp\"",
+            "backend = \"mlx_dspark\"",
+            1,
+        );
+        let (_dir, path) = write_config(&contents);
+
+        let config = WorkerConfig::load(&path)
+            .unwrap_or_else(|err| panic!("expected mlx_dspark config to load: {err}"));
+        assert_eq!(config.pools[0].backend, gpq_domain::BackendKind::MlxDspark);
+    }
+
+    #[test]
+    fn rejects_invalid_mlx_model_path_count_or_form() {
+        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let state = root.path().join("state");
+        let pool_a = root.path().join("gpu0");
+        let pool_b = root.path().join("gpu1");
+        for model_paths in [
+            "model_paths = []",
+            "model_paths = [\"/models/foo.gguf\", \"/models/bar.gguf\"]",
+            "model_paths = [\"models/foo.gguf\"]",
+        ] {
+            let contents = sample_toml(&state, &pool_a, &pool_b)
+                .replacen("backend = \"llama_cpp\"", "backend = \"mlx_dspark\"", 1)
+                .replacen("model_paths = [\"/models/foo.gguf\"]", model_paths, 1);
+            let (_dir, path) = write_config(&contents);
+            assert!(
+                WorkerConfig::load(&path).is_err(),
+                "invalid MLX model paths must be rejected: {model_paths}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_loopback_backend_url() {
+        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let state = root.path().join("state");
+        let pool_a = root.path().join("gpu0");
+        let pool_b = root.path().join("gpu1");
+        let contents = sample_toml(&state, &pool_a, &pool_b).replacen(
+            "http://127.0.0.1:8081",
+            "http://192.0.2.1:8081",
+            1,
+        );
+        let (_dir, path) = write_config(&contents);
+        assert!(WorkerConfig::load(&path).is_err());
+    }
+
+    #[test]
+    fn rejects_backend_url_query_and_fragment() {
+        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let state = root.path().join("state");
+        let pool_a = root.path().join("gpu0");
+        let pool_b = root.path().join("gpu1");
+        for suffix in ["?x=1", "#backend"] {
+            let contents = sample_toml(&state, &pool_a, &pool_b).replacen(
+                "http://127.0.0.1:8081",
+                &format!("http://127.0.0.1:8081{suffix}"),
+                1,
+            );
+            let (_dir, path) = write_config(&contents);
+            assert!(
+                WorkerConfig::load(&path).is_err(),
+                "backend URL with {suffix} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_mlx_state_dir_inside_model_path() {
+        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let model = root.path().join("model");
+        let state = model.join("state");
+        let pool_b = root.path().join("gpu1");
+        let contents = sample_toml(&root.path().join("worker-state"), &state, &pool_b)
+            .replacen("backend = \"llama_cpp\"", "backend = \"mlx_dspark\"", 1)
+            .replacen("/models/foo.gguf", &model.to_string_lossy(), 1);
+        let (_dir, path) = write_config(&contents);
+        assert!(WorkerConfig::load(&path).is_err());
     }
 
     #[test]

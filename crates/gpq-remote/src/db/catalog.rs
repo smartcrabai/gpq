@@ -71,7 +71,7 @@ pub struct WorkflowAliasRow {
 
 /// One registered Model Version, as advertised by capable Workers.
 pub struct ModelVersionRow {
-    /// Lowercase hex SHA-256 of the model file.
+    /// Lowercase hex SHA-256 of the model material.
     pub content_hash: ContentHash,
     /// Modality the version serves.
     pub modality: Modality,

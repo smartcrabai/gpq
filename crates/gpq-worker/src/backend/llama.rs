@@ -30,16 +30,19 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
-use gpq_domain::{BackendKind, ContentHash, FailureKind};
+use gpq_domain::{ContentHash, FailureKind};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
-use super::{Backend, BackendCapabilities, BackendError, ExecutionEvent, ExecutionRequest};
+use super::{
+    Backend, BackendCapabilities, BackendError, ExecutionEvent, ExecutionRequest, endpoint,
+    http_client, run_with_timeout,
+};
 use crate::config::PoolConfig;
-use crate::models::hash_model;
+use crate::models::{hash_model, hash_model_fresh};
 
 /// Adapter over one managed `llama-server` process, reachable only at the
 /// loopback `base_url` configured for its Device Pool (ADR 0005).
@@ -97,23 +100,23 @@ impl LlamaBackend {
     #[must_use]
     pub fn new(pool: &PoolConfig) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: http_client(),
             base_url: pool.base_url.clone(),
             state_dir: pool.state_dir.clone(),
             resident: Mutex::new(None),
         }
     }
 
-    /// Builds the absolute URL for a `llama-server` route under `base_url`.
-    fn endpoint(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url.as_str().trim_end_matches('/'))
-    }
-
     /// `GET /props` (README.md:823-914): model metadata and slot count.
     /// Returns `None` on any transport, status, or decode failure so `probe`
     /// can report a failed probe instead of an error (ADR 0005).
     async fn fetch_props(&self) -> Option<PropsResponse> {
-        let response = self.client.get(self.endpoint("/props")).send().await.ok()?;
+        let response = self
+            .client
+            .get(endpoint(&self.base_url, "/props"))
+            .send()
+            .await
+            .ok()?;
         if !response.status().is_success() {
             return None;
         }
@@ -124,48 +127,16 @@ impl LlamaBackend {
     /// slot. Only the count is used here; `--no-slots` deployments simply
     /// yield `None` and `probe` falls back to `/props.total_slots`.
     async fn fetch_slots(&self) -> Option<Vec<serde_json::Value>> {
-        let response = self.client.get(self.endpoint("/slots")).send().await.ok()?;
+        let response = self
+            .client
+            .get(endpoint(&self.base_url, "/slots"))
+            .send()
+            .await
+            .ok()?;
         if !response.status().is_success() {
             return None;
         }
         response.json::<Vec<serde_json::Value>>().await.ok()
-    }
-
-    /// Sends the translated chat-completion request and dispatches to the
-    /// streaming or non-streaming response reader. `attempt_id` is only
-    /// used for diagnostics (e.g. logging tool calls this adapter cannot
-    /// yet forward).
-    async fn run_chat_completion(
-        &self,
-        payload: Value,
-        stream_tokens: bool,
-        events: &Sender<ExecutionEvent>,
-        cancel: &CancellationToken,
-        attempt_id: &str,
-    ) -> Result<(), BackendError> {
-        let send = self
-            .client
-            .post(self.endpoint("/v1/chat/completions"))
-            .json(&payload)
-            .send();
-        let response = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(cancelled_error()),
-            result = send => result,
-        }
-        .map_err(|err| super::normalize_transport_error(&err))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(classify_http_status(status, &body));
-        }
-
-        if stream_tokens {
-            stream_response(response, events, cancel, attempt_id).await
-        } else {
-            consume_response(response, events, attempt_id).await
-        }
     }
 
     /// Confirms the Model Version llama-server currently has loaded matches
@@ -187,7 +158,12 @@ impl LlamaBackend {
             Some(path) => Some(self.resident_model_hash(path).await?),
             None => None,
         };
-        verify_resident_model(loaded, expected_hash, request.model_path.as_deref())
+        verify_resident_model(
+            loaded,
+            expected_hash,
+            request.model_path.as_deref(),
+            "llama-server",
+        )
     }
 
     /// Returns the Model Version hash bound to this adapter's process,
@@ -233,9 +209,8 @@ impl LlamaBackend {
             _ => {}
         }
 
-        let state_dir = self.state_dir.clone();
         let hash_path = path.clone();
-        let hash = tokio::task::spawn_blocking(move || hash_model(&state_dir, &hash_path))
+        let hash = tokio::task::spawn_blocking(move || hash_model_fresh(&hash_path))
             .await
             .map_err(|err| BackendError {
                 kind: FailureKind::Internal,
@@ -256,6 +231,65 @@ impl LlamaBackend {
     }
 }
 
+/// Context shared by one OpenAI-compatible chat request.
+pub(super) struct OpenAiChatContext<'a> {
+    pub events: &'a Sender<ExecutionEvent>,
+    pub cancel: &'a CancellationToken,
+    pub attempt_id: &'a str,
+    pub backend_name: &'a str,
+    pub emit_tokens: bool,
+}
+
+/// Sends a chat completion to an OpenAI-compatible managed backend. Shared
+/// with mlx-dspark; response parsing stays identical because both expose the
+/// same non-streaming and SSE contracts.
+pub(super) async fn run_openai_chat_completion(
+    client: &reqwest::Client,
+    endpoint: String,
+    payload: Value,
+    stream_tokens: bool,
+    context: OpenAiChatContext<'_>,
+) -> Result<(), BackendError> {
+    let send = client.post(endpoint).json(&payload).send();
+    let response = tokio::select! {
+        biased;
+        () = context.cancel.cancelled() => return Err(cancelled_error()),
+        result = send => result,
+    }
+    .map_err(|err| super::normalize_transport_error(&err))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = tokio::select! {
+            biased;
+            () = context.cancel.cancelled() => return Err(cancelled_error()),
+            result = response.text() => result.unwrap_or_default(),
+        };
+        return Err(classify_http_status(status, &body, context.backend_name));
+    }
+
+    if stream_tokens {
+        stream_response(
+            response,
+            context.events,
+            context.cancel,
+            context.attempt_id,
+            context.backend_name,
+            context.emit_tokens,
+        )
+        .await
+    } else {
+        consume_response(
+            response,
+            context.events,
+            context.cancel,
+            context.attempt_id,
+            context.backend_name,
+        )
+        .await
+    }
+}
+
 #[async_trait::async_trait]
 impl Backend for LlamaBackend {
     async fn probe(&self) -> Result<BackendCapabilities, BackendError> {
@@ -265,7 +299,7 @@ impl Backend for LlamaBackend {
         // server none of the required operations are possible.
         let health_ok = self
             .client
-            .get(self.endpoint("/health"))
+            .get(endpoint(&self.base_url, "/health"))
             .send()
             .await
             .is_ok_and(|response| response.status().is_success());
@@ -327,40 +361,24 @@ impl Backend for LlamaBackend {
         cancel: CancellationToken,
     ) -> Result<(), BackendError> {
         self.verify_pinned_model(&request).await?;
-        let deadline = request.deadline;
-        let stream_tokens = request.stream_tokens;
         let payload = build_chat_request(&request)?;
-
-        match tokio::time::timeout(
-            deadline,
-            self.run_chat_completion(
+        run_with_timeout(
+            request.deadline,
+            run_openai_chat_completion(
+                &self.client,
+                endpoint(&self.base_url, "/v1/chat/completions"),
                 payload,
-                stream_tokens,
-                &events,
-                &cancel,
-                &request.attempt_id,
+                request.stream_tokens,
+                OpenAiChatContext {
+                    events: &events,
+                    cancel: &cancel,
+                    attempt_id: &request.attempt_id,
+                    backend_name: "llama-server",
+                    emit_tokens: request.stream_tokens,
+                },
             ),
         )
         .await
-        {
-            Ok(outcome) => outcome,
-            Err(_) => Err(BackendError {
-                kind: FailureKind::ExecutionTimedOut,
-                message: format!("execution exceeded the {deadline:?} deadline (ADR 0003)"),
-                retry_hint: FailureKind::ExecutionTimedOut.is_retryable(),
-            }),
-        }
-    }
-
-    async fn release_memory(&self) -> Result<bool, BackendError> {
-        // No unload endpoint exists for a single-model llama-server
-        // (`/models/unload` is router-server-only, README.md:1875-1915);
-        // the supervisor must terminate the process instead (ADR 0005).
-        Ok(false)
-    }
-
-    fn kind(&self) -> BackendKind {
-        BackendKind::LlamaCpp
     }
 }
 
@@ -379,7 +397,7 @@ struct PropsResponse {
 /// pinned seed, when present, overrides whatever `parameters` carries.
 /// Every other field (`messages`, `tools`, `response_format`, `stop`, ...)
 /// passes through unchanged, since ADR 0007 keeps these payloads opaque.
-fn build_chat_request(request: &ExecutionRequest) -> Result<Value, BackendError> {
+pub(super) fn build_chat_request(request: &ExecutionRequest) -> Result<Value, BackendError> {
     let Value::Object(mut body) = request.parameters.clone() else {
         return Err(BackendError {
             kind: FailureKind::InvalidInput,
@@ -399,15 +417,19 @@ fn build_chat_request(request: &ExecutionRequest) -> Result<Value, BackendError>
 async fn consume_response(
     response: reqwest::Response,
     events: &Sender<ExecutionEvent>,
+    cancel: &CancellationToken,
     attempt_id: &str,
+    backend_name: &str,
 ) -> Result<(), BackendError> {
-    let body = response
-        .bytes()
-        .await
-        .map_err(|err| super::normalize_transport_error(&err))?;
+    let body = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(cancelled_error()),
+        result = response.bytes() => result,
+    }
+    .map_err(|err| super::normalize_transport_error(&err))?;
     let completion: ChatCompletion = serde_json::from_slice(&body).map_err(|err| BackendError {
         kind: FailureKind::Internal,
-        message: format!("malformed response from llama-server /v1/chat/completions: {err}"),
+        message: format!("malformed response from {backend_name} /v1/chat/completions: {err}"),
         retry_hint: FailureKind::Internal.is_retryable(),
     })?;
 
@@ -419,7 +441,11 @@ async fn consume_response(
     if let Some(message) = message.as_ref()
         && !message.tool_calls.is_empty()
     {
-        return Err(unsupported_tool_calls(attempt_id, message.tool_calls.len()));
+        return Err(unsupported_tool_calls(
+            attempt_id,
+            message.tool_calls.len(),
+            backend_name,
+        ));
     }
     let text = message
         .and_then(|message| message.content)
@@ -432,13 +458,14 @@ async fn consume_response(
 /// Reads an SSE `/v1/chat/completions` stream, forwarding token deltas as
 /// they arrive and the assembled text, usage, and timings once it ends.
 /// Honors `cancel` by dropping the response (and its connection) mid-read,
-/// which is llama-server's only cancellation signal (README-dev.md,
-/// server-queue.cpp `should_stop`).
+/// which is the managed backend's cancellation signal.
 async fn stream_response(
     response: reqwest::Response,
     events: &Sender<ExecutionEvent>,
     cancel: &CancellationToken,
     attempt_id: &str,
+    backend_name: &str,
+    emit_tokens: bool,
 ) -> Result<(), BackendError> {
     let stream = response.bytes_stream();
     futures::pin_mut!(stream);
@@ -449,6 +476,8 @@ async fn stream_response(
     // U+FFFD. Decoding is deferred to whole frames below.
     let mut buffer: Vec<u8> = Vec::new();
     let mut assembled = String::new();
+    let mut deferred_usage = None;
+    let mut deferred_progress = None;
 
     loop {
         let next = tokio::select! {
@@ -461,23 +490,47 @@ async fn stream_response(
         buffer.extend_from_slice(&bytes);
 
         while let Some(pos) = find_frame_end(&buffer) {
-            let frame = buffer.drain(..=pos + 1).collect::<Vec<u8>>();
+            let frame = buffer.drain(..=pos).collect::<Vec<u8>>();
             // A frame ends at `\n\n`, which can never split a UTF-8
             // sequence, so the frame is always a whole character boundary.
             let frame = std::str::from_utf8(&frame).map_err(|err| BackendError {
                 kind: FailureKind::Internal,
-                message: format!("llama-server sent a non-UTF-8 SSE frame: {err}"),
+                message: format!("{backend_name} sent a non-UTF-8 SSE frame: {err}"),
                 retry_hint: FailureKind::Internal.is_retryable(),
             })?;
-            for event in parse_sse_frame(frame.trim_end(), attempt_id)? {
+            for event in parse_sse_frame(frame.trim_end(), attempt_id, backend_name)? {
                 match event {
                     SseEvent::Done => {
                         finish_stream(events, assembled).await;
+                        if !emit_tokens {
+                            if let Some((prompt_tokens, completion_tokens, total_tokens)) =
+                                deferred_usage
+                            {
+                                let _ = events
+                                    .send(ExecutionEvent::Usage {
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        total_tokens,
+                                    })
+                                    .await;
+                            }
+                            if let Some((step, total_steps)) = deferred_progress {
+                                let _ = events
+                                    .send(ExecutionEvent::Progress {
+                                        fraction: 1.0,
+                                        stage: "decode".to_owned(),
+                                        step,
+                                        total_steps,
+                                    })
+                                    .await;
+                            }
+                        }
                         return Ok(());
                     }
                     SseEvent::Token(text) => {
                         assembled.push_str(&text);
-                        if events.send(ExecutionEvent::Token { text }).await.is_err() {
+                        if emit_tokens && events.send(ExecutionEvent::Token { text }).await.is_err()
+                        {
                             return Ok(());
                         }
                     }
@@ -486,58 +539,76 @@ async fn stream_response(
                         completion_tokens,
                         total_tokens,
                     } => {
-                        let _ = events
-                            .send(ExecutionEvent::Usage {
-                                prompt_tokens,
-                                completion_tokens,
-                                total_tokens,
-                            })
-                            .await;
+                        if emit_tokens {
+                            let _ = events
+                                .send(ExecutionEvent::Usage {
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    total_tokens,
+                                })
+                                .await;
+                        } else {
+                            deferred_usage = Some((prompt_tokens, completion_tokens, total_tokens));
+                        }
                     }
                     SseEvent::Progress { step, total_steps } => {
-                        let _ = events
-                            .send(ExecutionEvent::Progress {
-                                fraction: 1.0,
-                                stage: "decode".to_string(),
-                                step,
-                                total_steps,
-                            })
-                            .await;
+                        if emit_tokens {
+                            let _ = events
+                                .send(ExecutionEvent::Progress {
+                                    fraction: 1.0,
+                                    stage: "decode".to_owned(),
+                                    step,
+                                    total_steps,
+                                })
+                                .await;
+                        } else {
+                            deferred_progress = Some((step, total_steps));
+                        }
                     }
                 }
             }
         }
     }
 
-    finish_stream(events, assembled).await;
-    Ok(())
+    Err(BackendError {
+        kind: FailureKind::Internal,
+        message: format!("{backend_name} closed the SSE stream without [DONE]"),
+        retry_hint: FailureKind::Internal.is_retryable(),
+    })
 }
 
-/// Emits the final assembled text once an SSE stream ends without a
-/// trailing `usage`/`timings` frame having already reported it.
+/// Emits the final assembled text when the SSE stream reaches its `[DONE]`
+/// sentinel, after any trailing `usage`/`timings` frames.
 async fn finish_stream(events: &Sender<ExecutionEvent>, assembled: String) {
     if !assembled.is_empty() {
         let _ = events.send(ExecutionEvent::Text { text: assembled }).await;
     }
 }
 
-/// Finds the index of the first byte of a `\n\n` SSE frame delimiter.
+/// Finds the index of the last byte of the first SSE frame delimiter.
+/// Accepts both the LF and CRLF forms allowed by the SSE protocol.
 fn find_frame_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(2).position(|pair| pair == b"\n\n")
+    if let Some(pos) = buffer.windows(2).position(|pair| pair == b"\n\n") {
+        return Some(pos + 1);
+    }
+    buffer
+        .windows(4)
+        .position(|pair| pair == b"\r\n\r\n")
+        .map(|pos| pos + 3)
 }
 
-/// The failure returned when llama-server reports a model-initiated tool
-/// call. ADR 0006 promises tool calls on the OpenAI-compatible surface, but
+/// The failure returned when an OpenAI-compatible managed backend reports a
+/// model-initiated tool call. ADR 0006 promises tool calls on the surface, but
 /// neither [`ExecutionEvent`] nor the `AttemptResult` wire contract can
 /// carry them yet, so this adapter refuses the Attempt loudly instead of
 /// returning the empty completion a dropped `tool_calls` array produces —
 /// a caller that sent `tools` must not be told the model simply said
 /// nothing.
-fn unsupported_tool_calls(attempt_id: &str, count: usize) -> BackendError {
+fn unsupported_tool_calls(attempt_id: &str, count: usize, backend_name: &str) -> BackendError {
     BackendError {
         kind: FailureKind::UnsupportedCapability,
         message: format!(
-            "llama-server returned {count} tool call(s) for attempt {attempt_id}, which this Worker cannot forward (ADR 0006)"
+            "{backend_name} returned {count} tool call(s) for attempt {attempt_id}, which this Worker cannot forward (ADR 0006)"
         ),
         retry_hint: FailureKind::UnsupportedCapability.is_retryable(),
     }
@@ -583,19 +654,23 @@ enum SseEvent {
         completion_tokens: u32,
         total_tokens: u32,
     },
-    /// llama.cpp's cumulative prompt/decode timings, reported on the final
-    /// streamed chunk (README.md:1421-1436) — the only progress signal this
-    /// backend exposes, since llama.cpp has no per-step progress event.
+    /// Cumulative prompt/decode timings reported on the final streamed chunk
+    /// (README.md:1421-1436) — the only progress signal this backend exposes,
+    /// since it has no per-step progress event.
     Progress { step: u32, total_steps: u32 },
     /// The `data: [DONE]` stream terminator.
     Done,
 }
 
-/// Parses one buffered SSE frame (the bytes between two `\n\n` delimiters)
+/// Parses one buffered SSE frame (the bytes through an SSE frame delimiter)
 /// into zero or more [`SseEvent`]s. Comment lines (`:` keep-alives) and
 /// frames without a `data:` line produce no events; `[DONE]` short-circuits
 /// to `Done` without attempting JSON decode.
-fn parse_sse_frame(frame: &str, attempt_id: &str) -> Result<Vec<SseEvent>, BackendError> {
+fn parse_sse_frame(
+    frame: &str,
+    attempt_id: &str,
+    backend_name: &str,
+) -> Result<Vec<SseEvent>, BackendError> {
     let data_lines: Vec<&str> = frame
         .lines()
         .filter_map(|line| line.strip_prefix("data:"))
@@ -611,7 +686,7 @@ fn parse_sse_frame(frame: &str, attempt_id: &str) -> Result<Vec<SseEvent>, Backe
 
     let chunk: ChatChunk = serde_json::from_str(&data).map_err(|err| BackendError {
         kind: FailureKind::Internal,
-        message: format!("malformed SSE chunk from llama-server /v1/chat/completions: {err}"),
+        message: format!("malformed SSE chunk from {backend_name} /v1/chat/completions: {err}"),
         retry_hint: FailureKind::Internal.is_retryable(),
     })?;
 
@@ -623,7 +698,11 @@ fn parse_sse_frame(frame: &str, attempt_id: &str) -> Result<Vec<SseEvent>, Backe
     if let Some(delta) = delta
         && !delta.tool_calls.is_empty()
     {
-        return Err(unsupported_tool_calls(attempt_id, delta.tool_calls.len()));
+        return Err(unsupported_tool_calls(
+            attempt_id,
+            delta.tool_calls.len(),
+            backend_name,
+        ));
     }
     if let Some(text) = delta
         .and_then(|delta| delta.content.clone())
@@ -652,7 +731,11 @@ fn parse_sse_frame(frame: &str, attempt_id: &str) -> Result<Vec<SseEvent>, Backe
 /// (it can arrive on any status code the server chooses), then a
 /// model-not-found/not-loaded message, then generic 4xx validation errors,
 /// with anything else falling back to `Internal`.
-fn classify_http_status(status: reqwest::StatusCode, body: &str) -> BackendError {
+fn classify_http_status(
+    status: reqwest::StatusCode,
+    body: &str,
+    backend_name: &str,
+) -> BackendError {
     let lower = body.to_lowercase();
     let mentions_oom = lower.contains("out of memory")
         || lower.contains("oom")
@@ -689,38 +772,39 @@ fn classify_http_status(status: reqwest::StatusCode, body: &str) -> BackendError
         // backend crash rather than an unclassified internal error.
         return BackendError {
             kind: FailureKind::BackendCrashed,
-            message: format!("llama-server returned {status}: {body}"),
+            message: format!("{backend_name} returned {status}: {body}"),
             retry_hint: FailureKind::BackendCrashed.is_retryable(),
         };
     }
     BackendError {
         kind: FailureKind::Internal,
-        message: format!("llama-server returned {status}: {body}"),
+        message: format!("{backend_name} returned {status}: {body}"),
         retry_hint: FailureKind::Internal.is_retryable(),
     }
 }
 
-/// Compares the Model Version llama-server reports as loaded against the
-/// Attempt's pinned hash (ADR 0012). `expected_path` is included only for
-/// the diagnostic message; the hash comparison is authoritative.
-fn verify_resident_model(
+/// Compares the Model Version a backend reports as loaded against the
+/// Attempt's pinned hash (ADR 0012). `expected_path` is diagnostic only; the
+/// hash comparison is authoritative.
+pub(super) fn verify_resident_model(
     loaded: Option<ContentHash>,
     expected_hash: ContentHash,
     expected_path: Option<&Path>,
+    backend_name: &str,
 ) -> Result<(), BackendError> {
     match loaded {
         Some(hash) if hash == expected_hash => Ok(()),
         Some(hash) => Err(BackendError {
             kind: FailureKind::ModelUnavailable,
             message: format!(
-                "llama-server has model {hash} loaded but this attempt is pinned to {expected_hash}{}",
+                "{backend_name} has model {hash} loaded but this attempt is pinned to {expected_hash}{}",
                 expected_path.map_or_else(String::new, |path| format!(" ({})", path.display()))
             ),
             retry_hint: false,
         }),
         None => Err(BackendError {
             kind: FailureKind::ModelUnavailable,
-            message: "llama-server reports no loaded model".to_string(),
+            message: format!("{backend_name} reports no loaded model"),
             retry_hint: true,
         }),
     }
@@ -728,7 +812,7 @@ fn verify_resident_model(
 
 /// Builds the `Cancelled` error reported when `execute`'s `CancellationToken`
 /// fires before the Attempt finished (ADR 0003).
-fn cancelled_error() -> BackendError {
+pub(super) fn cancelled_error() -> BackendError {
     BackendError {
         kind: FailureKind::Cancelled,
         message: "attempt cancelled".to_string(),
@@ -785,7 +869,7 @@ struct ChatDelta {
 #[derive(Deserialize)]
 #[expect(
     clippy::struct_field_names,
-    reason = "these fields mirror llama-server's exact OpenAI-compatible JSON field names (README.md:1440-1451); renaming would require per-field #[serde(rename)] for no benefit"
+    reason = "these fields mirror the managed backends' exact OpenAI-compatible JSON field names (README.md:1440-1451); renaming would require per-field #[serde(rename)] for no benefit"
 )]
 struct ChatUsage {
     prompt_tokens: u32,
@@ -793,8 +877,8 @@ struct ChatUsage {
     total_tokens: u32,
 }
 
-/// llama.cpp's `timings` extension (README.md:1421-1436); only the decoded
-/// token count is used, as the closest available progress signal.
+/// The managed backends' `timings` extension (README.md:1421-1436); only
+/// the decoded token count is used, as the closest available progress signal.
 #[derive(Deserialize)]
 struct ChatTimings {
     predicted_n: u32,
@@ -828,14 +912,14 @@ mod tests {
     #[test]
     fn verify_resident_model_accepts_matching_hash() {
         let hash = ContentHash::digest(b"model-a");
-        assert!(verify_resident_model(Some(hash), hash, None).is_ok());
+        assert!(verify_resident_model(Some(hash), hash, None, "llama-server").is_ok());
     }
 
     #[test]
     fn verify_resident_model_rejects_mismatched_pinned_version() {
         let loaded = ContentHash::digest(b"model-a");
         let pinned = ContentHash::digest(b"model-b");
-        let Err(error) = verify_resident_model(Some(loaded), pinned, None) else {
+        let Err(error) = verify_resident_model(Some(loaded), pinned, None, "llama-server") else {
             panic!("a resident model different from the pinned hash must be rejected");
         };
         assert_eq!(error.kind, FailureKind::ModelUnavailable);
@@ -845,7 +929,7 @@ mod tests {
     #[test]
     fn verify_resident_model_rejects_no_loaded_model() {
         let pinned = ContentHash::digest(b"model-a");
-        let Err(error) = verify_resident_model(None, pinned, None) else {
+        let Err(error) = verify_resident_model(None, pinned, None, "llama-server") else {
             panic!("no resident model must be rejected");
         };
         assert_eq!(error.kind, FailureKind::ModelUnavailable);
@@ -921,8 +1005,14 @@ mod tests {
     }
 
     #[test]
+    fn find_frame_end_accepts_lf_and_crlf() {
+        assert_eq!(find_frame_end(b"data: x\n\nrest"), Some(8));
+        assert_eq!(find_frame_end(b"data: x\r\n\r\nrest"), Some(10));
+    }
+
+    #[test]
     fn parse_sse_frame_returns_done_on_sentinel() {
-        let Ok(events) = parse_sse_frame("data: [DONE]", "attempt-test") else {
+        let Ok(events) = parse_sse_frame("data: [DONE]", "attempt-test", "llama-server") else {
             panic!("expected sentinel to parse");
         };
         assert_eq!(events, vec![SseEvent::Done]);
@@ -931,7 +1021,7 @@ mod tests {
     #[test]
     fn parse_sse_frame_extracts_token_delta() {
         let frame = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
-        let Ok(events) = parse_sse_frame(frame, "attempt-test") else {
+        let Ok(events) = parse_sse_frame(frame, "attempt-test", "llama-server") else {
             panic!("expected chunk to parse");
         };
         assert_eq!(events, vec![SseEvent::Token("hello".to_string())]);
@@ -940,7 +1030,7 @@ mod tests {
     #[test]
     fn parse_sse_frame_extracts_usage() {
         let frame = r#"data: {"choices":[],"usage":{"prompt_tokens":44,"completion_tokens":48,"total_tokens":92}}"#;
-        let Ok(events) = parse_sse_frame(frame, "attempt-test") else {
+        let Ok(events) = parse_sse_frame(frame, "attempt-test", "llama-server") else {
             panic!("expected usage chunk to parse");
         };
         assert_eq!(
@@ -956,7 +1046,7 @@ mod tests {
     #[test]
     fn parse_sse_frame_extracts_timings_as_progress() {
         let frame = r#"data: {"choices":[],"timings":{"predicted_n":35}}"#;
-        let Ok(events) = parse_sse_frame(frame, "attempt-test") else {
+        let Ok(events) = parse_sse_frame(frame, "attempt-test", "llama-server") else {
             panic!("expected timings chunk to parse");
         };
         assert_eq!(
@@ -970,7 +1060,7 @@ mod tests {
 
     #[test]
     fn parse_sse_frame_ignores_frames_without_data() {
-        let Ok(events) = parse_sse_frame(": keep-alive", "attempt-test") else {
+        let Ok(events) = parse_sse_frame(": keep-alive", "attempt-test", "llama-server") else {
             panic!("expected comment frame to parse to no events");
         };
         assert!(events.is_empty());
@@ -978,7 +1068,7 @@ mod tests {
 
     #[test]
     fn parse_sse_frame_rejects_malformed_json() {
-        let Err(error) = parse_sse_frame("data: {not json}", "attempt-test") else {
+        let Err(error) = parse_sse_frame("data: {not json}", "attempt-test", "llama-server") else {
             panic!("expected malformed JSON to be rejected");
         };
         assert_eq!(error.kind, FailureKind::Internal);
@@ -986,16 +1076,22 @@ mod tests {
 
     #[test]
     fn classify_http_status_maps_client_errors_to_invalid_input() {
-        let error =
-            classify_http_status(reqwest::StatusCode::BAD_REQUEST, "missing field messages");
+        let error = classify_http_status(
+            reqwest::StatusCode::BAD_REQUEST,
+            "missing field messages",
+            "llama-server",
+        );
         assert_eq!(error.kind, FailureKind::InvalidInput);
         assert!(!error.retry_hint);
     }
 
     #[test]
     fn classify_http_status_maps_missing_model_to_model_unavailable() {
-        let error =
-            classify_http_status(reqwest::StatusCode::NOT_FOUND, "model 'llama-3' not found");
+        let error = classify_http_status(
+            reqwest::StatusCode::NOT_FOUND,
+            "model 'llama-3' not found",
+            "llama-server",
+        );
         assert_eq!(error.kind, FailureKind::ModelUnavailable);
         assert!(!error.retry_hint);
     }
@@ -1005,6 +1101,7 @@ mod tests {
         let error = classify_http_status(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             "CUDA error: out of memory",
+            "llama-server",
         );
         assert_eq!(error.kind, FailureKind::OutOfMemory);
         assert!(error.retry_hint);
@@ -1015,6 +1112,7 @@ mod tests {
         let error = classify_http_status(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected panic",
+            "llama-server",
         );
         assert_eq!(error.kind, FailureKind::BackendCrashed);
         assert!(error.retry_hint, "a backend crash is retryable (ADR 0003)");
@@ -1022,7 +1120,8 @@ mod tests {
 
     #[test]
     fn classify_http_status_maps_unclassifiable_statuses_to_internal() {
-        let error = classify_http_status(reqwest::StatusCode::SEE_OTHER, "redirected");
+        let error =
+            classify_http_status(reqwest::StatusCode::SEE_OTHER, "redirected", "llama-server");
         assert_eq!(error.kind, FailureKind::Internal);
         assert!(!error.retry_hint);
     }

@@ -57,6 +57,7 @@ enum BackendKind {
   BACKEND_KIND_UNSPECIFIED = 0;
   BACKEND_KIND_LLAMA_CPP = 1;
   BACKEND_KIND_COMFYUI = 2;
+  BACKEND_KIND_MLX_DSPARK = 3;
 }
 
 // Coarse Artifact classification.

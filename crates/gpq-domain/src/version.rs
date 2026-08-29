@@ -29,7 +29,7 @@ pub struct ExecutionLimits {
 pub struct ModelVersion {
     /// Stored identity.
     pub id: ModelVersionId,
-    /// Content hash of the model file, computed by the Worker (ADR 0005).
+    /// Content hash of the model material, computed by the Worker (ADR 0005).
     pub content_hash: ContentHash,
     /// Modality the model serves.
     pub modality: Modality,

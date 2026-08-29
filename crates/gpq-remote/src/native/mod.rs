@@ -205,6 +205,7 @@ pub(crate) fn backend_kind_to_proto(kind: gpq_domain::BackendKind) -> EnumValue<
     use gpq_domain::BackendKind as D;
     EnumValue::Known(match kind {
         D::LlamaCpp => pb::BackendKind::BACKEND_KIND_LLAMA_CPP,
+        D::MlxDspark => pb::BackendKind::BACKEND_KIND_MLX_DSPARK,
         D::ComfyUi => pb::BackendKind::BACKEND_KIND_COMFYUI,
     })
 }
@@ -328,12 +329,16 @@ mod tests {
 
     #[test]
     fn backend_kind_maps_every_domain_variant() {
-        assert!(backend_kind_to_proto(BackendKind::LlamaCpp).is_known());
-        assert!(backend_kind_to_proto(BackendKind::ComfyUi).is_known());
-        assert_ne!(
-            backend_kind_to_proto(BackendKind::LlamaCpp).to_i32(),
-            backend_kind_to_proto(BackendKind::ComfyUi).to_i32()
-        );
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in [
+            BackendKind::LlamaCpp,
+            BackendKind::MlxDspark,
+            BackendKind::ComfyUi,
+        ] {
+            let proto = backend_kind_to_proto(kind);
+            assert!(proto.is_known());
+            assert!(seen.insert(proto.to_i32()));
+        }
     }
 
     #[test]

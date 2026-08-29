@@ -22,7 +22,7 @@ use crate::version::WorkflowManifest;
 pub struct Requirement {
     /// Owning Tenant.
     pub tenant_id: TenantId,
-    /// Runtime kind that must be the Slot's Active Runtime.
+    /// Runtime kind compatible with the Slot's Active Runtime.
     pub backend_kind: BackendKind,
     /// Pinned Model or Workflow Version hash.
     pub version: ContentHash,
@@ -35,7 +35,7 @@ pub struct Requirement {
 }
 
 impl Requirement {
-    /// Builds the requirement of a llama.cpp Model Version.
+    /// Builds the requirement of an LLM Model Version.
     #[must_use]
     pub fn for_model(tenant_id: TenantId, version: ContentHash, vram_bytes: Option<u64>) -> Self {
         Self {
@@ -147,7 +147,7 @@ impl SlotCapability {
         if self.tenant_id != requirement.tenant_id {
             return Err(IncapableReason::TenantMismatch);
         }
-        if self.backend_kind != requirement.backend_kind {
+        if !self.backend_kind.satisfies(requirement.backend_kind) {
             return Err(IncapableReason::BackendMismatch {
                 required: requirement.backend_kind,
                 found: self.backend_kind,
@@ -189,13 +189,11 @@ impl SlotCapability {
     /// Cache-aware scheduling prefers these Slots (ADR 0002).
     #[must_use]
     pub fn holds_resident_model(&self, requirement: &Requirement) -> bool {
-        match self.resident_model {
-            Some(resident) => match requirement.backend_kind {
-                BackendKind::LlamaCpp => resident == requirement.version,
+        self.resident_model
+            .is_some_and(|resident| match requirement.backend_kind {
+                BackendKind::LlamaCpp | BackendKind::MlxDspark => resident == requirement.version,
                 BackendKind::ComfyUi => requirement.required_models.contains(&resident),
-            },
-            None => false,
-        }
+            })
     }
 
     /// Records that this Slot proved incapable of a version.
@@ -280,6 +278,18 @@ mod tests {
         );
         slot.model_versions.insert(hash(b"m"));
         assert_eq!(slot.admits(&requirement), Ok(()));
+    }
+
+    #[test]
+    fn mlx_dspark_admits_llm_model_requirements() {
+        let tenant = TenantId::new();
+        let mut slot = slot(tenant, BackendKind::MlxDspark);
+        slot.model_versions.insert(hash(b"m"));
+        slot.resident_model = Some(hash(b"m"));
+        let requirement = Requirement::for_model(tenant, hash(b"m"), None);
+
+        assert_eq!(slot.admits(&requirement), Ok(()));
+        assert!(slot.holds_resident_model(&requirement));
     }
 
     #[test]

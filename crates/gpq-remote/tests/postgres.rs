@@ -56,8 +56,9 @@ async fn migrations_apply_in_order_and_reapplication_is_a_noop() -> anyhow::Resu
     assert_eq!(
         versions,
         // 0004 makes `device_pools.free_slots` a generated column derived
-        // from `claimed_slots`; 0005 indexes the execution-deadline sweep.
-        vec![1, 2, 3, 4, 5],
+        // from `claimed_slots`; 0005 indexes the execution-deadline sweep;
+        // 0006 admits the mlx-dspark backend kind.
+        vec![1, 2, 3, 4, 5, 6],
         "unexpected applied migration versions: {versions:?}"
     );
 
@@ -73,6 +74,44 @@ async fn migrations_apply_in_order_and_reapplication_is_a_noop() -> anyhow::Resu
         "re-running migrations must not duplicate rows"
     );
 
+    harness.teardown().await
+}
+
+/// Migration 0006 must make the new backend kind persistable, not merely add
+/// the enum value to the generated protocol bindings.
+#[tokio::test]
+async fn mlx_dspark_backend_kind_is_accepted_by_device_pools() -> anyhow::Result<()> {
+    let harness = Harness::new().await?;
+    let tenant_id = Uuid::now_v7();
+    let worker_id = Uuid::now_v7();
+    let pool_id = Uuid::now_v7();
+    insert_tenant(harness.pool(), tenant_id, "mlx-tenant").await?;
+    insert_worker(
+        harness.pool(),
+        tenant_id,
+        worker_id,
+        "mlx-worker",
+        &[0; 32],
+        None,
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO device_pools \
+         (tenant_id, id, worker_id, pool_key, backend_kind, total_slots, claimed_slots) \
+         VALUES ($1, $2, $3, $4, 'mlx_dspark', 1, 0)",
+    )
+    .bind(tenant_id)
+    .bind(pool_id)
+    .bind(worker_id)
+    .bind("apple0")
+    .execute(harness.pool())
+    .await?;
+    let (backend_kind,): (String,) =
+        sqlx::query_as("SELECT backend_kind FROM device_pools WHERE id = $1")
+            .bind(pool_id)
+            .fetch_one(harness.pool())
+            .await?;
+    assert_eq!(backend_kind, "mlx_dspark");
     harness.teardown().await
 }
 

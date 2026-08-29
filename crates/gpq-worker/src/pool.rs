@@ -295,10 +295,10 @@ impl PoolSupervisor {
     /// Fails before any Attempt-shaped work happens (ADR 0003): a backend
     /// kind mismatch or an unregistered Model Version fails immediately and
     /// permanently, while a currently-loaded-but-different Model Version on
-    /// a running llama.cpp process fails as `ModelUnavailable` since that
-    /// runtime cannot swap models without a restart the caller did not ask
-    /// for. Returns `Internal` if the Pool has no free Slot right after
-    /// becoming ready.
+    /// a running LLM backend fails as `ModelUnavailable` since that runtime
+    /// cannot swap models without a restart the caller did not ask for.
+    /// Returns `Internal` if the Pool has no free Slot right after becoming
+    /// ready.
     pub async fn ensure_runtime_and_acquire_slot(
         &self,
         pool_key: &str,
@@ -313,10 +313,7 @@ impl PoolSupervisor {
                 retry_hint: false,
             });
         };
-        let hosted_kind = lock_state(&entry.state)
-            .backend
-            .as_ref()
-            .map_or(entry.config.backend, |active| active.kind());
+        let hosted_kind = entry.config.backend;
         let registered_models: Vec<ContentHash> =
             entry.models.iter().map(|(_, hash)| *hash).collect();
         runtime_precondition(
@@ -356,6 +353,24 @@ impl PoolSupervisor {
                 });
             }
             None => {
+                // A failed readiness probe can leave the old child alive while
+                // marking the Pool unready. Terminate it before replacing the
+                // adapter, otherwise it can retain the GPU/port and consume
+                // work intended for the replacement process.
+                let old_process = lock_state(&entry.state).process.take();
+                if let Some(mut old_process) = old_process {
+                    let _ = old_process.terminate_tree(TERMINATE_GRACE).await;
+                }
+                {
+                    let mut state = lock_state(&entry.state);
+                    state.backend = None;
+                    state.ready = false;
+                    state.slots_total = 0;
+                    state.slots_free = 0;
+                    state.busy.clear();
+                    state.resident_model = None;
+                    state.pending_model_demand = None;
+                }
                 start_pool_process(&entry).await?;
 
                 let state = lock_state(&entry.state);
@@ -617,16 +632,17 @@ async fn start_pool_process(entry: &Arc<PoolEntry>) -> Result<(), BackendError> 
         spawn_stream_logger(entry.config.key.clone(), "stderr", stderr);
     }
 
-    // A backend answers HTTP well before it can generate: llama.cpp loads the
-    // model first, ComfyUI imports custom nodes first. Both report their
+    // A backend answers HTTP well before it can generate: LLM backends load the
+    // model first, while ComfyUI imports custom nodes first. Both report their
     // required-operation probes as failed rather than erroring (ADR 0005), so
     // wait for the probes themselves to pass, not merely for an answer, and
     // keep the last observation for the unready reason.
     let ready_by = Instant::now() + entry.config.startup_timeout;
     let mut last_error: Option<BackendError> = None;
     let capabilities = loop {
-        match backend.probe().await {
-            Ok(capabilities) => {
+        let remaining = ready_by.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, backend.probe()).await {
+            Ok(Ok(capabilities)) => {
                 if capabilities.probes.values().all(|&passed| passed) {
                     break capabilities;
                 }
@@ -634,15 +650,31 @@ async fn start_pool_process(entry: &Arc<PoolEntry>) -> Result<(), BackendError> 
                     break capabilities;
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 if Instant::now() >= ready_by {
                     return Err(last_error.unwrap_or(err));
                 }
                 last_error = Some(err);
             }
+            Err(_) => {
+                return Err(BackendError {
+                    kind: FailureKind::BackendCrashed,
+                    message: format!(
+                        "backend probe exceeded the {:?} startup timeout",
+                        entry.config.startup_timeout
+                    ),
+                    retry_hint: true,
+                });
+            }
         }
         tokio::time::sleep(PROBE_RETRY_INTERVAL).await;
     };
+
+    ensure_registered_resident_model(
+        entry.config.backend,
+        &entry.models,
+        capabilities.resident_model,
+    )?;
 
     let all_probes_pass = capabilities.probes.values().all(|&passed| passed);
     let slots_total = if capabilities.slots > 0 {
@@ -713,7 +745,7 @@ fn runtime_precondition(
     registered_models: &[ContentHash],
     resident_model: Option<ContentHash>,
 ) -> Result<(), BackendError> {
-    if requested_kind != hosted_kind {
+    if !hosted_kind.satisfies(requested_kind) {
         return Err(BackendError {
             kind: FailureKind::UnsupportedCapability,
             message: format!("pool `{pool_key}` hosts {hosted_kind} only, not {requested_kind}"),
@@ -732,24 +764,49 @@ fn runtime_precondition(
     Ok(())
 }
 
+/// Whether a probed MLX runtime loaded one of the model versions scanned before
+/// its process started. MLX reports its live model path, so this check closes
+/// the race where model bytes change between the startup scan and first probe.
+fn resident_model_matches_registered(
+    backend: BackendKind,
+    registered_models: &[(PathBuf, ContentHash)],
+    resident_model: Option<ContentHash>,
+) -> bool {
+    backend != BackendKind::MlxDspark
+        || resident_model.is_some_and(|resident| {
+            registered_models
+                .iter()
+                .any(|(_, registered)| *registered == resident)
+        })
+}
+
+fn ensure_registered_resident_model(
+    backend: BackendKind,
+    registered_models: &[(PathBuf, ContentHash)],
+    resident_model: Option<ContentHash>,
+) -> Result<(), BackendError> {
+    if resident_model_matches_registered(backend, registered_models, resident_model) {
+        return Ok(());
+    }
+    Err(BackendError {
+        kind: FailureKind::ModelUnavailable,
+        message: format!("{backend} reported an unregistered resident Model Version"),
+        retry_hint: false,
+    })
+}
+
 /// Whether an already-running Active Runtime can serve `requested` without a
 /// restart.
 ///
-/// llama.cpp loads exactly one model per process and cannot swap it without
-/// restarting (ADR 0005), so a running llama.cpp Pool only satisfies a
-/// request for the Model Version it already has resident. `ComfyUI` selects
-/// its checkpoint from within each submitted Workflow graph rather than
-/// holding one persistent resident model, so any running `ComfyUI` Pool
-/// satisfies any request.
+/// LLM runtimes load exactly one model per process, so they only satisfy a
+/// request for the Model Version already resident. `ComfyUI` selects its
+/// checkpoint from each submitted Workflow graph and satisfies any request.
 fn runtime_satisfies(
     backend: BackendKind,
     resident: Option<ContentHash>,
     requested: Option<ContentHash>,
 ) -> bool {
-    match (backend, requested) {
-        (_, None) | (BackendKind::ComfyUi, Some(_)) => true,
-        (BackendKind::LlamaCpp, Some(hash)) => resident == Some(hash),
-    }
+    requested.is_none() || backend == BackendKind::ComfyUi || resident == requested
 }
 
 /// Whether an idle Active Runtime should be unloaded now (ADR 0005: models
@@ -782,8 +839,8 @@ mod tests {
     use gpq_domain::AttemptId;
 
     use super::{
-        IDLE_UNLOAD_AFTER, PoolState, mark_unready_for_exit, runtime_precondition,
-        runtime_satisfies, should_unload_idle, unready_reason,
+        IDLE_UNLOAD_AFTER, PoolState, mark_unready_for_exit, resident_model_matches_registered,
+        runtime_precondition, runtime_satisfies, should_unload_idle, unready_reason,
     };
 
     #[test]
@@ -899,28 +956,49 @@ mod tests {
     }
 
     #[test]
-    fn llama_cpp_only_satisfies_its_own_resident_model() {
+    fn mlx_runtime_must_report_a_registered_resident_model() {
+        use gpq_domain::{BackendKind, ContentHash};
+        use std::path::PathBuf;
+
+        let registered = ContentHash::digest(b"registered");
+        let other = ContentHash::digest(b"other");
+        let models = vec![(PathBuf::from("/models/model"), registered)];
+
+        assert!(resident_model_matches_registered(
+            BackendKind::MlxDspark,
+            &models,
+            Some(registered)
+        ));
+        assert!(!resident_model_matches_registered(
+            BackendKind::MlxDspark,
+            &models,
+            Some(other)
+        ));
+        assert!(!resident_model_matches_registered(
+            BackendKind::MlxDspark,
+            &models,
+            None
+        ));
+        assert!(resident_model_matches_registered(
+            BackendKind::LlamaCpp,
+            &models,
+            None
+        ));
+    }
+
+    #[test]
+    fn llm_backends_only_satisfy_their_own_resident_model() {
         use gpq_domain::{BackendKind, ContentHash};
 
         let resident = ContentHash::digest(b"model-a");
         let other = ContentHash::digest(b"model-b");
 
-        assert!(runtime_satisfies(
-            BackendKind::LlamaCpp,
-            Some(resident),
-            None
-        ));
-        assert!(runtime_satisfies(
-            BackendKind::LlamaCpp,
-            Some(resident),
-            Some(resident)
-        ));
-        assert!(!runtime_satisfies(
-            BackendKind::LlamaCpp,
-            Some(resident),
-            Some(other)
-        ));
-        assert!(!runtime_satisfies(BackendKind::LlamaCpp, None, Some(other)));
+        for backend in [BackendKind::LlamaCpp, BackendKind::MlxDspark] {
+            assert!(runtime_satisfies(backend, Some(resident), None));
+            assert!(runtime_satisfies(backend, Some(resident), Some(resident)));
+            assert!(!runtime_satisfies(backend, Some(resident), Some(other)));
+            assert!(!runtime_satisfies(backend, None, Some(other)));
+        }
     }
 
     #[test]
@@ -994,20 +1072,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_precondition_accepts_a_registered_resident_model() {
+    fn runtime_precondition_accepts_registered_llm_resident_models() {
         use gpq_domain::{BackendKind, ContentHash};
 
         let hash = ContentHash::digest(b"registered");
-        assert!(
-            runtime_precondition(
-                "gpu0",
-                BackendKind::LlamaCpp,
-                BackendKind::LlamaCpp,
-                &[hash],
-                Some(hash)
-            )
-            .is_ok()
-        );
+        for backend in [BackendKind::LlamaCpp, BackendKind::MlxDspark] {
+            assert!(
+                runtime_precondition("gpu0", backend, BackendKind::LlamaCpp, &[hash], Some(hash))
+                    .is_ok()
+            );
+        }
     }
 
     #[test]

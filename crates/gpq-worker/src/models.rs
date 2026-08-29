@@ -1,8 +1,8 @@
 //! Model Version content hashing and caching (ADR 0005, ADR 0012).
 //!
 //! Workers compute SHA-256 Model Version hashes and cache them atomically by
-//! path, size, modification time, and file identity, rehashing on any change
-//! and rejecting configured `expected_hashes` mismatches rather than silently
+//! path and member metadata, rehashing on any change and rejecting configured
+//! `expected_hashes` mismatches rather than silently
 //! trusting stale or substituted model material.
 
 use std::collections::BTreeMap;
@@ -14,10 +14,11 @@ use anyhow::Context;
 use gpq_domain::ContentHash;
 use gpq_domain::hash::Hasher;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::PoolConfig;
 
-/// Streamed read chunk size while hashing model files.
+/// Streamed read chunk size while hashing model material.
 const HASH_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// Per-process counter mixed into temp cache file names so concurrent
@@ -36,43 +37,112 @@ struct CacheKey {
     mtime_unix_nanos: i128,
     /// Platform file identity: Unix `dev:ino`, Windows `volume:file_index`.
     file_id: String,
+    /// Distinguishes a model directory from a single model file.
+    #[serde(default)]
+    directory: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry {
     key: CacheKey,
+    /// Relative path to metadata for every entry in a model directory.
+    #[serde(default)]
+    members: BTreeMap<String, CacheKey>,
     hash: ContentHash,
 }
 
 /// Path -> cache entry, persisted as one JSON file per Pool state directory.
 type CacheFile = BTreeMap<String, CacheEntry>;
+type ModelFiles = (BTreeMap<String, CacheKey>, Vec<(String, PathBuf)>);
 
-/// Computes (or returns the cached) SHA-256 [`ContentHash`] of the file at
-/// `path`.
+/// Computes (or returns the cached) SHA-256 [`ContentHash`] of one model.
 ///
-/// The cache lives under `state_dir` as `model-hash-cache.json`, keyed by
-/// path, file size, modification time, and platform file identity; any
-/// mismatch on any of those forces a fresh hash, and the cache file itself is
-/// written atomically (temp file + rename) so a crash mid-write never leaves
-/// a corrupt cache (ADR 0005).
+/// Single-file models retain their raw file digest. Directory models use a
+/// deterministic digest of every relative path and regular file, which lets
+/// mlx-dspark models made of config, tokenizer, and sharded weight files obey
+/// the same immutable-version contract.
 pub fn hash_model(state_dir: &Path, path: &Path) -> anyhow::Result<ContentHash> {
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("reading metadata for model {}", path.display()))?;
     let key = cache_key(&metadata)?;
+    let (members, files) = model_files(path, &metadata)?;
     let path_key = path.to_string_lossy().into_owned();
     let cache_path = state_dir.join(CACHE_FILE_NAME);
 
     let mut cache = load_cache(&cache_path)?;
     if let Some(entry) = cache.get(&path_key)
         && entry.key == key
+        && entry.members == members
     {
         return Ok(entry.hash);
     }
 
-    let hash = digest_file(path)?;
-    cache.insert(path_key, CacheEntry { key, hash });
+    let hash = if key.directory {
+        digest_directory(&files)?
+    } else {
+        digest_file(path)?
+    };
+    cache.insert(path_key, CacheEntry { key, members, hash });
     save_cache(&cache_path, &cache)?;
     Ok(hash)
+}
+
+/// Computes a model hash without consulting the metadata cache. This is used
+/// at trust boundaries where a model's bytes must be checked, rather than
+/// relying on metadata that a file replacement can preserve.
+pub(crate) fn hash_model_fresh(path: &Path) -> anyhow::Result<ContentHash> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading metadata for model {}", path.display()))?;
+    let (_, files) = model_files(path, &metadata)?;
+    if metadata.is_dir() {
+        digest_directory(&files)
+    } else {
+        digest_file(path)
+    }
+}
+
+/// Hashes model material while checking `cancel` between directory entries and
+/// bounded file reads. The blocking caller can therefore stop promptly when a
+/// timed-out or cancelled attempt drops its awaiter.
+pub(crate) fn hash_model_fresh_cancellable(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> anyhow::Result<ContentHash> {
+    ensure_not_cancelled(cancel)?;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading metadata for model {}", path.display()))?;
+    let (_, files) = model_files_with_cancel(path, &metadata, cancel)?;
+    if metadata.is_dir() {
+        digest_directory_with_cancel(&files, cancel)
+    } else {
+        digest_file_with_cancel(path, cancel)
+    }
+}
+
+fn model_files(path: &Path, metadata: &Metadata) -> anyhow::Result<ModelFiles> {
+    let mut members = BTreeMap::new();
+    let mut files = Vec::new();
+    if metadata.is_dir() {
+        collect_model_files(path, path, &mut members, &mut files)?;
+    } else if !metadata.is_file() {
+        anyhow::bail!("model {} is not a file or directory", path.display());
+    }
+    Ok((members, files))
+}
+
+fn model_files_with_cancel(
+    path: &Path,
+    metadata: &Metadata,
+    cancel: &CancellationToken,
+) -> anyhow::Result<ModelFiles> {
+    let mut members = BTreeMap::new();
+    let mut files = Vec::new();
+    if metadata.is_dir() {
+        collect_model_files_with_cancel(path, path, &mut members, &mut files, cancel)?;
+    } else if !metadata.is_file() {
+        anyhow::bail!("model {} is not a file or directory", path.display());
+    }
+    Ok((members, files))
 }
 
 /// Hashes every model configured for `pool`, rejecting (with an `Err`) any
@@ -82,7 +152,7 @@ pub fn scan_models(pool: &PoolConfig) -> anyhow::Result<Vec<(PathBuf, ContentHas
     pool.model_paths
         .iter()
         .map(|path| {
-            let hash = hash_model(&pool.state_dir, path)?;
+            let hash = hash_model_fresh(path)?;
             if let Some(expected_hex) = pool
                 .expected_hashes
                 .get(&path.to_string_lossy().into_owned())
@@ -122,6 +192,7 @@ fn cache_key(metadata: &Metadata) -> anyhow::Result<CacheKey> {
         size: metadata.len(),
         mtime_unix_nanos,
         file_id: file_identity(metadata),
+        directory: metadata.is_dir(),
     })
 }
 
@@ -141,21 +212,130 @@ fn file_identity(metadata: &Metadata) -> String {
     format!("ctime:{}", metadata.creation_time())
 }
 
+/// Collects one model directory in stable relative-path order. Symlinked
+/// files are hashed by content; symlinked directories are rejected to avoid
+/// escaping the model tree or following cycles.
+fn collect_model_files(
+    root: &Path,
+    directory: &Path,
+    members: &mut BTreeMap<String, CacheKey>,
+    files: &mut Vec<(String, PathBuf)>,
+) -> anyhow::Result<()> {
+    let no_cancel = CancellationToken::new();
+    collect_model_files_with_cancel(root, directory, members, files, &no_cancel)
+}
+
+fn collect_model_files_with_cancel(
+    root: &Path,
+    directory: &Path,
+    members: &mut BTreeMap<String, CacheKey>,
+    files: &mut Vec<(String, PathBuf)>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    ensure_not_cancelled(cancel)?;
+    let mut entries = std::fs::read_dir(directory)
+        .with_context(|| format!("reading model directory {}", directory.display()))?
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    for entry in entries {
+        ensure_not_cancelled(cancel)?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("reading model entry {}", path.display()))?;
+        let relative = relative_model_path(root, &path)?;
+        members.insert(relative.clone(), cache_key(&metadata)?);
+        if metadata.is_dir() {
+            anyhow::ensure!(
+                !file_type.is_symlink(),
+                "model directory symlink {} is not supported",
+                path.display()
+            );
+            collect_model_files_with_cancel(root, &path, members, files, cancel)?;
+        } else if metadata.is_file() {
+            files.push((relative, path));
+        } else {
+            anyhow::bail!("model entry {} is not a file or directory", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn relative_model_path(root: &Path, path: &Path) -> anyhow::Result<String> {
+    path.strip_prefix(root)?
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_owned)
+                .context("model paths must be valid UTF-8")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(|components| components.join("/"))
+}
+
+fn digest_directory(files: &[(String, PathBuf)]) -> anyhow::Result<ContentHash> {
+    let no_cancel = CancellationToken::new();
+    digest_directory_with_cancel(files, &no_cancel)
+}
+
+fn digest_directory_with_cancel(
+    files: &[(String, PathBuf)],
+    cancel: &CancellationToken,
+) -> anyhow::Result<ContentHash> {
+    let mut hasher = Hasher::new();
+    hasher.update(b"gpq-model-directory-v1\0");
+    let mut buffer = vec![0_u8; HASH_CHUNK_BYTES];
+    for (relative, path) in files {
+        ensure_not_cancelled(cancel)?;
+        let name = relative.as_bytes();
+        let name_len = u64::try_from(name.len()).context("model relative path is too long")?;
+        let size = std::fs::metadata(path)?.len();
+        hasher.update(&name_len.to_be_bytes());
+        hasher.update(name);
+        hasher.update(&size.to_be_bytes());
+        update_file_hash_with_cancel(&mut hasher, path, &mut buffer, cancel)?;
+    }
+    Ok(hasher.finish())
+}
+
 fn digest_file(path: &Path) -> anyhow::Result<ContentHash> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("opening model {}", path.display()))?;
+    let no_cancel = CancellationToken::new();
+    digest_file_with_cancel(path, &no_cancel)
+}
+
+fn digest_file_with_cancel(path: &Path, cancel: &CancellationToken) -> anyhow::Result<ContentHash> {
     let mut hasher = Hasher::new();
     let mut buffer = vec![0_u8; HASH_CHUNK_BYTES];
+    update_file_hash_with_cancel(&mut hasher, path, &mut buffer, cancel)?;
+    Ok(hasher.finish())
+}
+
+fn update_file_hash_with_cancel(
+    hasher: &mut Hasher,
+    path: &Path,
+    buffer: &mut [u8],
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening model {}", path.display()))?;
     loop {
+        ensure_not_cancelled(cancel)?;
         let read = file
-            .read(&mut buffer)
+            .read(buffer)
             .with_context(|| format!("reading model {}", path.display()))?;
         if read == 0 {
-            break;
+            return Ok(());
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finish())
+}
+
+fn ensure_not_cancelled(cancel: &CancellationToken) -> anyhow::Result<()> {
+    anyhow::ensure!(!cancel.is_cancelled(), "model hashing cancelled");
+    Ok(())
 }
 
 fn load_cache(path: &Path) -> anyhow::Result<CacheFile> {
@@ -197,7 +377,7 @@ mod tests {
 
     use gpq_domain::ContentHash;
 
-    use super::hash_model;
+    use super::{hash_model, hash_model_fresh, hash_model_fresh_cancellable};
 
     fn write_file(path: &std::path::Path, content: &[u8]) {
         let Ok(mut file) = std::fs::File::create(path) else {
@@ -262,6 +442,77 @@ mod tests {
 
         assert_ne!(first, second);
         assert_eq!(second, ContentHash::digest(b"weights v2, now longer"));
+    }
+
+    #[test]
+    fn fresh_hash_detects_same_metadata_content_replacement() {
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("tempdir")
+        };
+        let model_path = dir.path().join("model.gguf");
+        write_file(&model_path, b"weights v1");
+        let Ok(modified) = std::fs::metadata(&model_path).and_then(|m| m.modified()) else {
+            panic!("read mtime")
+        };
+        let Ok(first) = hash_model_fresh(&model_path) else {
+            panic!("first fresh hash")
+        };
+
+        write_file(&model_path, b"weights v2");
+        let Ok(file) = std::fs::File::open(&model_path) else {
+            panic!("reopen model file")
+        };
+        let Ok(()) = file.set_modified(modified) else {
+            panic!("restore mtime")
+        };
+        let Ok(second) = hash_model_fresh(&model_path) else {
+            panic!("second fresh hash")
+        };
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn cancellable_hash_honors_pre_cancelled_token() {
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("tempdir")
+        };
+        let model_path = dir.path().join("model.gguf");
+        write_file(&model_path, b"weights");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        assert!(hash_model_fresh_cancellable(&model_path, &cancel).is_err());
+    }
+
+    #[test]
+    fn directory_hash_is_stable_and_tracks_member_changes() {
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("tempdir")
+        };
+        let model_path = dir.path().join("model");
+        let Ok(()) = std::fs::create_dir(&model_path) else {
+            panic!("create model directory")
+        };
+        write_file(&model_path.join("config.json"), b"{}");
+        write_file(&model_path.join("weights.safetensors"), b"weights v1");
+
+        let Ok(first) = hash_model(dir.path(), &model_path) else {
+            panic!("first directory hash")
+        };
+        let Ok(second) = hash_model(dir.path(), &model_path) else {
+            panic!("cached directory hash")
+        };
+        assert_eq!(first, second);
+
+        write_file(
+            &model_path.join("weights.safetensors"),
+            b"weights v2, longer",
+        );
+        let Ok(changed) = hash_model(dir.path(), &model_path) else {
+            panic!("changed directory hash")
+        };
+        assert_ne!(first, changed);
     }
 
     #[test]

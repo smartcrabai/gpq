@@ -1,6 +1,6 @@
 # gpq
 
-GPU Generation Queue (`gpq`) coordinates tenant-owned GPU workers and AI generation requests while prioritizing GPU utilization. It provides OpenAI-compatible HTTP APIs, a durable native Connect API, and workers that supervise local llama.cpp and ComfyUI processes.
+GPU Generation Queue (`gpq`) coordinates tenant-owned GPU workers and AI generation requests while prioritizing GPU utilization. It provides OpenAI-compatible HTTP APIs, a durable native Connect API, and workers that supervise local llama.cpp, mlx-dspark, and ComfyUI processes.
 
 ## Architecture
 
@@ -39,7 +39,7 @@ TLS terminates at the ingress. `gpq-remote` itself serves plaintext HTTP/1.1 and
 - `protoc` 33 or newer; CI uses 35.1
 - PostgreSQL; integration tests use PostgreSQL 18
 - Docker for database and object-store integration tests
-- llama.cpp and/or ComfyUI installed on Worker hosts
+- llama.cpp, mlx-dspark (Apple Silicon), and/or ComfyUI installed on Worker hosts
 - Optional S3-compatible object storage for Native input Artifacts and object-store output placement
 
 ## Install `gpq-worker`
@@ -179,7 +179,7 @@ Set `GPQ_DATABASE_URL`, `GPQ_CREDENTIAL_KEY`, and `GPQ_PUBLIC_BASE_URL` for each
 
 ## Worker configuration
 
-Workers use one TOML file loaded at startup. Paths must be absolute. Device selectors may not overlap between Pools.
+Workers use one TOML file loaded at startup. Paths must be absolute. Device selectors may not overlap between Pools. `backend` accepts `llama_cpp`, `mlx_dspark`, or `comfyui`. Each Pool's `base_url` must be an unauthenticated `http` or `https` URL whose host is a loopback IP address (for example, `127.0.0.1` or `::1`).
 
 Example llama.cpp Worker:
 
@@ -206,10 +206,32 @@ model_paths = ["/models/example.gguf"]
 [pools.env]
 CUDA_VISIBLE_DEVICES = "0"
 
-# Optional: reject startup when a configured model file does not match.
+# Optional: reject startup when configured model material does not match.
 [pools.expected_hashes]
 "/models/example.gguf" = "<64-character SHA-256 digest>"
 ```
+
+Example mlx-dspark Pool on Apple Silicon:
+
+```toml
+[[pools]]
+key = "apple0"
+backend = "mlx_dspark"
+executable = "/opt/mlx-dspark/.venv/bin/mlx-dspark"
+args = [
+  "serve",
+  "--model", "/models/Qwen3-8B-8bit",
+  "--host", "127.0.0.1",
+  "--port", "8082",
+  "--max-batch", "2"
+]
+state_dir = "/var/lib/gpq-worker/apple0"
+startup_timeout_secs = 300
+base_url = "http://127.0.0.1:8082"
+model_paths = ["/models/Qwen3-8B-8bit"]
+```
+
+mlx-dspark requires exactly one absolute local model path, and its `state_dir` must be outside that model path. The Worker hashes every file in a model directory (or the file itself) and requires `/health` to report `status: "ok"` with a `target` field naming that path, preserving pinned Model Versions. Do not pass mlx-dspark `--api-key`; the managed server is loopback-only and Worker requests carry no backend credential.
 
 Example additional ComfyUI Pool:
 

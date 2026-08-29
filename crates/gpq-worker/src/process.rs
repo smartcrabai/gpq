@@ -495,8 +495,6 @@ mod unix_ps {
 /// Windows Job Object management and process-table queries.
 #[cfg(windows)]
 mod windows_job {
-    use std::os::windows::io::AsRawHandle;
-
     use tokio::process::Child;
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
@@ -553,7 +551,7 @@ mod windows_job {
         // SAFETY: null attributes/name create an anonymous, unnamed job
         // object; the returned handle is checked for failure below.
         let job: HANDLE = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if job == 0 {
+        if job.is_null() {
             anyhow::bail!(
                 "CreateJobObjectW failed: {}",
                 std::io::Error::last_os_error()
@@ -581,7 +579,14 @@ mod windows_job {
             }
             anyhow::bail!("SetInformationJobObject failed: {err}");
         }
-        let process_handle = child.as_raw_handle() as HANDLE;
+        let Some(process_handle) = child.raw_handle() else {
+            // SAFETY: `job` was just validated non-null above.
+            unsafe {
+                CloseHandle(job);
+            }
+            anyhow::bail!("child process handle is no longer available (already reaped)");
+        };
+        let process_handle = process_handle as HANDLE;
         // SAFETY: `process_handle` is the live handle tokio holds for this
         // child for as long as `child` is alive, which outlives this call.
         let ok = unsafe { AssignProcessToJobObject(job, process_handle) };
@@ -604,7 +609,7 @@ mod windows_job {
         // SAFETY: opening a process by pid with a read-only access mask; the
         // returned handle is closed by every caller before returning.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if handle == 0 { None } else { Some(handle) }
+        if handle.is_null() { None } else { Some(handle) }
     }
 
     /// The process creation time of `pid`, encoded as a decimal `FILETIME`.
@@ -664,7 +669,7 @@ mod windows_job {
         // SAFETY: opening a process by pid to request termination; the
         // handle is closed before returning in every branch.
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if handle == 0 {
+        if handle.is_null() {
             // Already gone.
             return Ok(());
         }

@@ -134,11 +134,11 @@ fn file_identity(metadata: &Metadata) -> String {
 #[cfg(windows)]
 fn file_identity(metadata: &Metadata) -> String {
     use std::os::windows::fs::MetadataExt;
-    format!(
-        "{}:{}",
-        metadata.volume_serial_number().unwrap_or_default(),
-        metadata.file_index().unwrap_or_default()
-    )
+    // volume_serial_number()/file_index() are still unstable
+    // (`windows_by_handle`, rust-lang/rust#63010). The creation time is the
+    // best stable stand-in: it changes when the file is replaced, and the
+    // cache key already includes size and mtime.
+    format!("ctime:{}", metadata.creation_time())
 }
 
 fn digest_file(path: &Path) -> anyhow::Result<ContentHash> {

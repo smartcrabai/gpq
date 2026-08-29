@@ -142,7 +142,10 @@ github-build-setup = "../build-setup.yml"
 install-path = "CARGO_HOME"
 installers = ["shell", "homebrew"]
 precise-builds = true
+# Windows runner images ship an older preinstalled Rust; gpq-domain uses
+# Duration::from_hours/from_mins (stable since 1.97).
 publish-jobs = ["homebrew"]
+rust-toolchain-version = "1.97.0"
 tap = "smartcrabai/homebrew-tap"
 targets = [
   "aarch64-apple-darwin",

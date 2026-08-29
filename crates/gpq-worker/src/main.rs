@@ -1,6 +1,6 @@
-//! `gpq-worker`: a tenant-owned host agent that supervises llama.cpp /
-//! `ComfyUI` subprocesses and executes Attempts leased from `gpq-remote`
-//! (CONTEXT.md, ADR 0005).
+//! `gpq-worker`: a tenant-owned host agent that supervises llama.cpp,
+//! mlx-dspark, and `ComfyUI` subprocesses and executes Attempts leased from
+//! `gpq-remote` (CONTEXT.md, ADR 0005).
 //!
 //! `run` is the single foreground implementation (ADR 0020); `enroll`,
 //! `diagnose`, and `service install|uninstall|start|stop` are the only other
@@ -59,7 +59,7 @@ enum Command {
     /// macOS, and the native Windows Service on Windows all just start this
     /// same command.
     Run(ConfigArgs),
-    /// Checks executables, state directories, model files, backend
+    /// Checks executables, state directories, model paths, backend
     /// reachability, credential storage, and Remote reachability without
     /// executing any work. Exits non-zero if any check fails.
     Diagnose(ConfigArgs),

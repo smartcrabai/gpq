@@ -462,6 +462,7 @@ pub(crate) async fn release_deleted_inputs(
 fn domain_backend_kind(value: EnumValue<ProtoBackendKind>) -> Option<BackendKind> {
     match value {
         EnumValue::Known(ProtoBackendKind::BACKEND_KIND_LLAMA_CPP) => Some(BackendKind::LlamaCpp),
+        EnumValue::Known(ProtoBackendKind::BACKEND_KIND_MLX_DSPARK) => Some(BackendKind::MlxDspark),
         EnumValue::Known(ProtoBackendKind::BACKEND_KIND_COMFYUI) => Some(BackendKind::ComfyUi),
         EnumValue::Known(ProtoBackendKind::BACKEND_KIND_UNSPECIFIED) | EnumValue::Unknown(_) => {
             None
@@ -634,18 +635,15 @@ async fn try_handle_capability_report(
         .filter_map(pool_upsert_from_proto)
         .collect();
 
-    // ADR 0012: llama.cpp Model Versions are automatically registered by
-    // content hash. ComfyUI's on-disk models are referenced through
-    // Tenant-registered Workflow Versions instead, so they are not
-    // auto-registered here.
-    let llama_versions: Vec<(ContentHash, Modality, ExecutionLimits)> = report
+    // ADR 0012: LLM Model Versions are automatically registered by content
+    // hash. ComfyUI's on-disk models are referenced through Tenant-registered
+    // Workflow Versions instead, so they are not auto-registered here.
+    let llm_versions: Vec<(ContentHash, Modality, ExecutionLimits)> = report
         .pools
         .iter()
         .filter(|pool| {
-            matches!(
-                pool.backend_kind,
-                EnumValue::Known(ProtoBackendKind::BACKEND_KIND_LLAMA_CPP)
-            )
+            domain_backend_kind(pool.backend_kind)
+                .is_some_and(|kind| kind.satisfies(BackendKind::LlamaCpp))
         })
         .flat_map(|pool| pool.model_sha256.iter())
         .filter_map(|hex| hex.parse::<ContentHash>().ok())
@@ -653,8 +651,8 @@ async fn try_handle_capability_report(
         .collect();
 
     let mut tx = state.db.begin_tenant(tenant_id).await?;
-    if !llama_versions.is_empty() {
-        crate::db::workers::register_model_versions(&mut tx, tenant_id, &llama_versions).await?;
+    if !llm_versions.is_empty() {
+        crate::db::workers::register_model_versions(&mut tx, tenant_id, &llm_versions).await?;
     }
     crate::db::workers::upsert_pools(&mut tx, tenant_id, worker_id, &pools).await?;
     crate::db::workers::touch_last_seen(&mut tx, tenant_id, worker_id).await?;
@@ -1336,6 +1334,14 @@ mod tests {
             None
         );
         assert_eq!(domain_failure_kind(EnumValue::Unknown(999)), None);
+    }
+
+    #[test]
+    fn backend_kind_maps_mlx_dspark() {
+        assert_eq!(
+            domain_backend_kind(EnumValue::Known(ProtoBackendKind::BACKEND_KIND_MLX_DSPARK)),
+            Some(BackendKind::MlxDspark)
+        );
     }
 
     #[test]

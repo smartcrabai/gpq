@@ -409,7 +409,7 @@ async fn build_lease_assignment(
         .modality()
         .map_err(|error| anyhow::anyhow!("generation has an unparseable modality: {error}"))?;
 
-    // A llama.cpp lease carries no Workflow: the graph and manifest fields must
+    // A Model lease carries no Workflow: the graph and manifest fields must
     // stay unset rather than default-constructed, or the Worker would try to
     // revalidate an empty manifest (ADR 0007 keeps the two targets distinct).
     let resolved_workflow = match target {

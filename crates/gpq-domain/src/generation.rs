@@ -110,7 +110,7 @@ state_enum! {
 /// to an immutable version hash that every Attempt must reuse.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum ExecutionTarget {
-    /// A llama.cpp Model Version.
+    /// An LLM Model Version, served by llama.cpp or mlx-dspark.
     Model {
         /// Content hash of the exact model material.
         version: ContentHash,

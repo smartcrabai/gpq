@@ -180,7 +180,7 @@ message LeaseAssignment {
   string pool_id = 3;
   string slot_id = 4;
   gpq.v1.Modality modality = 5;
-  // Pinned Model Version for llama.cpp work (ADR 0012).
+  // Pinned Model Version for LLM backend work (ADR 0012).
   string model_sha256 = 6;
   // Pinned Workflow Version, its graph, and its manifest for ComfyUI work. The
   // graph travels with the lease and the Worker revalidates before execution

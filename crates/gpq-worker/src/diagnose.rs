@@ -1,7 +1,7 @@
 //! Worker self-diagnosis (`gpq-worker diagnose`).
 //!
 //! Checks, per Device Pool (ADR 0005): the backend executable exists and is
-//! executable, its state directory is writable, configured model files are
+//! executable, its state directory is writable, configured model paths are
 //! present with matching SHA-256 hashes, and the backend answers its
 //! required endpoint probes on its loopback address. Also checks Worker
 //! Credential presence and storage backend (ADR 0009) and Remote
@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::backend;
 use crate::config::{PoolConfig, WorkerConfig};
 use crate::credential::CredentialStore;
-use crate::models::hash_model;
+use crate::models::hash_model_fresh;
 use crate::process::{self, Ownership};
 
 /// The outcome of one diagnostic check.
@@ -206,8 +206,8 @@ async fn check_state_dir_writable(pool: &PoolConfig, report: &mut Report) {
 fn check_models(pool: &PoolConfig, report: &mut Report) {
     for model_path in &pool.model_paths {
         let label = format!("pool `{}` model {}", pool.key, model_path.display());
-        if !model_path.is_file() {
-            report.push(label, Outcome::Failed("file not found".to_owned()));
+        if !model_path.is_file() && !model_path.is_dir() {
+            report.push(label, Outcome::Failed("path not found".to_owned()));
             continue;
         }
         let Some(expected) = pool.expected_hashes.get(&model_path.display().to_string()) else {
@@ -217,7 +217,7 @@ fn check_models(pool: &PoolConfig, report: &mut Report) {
             );
             continue;
         };
-        match hash_model(&pool.state_dir, model_path) {
+        match hash_model_fresh(model_path) {
             Ok(actual) if actual.to_hex() == *expected => {
                 report.push(label, Outcome::Ok(format!("sha256 {actual} matches")));
             }

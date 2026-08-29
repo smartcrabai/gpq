@@ -3,13 +3,15 @@
 //!
 //! Adapters use only managed subprocesses and loopback HTTP/WebSocket APIs
 //! (ADR 0005); this module defines the boundary every adapter implements so
-//! `pool.rs` and `executor.rs` never depend on `llama-server` or `ComfyUI`
-//! specifics directly.
+//! `pool.rs` and `executor.rs` never depend on `llama-server`, `mlx-dspark`,
+//! or `ComfyUI` specifics directly.
 
 mod comfy;
 mod llama;
+mod mlx;
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -121,15 +123,16 @@ pub struct BackendCapabilities {
     pub probes: BTreeMap<String, bool>,
 }
 
-/// A managed generation backend: llama.cpp or `ComfyUI`, reached only through
-/// managed subprocesses and loopback HTTP/WebSocket APIs (ADR 0005).
+/// A managed generation backend: llama.cpp, mlx-dspark, or `ComfyUI`, reached
+/// only through managed subprocesses and loopback HTTP/WebSocket APIs (ADR 0005).
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Runs the required-endpoint probes and reports capabilities.
     ///
-    /// A missing core generation, streaming, progress, result, or
-    /// cancellation operation makes the backend unready; the caller decides
-    /// readiness from `probes`, this method only reports what it observed.
+    /// Adapters report the core operations required by their protocol; a
+    /// missing operation is reported as false and makes the backend unready.
+    /// The caller decides readiness from `probes`; this method only reports
+    /// what it observed.
     async fn probe(&self) -> Result<BackendCapabilities, BackendError>;
 
     /// Runs one Attempt to completion, emitting `events` as it progresses.
@@ -145,10 +148,9 @@ pub trait Backend: Send + Sync {
     /// `Ok(false)` means the backend has no such API or it failed: the
     /// caller must terminate the process instead, since process termination
     /// is the universal memory-release fallback (ADR 0005).
-    async fn release_memory(&self) -> Result<bool, BackendError>;
-
-    /// Which managed runtime this adapter drives.
-    fn kind(&self) -> BackendKind;
+    async fn release_memory(&self) -> Result<bool, BackendError> {
+        Ok(false)
+    }
 }
 
 /// Constructs the adapter matching `pool.backend` (ADR 0005: a Pool switches
@@ -157,7 +159,36 @@ pub trait Backend: Send + Sync {
 pub fn build(pool: &PoolConfig) -> Box<dyn Backend> {
     match pool.backend {
         BackendKind::LlamaCpp => Box::new(llama::LlamaBackend::new(pool)),
+        BackendKind::MlxDspark => Box::new(mlx::MlxDsparkBackend::new(pool)),
         BackendKind::ComfyUi => Box::new(comfy::ComfyBackend::new(pool)),
+    }
+}
+
+pub(super) fn endpoint(base_url: &url::Url, path: &str) -> String {
+    format!("{}{path}", base_url.as_str().trim_end_matches('/'))
+}
+
+/// Builds the HTTP client used for managed backend control planes. Backend
+/// URLs are validated as loopback-only configuration, and redirects are
+/// disabled so a backend cannot redirect a request to another host.
+pub(super) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|err| panic!("building managed backend HTTP client: {err}"))
+}
+
+pub(super) async fn run_with_timeout<F>(deadline: Duration, future: F) -> Result<(), BackendError>
+where
+    F: Future<Output = Result<(), BackendError>>,
+{
+    match tokio::time::timeout(deadline, future).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(BackendError {
+            kind: FailureKind::ExecutionTimedOut,
+            message: format!("execution exceeded the {deadline:?} deadline (ADR 0003)"),
+            retry_hint: FailureKind::ExecutionTimedOut.is_retryable(),
+        }),
     }
 }
 

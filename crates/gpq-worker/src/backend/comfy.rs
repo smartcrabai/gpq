@@ -2,7 +2,7 @@
 //!
 //! [`ComfyBackend`] talks to one operator-managed `ComfyUI` process reached only
 //! over loopback HTTP and WebSocket (ADR 0005: "Adapters use only managed
-//! subprocesses and loopback llama-server HTTP/SSE or `ComfyUI` HTTP/WebSocket
+//! subprocesses and loopback backend HTTP/SSE or `ComfyUI` HTTP/WebSocket
 //! APIs, never C/C++ FFI or Python imports."). It never installs, downloads,
 //! or otherwise manages custom nodes: those are entirely an operator
 //! responsibility, and a graph that names an absent node or model is rejected
@@ -58,9 +58,10 @@ use uuid::Uuid;
 
 use crate::backend::{
     Backend, BackendCapabilities, BackendError, ExecutionEvent, ExecutionRequest, InputArtifact,
+    endpoint, http_client,
 };
 use crate::config::PoolConfig;
-use crate::models::hash_model;
+use crate::models::hash_model_fresh;
 
 /// Per-request HTTP timeout for control-plane calls (submit, interrupt,
 /// history, probes). Large `/view` downloads use the same client but rely on
@@ -96,7 +97,7 @@ pub struct ComfyBackend {
     base_url: Url,
     state_dir: PathBuf,
     slots: u32,
-    /// Model files this Pool expects to find on disk
+    /// Model paths this Pool expects to find on disk
     /// (`PoolConfig::model_paths`), used to resolve a graph's
     /// checkpoint-loader filename to a concrete path for pinned-Model-
     /// Version revalidation (ADR 0012).
@@ -110,8 +111,9 @@ impl ComfyBackend {
     pub fn new(pool: &PoolConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| http_client());
         Self {
             client,
             base_url: pool.base_url.clone(),
@@ -121,11 +123,6 @@ impl ComfyBackend {
                 .unwrap_or_else(|| BackendKind::ComfyUi.default_slots()),
             model_paths: pool.model_paths.clone(),
         }
-    }
-
-    /// Builds an absolute URL string for a path under the `ComfyUI` base URL.
-    fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url.as_str().trim_end_matches('/'))
     }
 
     /// Builds the `ws://` (or `wss://`) URL for the live event stream scoped
@@ -147,7 +144,7 @@ impl ComfyBackend {
     async fn system_stats(&self) -> Result<SystemStatsResponse, BackendError> {
         let resp = self
             .client
-            .get(self.url("/system_stats"))
+            .get(endpoint(&self.base_url, "/system_stats"))
             .send()
             .await
             .map_err(|e| super::normalize_transport_error(&e))?;
@@ -167,7 +164,7 @@ impl ComfyBackend {
     async fn object_info(&self) -> Result<BTreeMap<String, ObjectInfoEntry>, BackendError> {
         let resp = self
             .client
-            .get(self.url("/object_info"))
+            .get(endpoint(&self.base_url, "/object_info"))
             .send()
             .await
             .map_err(|e| super::normalize_transport_error(&e))?;
@@ -199,7 +196,7 @@ impl ComfyBackend {
     async fn probe_generation(&self) -> bool {
         probe_ok(
             self.client
-                .post(self.url("/prompt"))
+                .post(endpoint(&self.base_url, "/prompt"))
                 .json(&Value::Object(Map::new())),
             |status| status == StatusCode::BAD_REQUEST,
         )
@@ -226,7 +223,8 @@ impl ComfyBackend {
     /// Safe probe of `GET /history`, `ComfyUI`'s result-retrieval surface.
     async fn probe_result(&self) -> bool {
         probe_ok(
-            self.client.get(self.url("/history?max_items=0")),
+            self.client
+                .get(endpoint(&self.base_url, "/history?max_items=0")),
             |status| status.is_success(),
         )
         .await
@@ -239,7 +237,7 @@ impl ComfyBackend {
         let probe_id = Uuid::now_v7().to_string();
         probe_ok(
             self.client
-                .post(self.url("/interrupt"))
+                .post(endpoint(&self.base_url, "/interrupt"))
                 .json(&serde_json::json!({ "prompt_id": probe_id })),
             |status| status.is_success(),
         )
@@ -253,7 +251,7 @@ impl ComfyBackend {
     async fn probe_memory_release(&self) -> bool {
         probe_ok(
             self.client
-                .post(self.url("/free"))
+                .post(endpoint(&self.base_url, "/free"))
                 .json(&serde_json::json!({ "unload_models": false, "free_memory": false })),
             |status| status.is_success(),
         )
@@ -299,7 +297,10 @@ impl ComfyBackend {
             }
         }
         if !manifest.required_models.is_empty() {
-            let Some(expected_hash) = request.model_sha256 else {
+            let Some(expected_hash) = request
+                .model_sha256
+                .filter(|hash| manifest.required_models.contains(hash))
+            else {
                 return Err(BackendError {
                     kind: FailureKind::ModelUnavailable,
                     message:
@@ -308,15 +309,6 @@ impl ComfyBackend {
                     retry_hint: false,
                 });
             };
-            if !manifest.required_models.contains(&expected_hash) {
-                return Err(BackendError {
-                    kind: FailureKind::ModelUnavailable,
-                    message:
-                        "comfyui workflow requires a model version not resolved for this attempt"
-                            .to_string(),
-                    retry_hint: false,
-                });
-            }
             self.verify_pinned_checkpoint(expected_hash, request.workflow_graph.as_ref())
                 .await?;
         }
@@ -327,8 +319,8 @@ impl ComfyBackend {
     /// graph's loader node still matches the Attempt's pinned Model Version
     /// (ADR 0012).
     ///
-    /// `ComfyUI` has no persistently resident model the way llama-server
-    /// does (this adapter's `probe` always reports `resident_model: None`),
+    /// `ComfyUI` has no persistently resident model the way LLM backends do
+    /// (this adapter's `probe` always reports `resident_model: None`),
     /// so there is no already-loaded process state to trust here: this
     /// rehashes whatever is on disk right now, on every Attempt, which is
     /// exactly what would catch a checkpoint file swapped locally between
@@ -356,8 +348,7 @@ impl ComfyBackend {
             });
         };
         let path = path.to_path_buf();
-        let state_dir = self.state_dir.clone();
-        let hash = tokio::task::spawn_blocking(move || hash_model(&state_dir, &path))
+        let hash = tokio::task::spawn_blocking(move || hash_model_fresh(&path))
             .await
             .map_err(|err| BackendError {
                 kind: FailureKind::Internal,
@@ -412,7 +403,7 @@ impl ComfyBackend {
             .text("overwrite", "true");
         let resp = self
             .client
-            .post(self.url("/upload/image"))
+            .post(endpoint(&self.base_url, "/upload/image"))
             .multipart(form)
             .send()
             .await
@@ -452,7 +443,7 @@ impl ComfyBackend {
             serde_json::json!({ "prompt": Value::Object(graph.clone()), "client_id": client_id });
         let resp = self
             .client
-            .post(self.url("/prompt"))
+            .post(endpoint(&self.base_url, "/prompt"))
             .json(&body)
             .send()
             .await
@@ -494,7 +485,7 @@ impl ComfyBackend {
     async fn interrupt(&self, prompt_id: &str) {
         let outcome = self
             .client
-            .post(self.url("/interrupt"))
+            .post(endpoint(&self.base_url, "/interrupt"))
             .json(&serde_json::json!({ "prompt_id": prompt_id }))
             .send()
             .await;
@@ -509,7 +500,7 @@ impl ComfyBackend {
     async fn get_history(&self, prompt_id: &str) -> Result<Value, BackendError> {
         let resp = self
             .client
-            .get(self.url(&format!("/history/{prompt_id}")))
+            .get(endpoint(&self.base_url, &format!("/history/{prompt_id}")))
             .send()
             .await
             .map_err(|e| super::normalize_transport_error(&e))?;
@@ -539,7 +530,7 @@ impl ComfyBackend {
     ) -> Result<(ContentHash, u64), BackendError> {
         let resp = self
             .client
-            .get(self.url("/view"))
+            .get(endpoint(&self.base_url, "/view"))
             .query(&[
                 ("filename", entry.filename.as_str()),
                 ("subfolder", entry.subfolder.as_str()),
@@ -646,7 +637,7 @@ fn expected_media_kind(modality: Modality) -> MediaKind {
         Modality::Video => MediaKind::Video,
         Modality::Music => MediaKind::Audio,
         // ComfyUI never executes an Llm Generation (ADR 0005 routes those to
-        // llama.cpp); kept exhaustive so a future modality still fails
+        // an LLM backend); kept exhaustive so a future modality still fails
         // closed here instead of silently matching every workflow.
         Modality::Llm => MediaKind::Text,
     }
@@ -727,7 +718,7 @@ impl Backend for ComfyBackend {
             version: stats.system.comfyui_version,
             slots: self.slots,
             // ComfyUI has no single persistently "resident model" concept the
-            // way llama.cpp does: graphs load whatever checkpoints their own
+            // way LLM backends do: graphs load whatever checkpoints their own
             // nodes name (ADR 0007).
             resident_model: None,
             accelerator_memory_bytes,
@@ -917,19 +908,13 @@ impl Backend for ComfyBackend {
     async fn release_memory(&self) -> Result<bool, BackendError> {
         let outcome = self
             .client
-            .post(self.url("/free"))
+            .post(endpoint(&self.base_url, "/free"))
             .json(&serde_json::json!({ "unload_models": true, "free_memory": true }))
             .send()
             .await;
-        match outcome {
-            Ok(resp) if resp.status().is_success() => Ok(true),
-            Ok(_) => Ok(false),
-            Err(err) => Err(super::normalize_transport_error(&err)),
-        }
-    }
-
-    fn kind(&self) -> BackendKind {
-        BackendKind::ComfyUi
+        outcome
+            .map(|resp| resp.status().is_success())
+            .map_err(|err| super::normalize_transport_error(&err))
     }
 }
 

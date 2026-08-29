@@ -22,7 +22,7 @@ use crate::state::AppState;
 /// Which catalog a requested alias names (ADR 0012).
 #[derive(Debug, Clone)]
 pub enum AliasTarget {
-    /// A llama.cpp Model alias.
+    /// An LLM Model alias.
     Model(String),
     /// A `ComfyUI` Workflow alias.
     Workflow(String),

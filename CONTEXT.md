@@ -33,11 +33,11 @@ A non-overlapping set of one or more GPUs controlled as one exclusive resource b
 _Avoid_: GPU queue
 
 **Active Runtime**:
-The currently loaded llama.cpp or ComfyUI runtime occupying a Device Pool. Switching backend kind replaces the Active Runtime rather than colocating both.
+The currently loaded llama.cpp, mlx-dspark, or ComfyUI runtime occupying a Device Pool. Switching backend kind replaces the Active Runtime rather than colocating multiple runtimes.
 _Avoid_: Backend installation, Worker
 
 **Execution Slot**:
-One concurrent execution permit exposed by an Active Runtime. llama.cpp may expose several Slots through continuous batching; ComfyUI normally exposes one.
+One concurrent execution permit exposed by an Active Runtime. LLM backends may expose several Slots through server batching; ComfyUI normally exposes one.
 _Avoid_: GPU, worker thread
 
 **Artifact**:

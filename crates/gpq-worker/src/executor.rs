@@ -849,6 +849,7 @@ pub(crate) fn modality_from_proto(modality: EnumValue<v1::Modality>) -> Result<M
 pub(crate) fn backend_kind_to_proto(kind: gpq_domain::BackendKind) -> v1::BackendKind {
     match kind {
         gpq_domain::BackendKind::LlamaCpp => v1::BackendKind::BACKEND_KIND_LLAMA_CPP,
+        gpq_domain::BackendKind::MlxDspark => v1::BackendKind::BACKEND_KIND_MLX_DSPARK,
         gpq_domain::BackendKind::ComfyUi => v1::BackendKind::BACKEND_KIND_COMFYUI,
     }
 }

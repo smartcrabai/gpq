@@ -89,7 +89,7 @@ impl<'de> Deserialize<'de> for ContentHash {
     }
 }
 
-/// Incremental SHA-256 hasher for streamed Artifacts and model files.
+/// Incremental SHA-256 hasher for streamed Artifacts and model material.
 #[derive(Default, Clone)]
 pub struct Hasher(Sha256);
 

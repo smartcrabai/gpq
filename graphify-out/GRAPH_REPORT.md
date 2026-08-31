@@ -1,16 +1,16 @@
-# Graph Report - gpq  (2026-08-30)
+# Graph Report - gpq  (2026-08-31)
 
 ## Corpus Check
-- 115 files · ~136,108 words
+- 116 files · ~138,905 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 2867 nodes · 7355 edges · 86 communities (78 shown, 8 thin omitted)
+- 2875 nodes · 7364 edges · 86 communities (79 shown, 7 thin omitted)
 - Extraction: 97% EXTRACTED · 3% INFERRED · 0% AMBIGUOUS · INFERRED: 188 edges (avg confidence: 0.85)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `0c48c743`
+- Built from commit: `34d857b3`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -35,7 +35,7 @@
 - attempts.rs
 - GenerationEvent
 - backend/comfy.rs
-- any_candidate_remains
+- native/catalog.rs
 - responses.rs
 - transfer.rs
 - gpq-remote/src/session.rs
@@ -47,13 +47,13 @@
 - AppState
 - Test workflow
 - Result
-- ExecutionTarget
+- gpq-worker/src/main.rs
 - service.rs
 - fake_llama.rs
 - gpq-worker/src/artifacts.rs
 - record_accepted_result
-- .serialize
 - ContentHash
+- db/catalog.rs
 - SlotCapability
 - Modality
 - scheduler.rs
@@ -75,7 +75,7 @@
 - resolve_and_store_images
 - Candidate
 - sse.rs
-- native/catalog.rs
+- tenant_console.rs
 - ApiError
 - run_inbound_pump
 - e2e_support/cli.rs
@@ -133,7 +133,7 @@
 - **Generation execution and delivery** — docs_adr_0002_prioritize_gpu_utilization_prioritize_gpu_utilization, docs_adr_0003_use_leased_at_least_once_execution_use_leased_at_least_once_execution, docs_adr_0007_unify_generation_lifecycle_only_unify_the_generation_lifecycle_only, docs_adr_0008_keep_records_but_expire_artifacts_keep_records_but_expire_artifacts [INFERRED 0.85]
 - **Tenant isolation and operations** — docs_adr_0001_tenant_dedicated_workers_keep_workers_tenant_dedicated, docs_adr_0009_separate_tenant_and_worker_credentials_separate_tenant_and_worker_credentials, docs_adr_0011_trust_remote_and_enforce_rls_trust_remote_and_enforce_database_tenant_isolation, docs_adr_0016_separate_migration_from_serving_separate_migration_from_serving, docs_adr_0018_do_not_sandbox_custom_nodes_do_not_sandbox_comfyui_custom_nodes [INFERRED 0.85]
 
-## Communities (86 total, 8 thin omitted)
+## Communities (86 total, 7 thin omitted)
 
 ### Community 0 - "wait_until"
 Cohesion: 0.05
@@ -152,8 +152,8 @@ Cohesion: 0.06
 Nodes (55): CatalogServiceClient, ClientConfig, AdminCli, chat_parameters(), collect_sse_json(), database_url_for(), database_url_with_credentials(), enroll_worker() (+47 more)
 
 ### Community 4 - "PoolConfig"
-Cohesion: 0.05
-Nodes (81): check_device_overlap(), duration_secs(), ensure_state_dir(), parses_full_sample(), parses_mlx_dspark_pool(), PoolConfig, rejects_backend_url_query_and_fragment(), rejects_duplicate_pool_keys() (+73 more)
+Cohesion: 0.08
+Nodes (54): check_device_overlap(), duration_secs(), ensure_state_dir(), parses_full_sample(), parses_mlx_dspark_pool(), PoolConfig, rejects_backend_url_query_and_fragment(), rejects_duplicate_pool_keys() (+46 more)
 
 ### Community 5 - "generations.rs"
 Cohesion: 0.07
@@ -169,7 +169,7 @@ Nodes (58): ChatMessage, build_chat_request(), build_chat_request_forces_stream_
 
 ### Community 8 - "gpq-worker/src/session.rs"
 Cohesion: 0.06
-Nodes (64): AbortOnDrop, accept_lease(), backoff_base(), cancel_all_attempts(), cancel_attempt(), cancel_expired_leases(), capability_report_message(), classify_lease() (+56 more)
+Nodes (61): AbortOnDrop, accept_lease(), backoff_base(), cancel_all_attempts(), cancel_attempt(), cancel_expired_leases(), capability_report_message(), classify_lease() (+53 more)
 
 ### Community 9 - "tenants.rs"
 Cohesion: 0.07
@@ -185,7 +185,7 @@ Nodes (61): accept_result_rejects_a_result_for_a_terminal_generation(), accept_r
 
 ### Community 12 - "chat.rs"
 Cohesion: 0.07
-Nodes (56): GenerationState, chat_completions(), chat_finish_reason(), ChatChoice, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage (+48 more)
+Nodes (57): GenerationState, chat_completions(), chat_finish_reason(), ChatChoice, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage (+49 more)
 
 ### Community 13 - "process.rs"
 Cohesion: 0.08
@@ -204,8 +204,8 @@ Cohesion: 0.09
 Nodes (47): base_graph(), checkpoint_name(), event(), FakeComfy, free(), handle_socket(), hang_graph(), has_node_class() (+39 more)
 
 ### Community 17 - "attempts.rs"
-Cohesion: 0.10
-Nodes (40): RetryDecision, lease_expires_forty_five_seconds_after_now(), lease_expiry_from(), DateTime, Utc, AttemptState, acknowledge_cancel(), AttemptRow (+32 more)
+Cohesion: 0.12
+Nodes (36): RetryDecision, AttemptState, acknowledge_cancel(), AttemptRow, create(), CreateAttemptError, expired_leases(), finish() (+28 more)
 
 ### Community 18 - "GenerationEvent"
 Cohesion: 0.08
@@ -215,13 +215,13 @@ Nodes (48): append(), append_attempt_created(), EventKind, EventRow, latest(), l
 Cohesion: 0.06
 Nodes (36): apply_override(), apply_parameters(), apply_parameters_overrides_addressed_node_input(), apply_parameters_places_seed_at_reserved_pointer(), apply_parameters_rejects_malformed_pointer(), apply_parameters_rejects_unknown_node_id(), apply_parameters_skips_seed_without_pointer(), checkpoint_name() (+28 more)
 
-### Community 20 - "any_candidate_remains"
-Cohesion: 0.11
-Nodes (30): CatalogService, any_candidate_remains(), IntoIterator, Item, catalog_error(), CatalogApi, internal(), invalid() (+22 more)
+### Community 20 - "native/catalog.rs"
+Cohesion: 0.08
+Nodes (39): CatalogService, catalog_error(), CatalogApi, custom_node_without_exact_version_is_rejected(), internal(), invalid(), missing_mime_type_is_rejected(), missing_output_node_is_rejected() (+31 more)
 
 ### Community 21 - "responses.rs"
 Cohesion: 0.08
-Nodes (49): usage_from_row(), UsageDto, build_response_object(), collect_input_artifacts(), completed_response_carries_output_text_and_usage(), CompletedEvent, create_response(), CreatedEvent (+41 more)
+Nodes (47): build_response_object(), collect_input_artifacts(), completed_response_carries_output_text_and_usage(), CompletedEvent, create_response(), CreatedEvent, CreateResponseRequest, DeltaEvent (+39 more)
 
 ### Community 22 - "transfer.rs"
 Cohesion: 0.07
@@ -263,6 +263,10 @@ Nodes (36): Buf breaking check, Buf configuration, Buf lint, proto module, STAND
 Cohesion: 0.12
 Nodes (25): enroll(), open_session(), random_content_sha256(), CancelRequest, ConnectError, DiscardOutput, Duration, Harness (+17 more)
 
+### Community 32 - "gpq-worker/src/main.rs"
+Cohesion: 0.15
+Nodes (28): Cli, combine_uninstall_results(), combine_uninstall_results_ok_when_both_succeed(), combine_uninstall_results_reports_both_failures_when_neither_step_succeeds(), combine_uninstall_results_surfaces_credential_failure_alone(), combine_uninstall_results_surfaces_service_failure_alone(), Command, ConfigArgs (+20 more)
+
 ### Community 33 - "service.rs"
 Cohesion: 0.18
 Nodes (31): install(), install_linux(), install_macos(), install_windows(), launchd_plist_path(), launchd_plist_wires_program_arguments(), quote_systemd_word(), quote_windows_arg() (+23 more)
@@ -279,21 +283,21 @@ Nodes (39): ManifestMismatch, Result, ArtifactChunkData, ArtifactHandle, Artifac
 Cohesion: 0.11
 Nodes (41): AttemptFailure, AttemptProgress, AttemptResult, AttemptRunning, AttemptTokenDelta, CancelAcknowledged, CapabilityReport, generation_snapshot() (+33 more)
 
-### Community 37 - ".serialize"
-Cohesion: 0.17
-Nodes (9): D, Err, Error, Formatter, Result, Self, String, Ok (+1 more)
+### Community 37 - "ContentHash"
+Cohesion: 0.08
+Nodes (17): hash(), ExecutionTarget, ContentHash, digest_matches_known_vector(), round_trips_through_hex(), D, Display, Err (+9 more)
 
-### Community 38 - "ContentHash"
-Cohesion: 0.13
-Nodes (50): ContentHash, Display, CatalogError, content_hash_changes_with_graph(), content_hash_ignores_limits(), content_hash_is_stable_under_key_reordering(), decode_error(), decode_model_execution_limits() (+42 more)
+### Community 38 - "db/catalog.rs"
+Cohesion: 0.14
+Nodes (48): CatalogError, content_hash_changes_with_graph(), content_hash_ignores_limits(), content_hash_is_stable_under_key_reordering(), decode_error(), decode_model_execution_limits(), decode_workflow_manifest(), delete_model_alias() (+40 more)
 
 ### Community 39 - "SlotCapability"
 Cohesion: 0.14
-Nodes (27): BTreeSet, accelerator_memory_boundary_is_inclusive(), extra_models_and_custom_nodes_do_not_block_admission(), hash(), IncapableReason, missing_custom_node_reports_no_installed_version(), mlx_dspark_admits_llm_model_requirements(), oom_marking_removes_the_slot_from_candidates() (+19 more)
+Nodes (28): BTreeSet, accelerator_memory_boundary_is_inclusive(), any_candidate_remains(), extra_models_and_custom_nodes_do_not_block_admission(), IncapableReason, missing_custom_node_reports_no_installed_version(), mlx_dspark_admits_llm_model_requirements(), oom_marking_removes_the_slot_from_candidates() (+20 more)
 
 ### Community 40 - "Modality"
-Cohesion: 0.14
-Nodes (19): Modality, Duration, ExecutionLimits, ModelVersion, resolve_execution_timeout(), BTreeMap, Duration, MediaKind (+11 more)
+Cohesion: 0.12
+Nodes (22): Modality, Duration, ExecutionLimits, ModelVersion, resolve_execution_timeout(), BTreeMap, Duration, MediaKind (+14 more)
 
 ### Community 41 - "scheduler.rs"
 Cohesion: 0.12
@@ -309,7 +313,7 @@ Nodes (14): accepts_owner_only_file(), CredentialStore, current_uid(), load_unix
 
 ### Community 44 - "openai/mod.rs"
 Cohesion: 0.10
-Nodes (13): ip_literal_host_public_address_is_accepted(), ipv6_mapped_private_is_rejected(), is_publicly_routable(), is_publicly_routable_v4(), is_publicly_routable_v6(), resolve_safe_addrs(), router(), Response (+5 more)
+Nodes (12): ip_literal_host_public_address_is_accepted(), ipv6_mapped_private_is_rejected(), is_publicly_routable(), is_publicly_routable_v4(), is_publicly_routable_v6(), resolve_safe_addrs(), router(), Response (+4 more)
 
 ### Community 45 - "backend/mod.rs"
 Cohesion: 0.11
@@ -324,8 +328,8 @@ Cohesion: 0.19
 Nodes (15): credential_key_parses_valid_hex(), object_store_absent_is_none(), object_store_default_presign_ttl_is_fifteen_minutes(), object_store_full_configuration_resolves(), ObjectStoreConfig, parse_credential_key(), RemoteConfig, resolve_object_store() (+7 more)
 
 ### Community 48 - "plan_assignments"
-Cohesion: 0.19
-Nodes (19): assign(), eligible_pool_is_bounded_by_its_advertised_free_slots(), known_tenants(), plan_assignments(), pool_whose_worker_has_no_live_session_is_skipped(), pool_with_no_free_slots_is_skipped(), DateTime, DevicePoolId (+11 more)
+Cohesion: 0.17
+Nodes (20): assign(), eligible_pool_is_bounded_by_its_advertised_free_slots(), known_tenants(), plan_assignments(), pool_whose_worker_has_no_live_session_is_skipped(), pool_with_no_free_slots_is_skipped(), DateTime, DevicePoolId (+12 more)
 
 ### Community 49 - "src/models.rs"
 Cohesion: 0.14
@@ -344,12 +348,12 @@ Cohesion: 0.34
 Nodes (17): attempt_rows(), AttemptRow, db_now(), event_kinds(), generation_row(), generation_row_created_after(), GenerationRow, latest_generation_row() (+9 more)
 
 ### Community 53 - "auth.rs"
-Cohesion: 0.18
-Nodes (15): bearer_token(), bearer_token_is_none_without_a_header(), bearer_token_parses_case_insensitively(), bearer_token_parses_the_standard_scheme(), bearer_token_rejects_other_schemes(), different_secrets_hash_differently(), generate_secret(), generated_secrets_carry_their_prefix_and_are_unique() (+7 more)
+Cohesion: 0.17
+Nodes (16): bearer_token(), bearer_token_is_none_without_a_header(), bearer_token_parses_case_insensitively(), bearer_token_parses_the_standard_scheme(), bearer_token_rejects_other_schemes(), different_secrets_hash_differently(), generate_secret(), generated_secrets_carry_their_prefix_and_are_unique() (+8 more)
 
 ### Community 54 - "gpq-domain/src/lib.rs"
-Cohesion: 0.14
-Nodes (7): digest_matches_known_vector(), round_trips_through_hex(), FromStr, assert_serde_matches(), T, serde_names_match_stable_names(), Failure
+Cohesion: 0.15
+Nodes (8): lease_expires_forty_five_seconds_after_now(), lease_expiry_from(), DateTime, Utc, assert_serde_matches(), T, serde_names_match_stable_names(), Failure
 
 ### Community 55 - ".new"
 Cohesion: 0.22
@@ -371,9 +375,9 @@ Nodes (10): Candidate, DateTime, Duration, GenerationId, Option, Utc, Vec, selec
 Cohesion: 0.17
 Nodes (24): advance(), BroadcastFrames, CancelOnDrop, data_event(), done_event(), finish_with(), named_event(), Drop (+16 more)
 
-### Community 60 - "native/catalog.rs"
-Cohesion: 0.21
-Nodes (13): custom_node_without_exact_version_is_rejected(), missing_mime_type_is_rejected(), missing_output_node_is_rejected(), model_version_row_to_proto(), Result, String, valid_manifest(), validate_manifest() (+5 more)
+### Community 60 - "tenant_console.rs"
+Cohesion: 0.32
+Nodes (7): console_route_serves_the_browser_client_with_security_headers(), index(), router(), Result, HeaderName, HeaderValue, Html
 
 ### Community 61 - "ApiError"
 Cohesion: 0.22
@@ -388,8 +392,8 @@ Cohesion: 0.42
 Nodes (11): migrate(), RotatedKey, Output, Path, Result, String, Uuid, run() (+3 more)
 
 ### Community 67 - "Result"
-Cohesion: 0.23
-Nodes (12): await_terminal_generation(), fetch_generation_row(), GenerationId, GenerationRow, Receiver, Result, TenantId, tenant_settings() (+4 more)
+Cohesion: 0.21
+Nodes (13): await_terminal_generation(), fetch_generation_row(), GenerationId, GenerationRow, Receiver, Result, TenantId, tenant_settings() (+5 more)
 
 ### Community 68 - "fetch_http_image"
 Cohesion: 0.27
@@ -428,22 +432,22 @@ Cohesion: 0.67
 Nodes (4): gpq-domain, gpq-proto, gpq-remote, gpq-worker
 
 ### Community 86 - "SchedulerHandle"
-Cohesion: 0.20
-Nodes (9): JoinHandle, Receiver, Self, Sender, WorkerId, run(), SchedulerHandle, spawn() (+1 more)
+Cohesion: 0.22
+Nodes (8): JoinHandle, Receiver, Self, Sender, run(), SchedulerHandle, spawn(), Wake
 
 ## Knowledge Gaps
 - **59 isolated node(s):** `UsageJson`, `DeltaEvent`, `remote_session_start.sh script`, `graphify`, `tenant trust boundaries` (+54 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **8 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **7 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `AppState` connect `AppState` to `gpq-remote/src/artifacts.rs`, `native/generation.rs`, `tenants.rs`, `chat.rs`, `GenerationEvent`, `any_candidate_remains`, `responses.rs`, `transfer.rs`, `gpq-remote/src/session.rs`, `native/mod.rs`, `src/cli.rs`, `admission.rs`, `record_accepted_result`, `scheduler.rs`, `Db`, `openai/mod.rs`, `gpq-remote/src/config.rs`, `plan_assignments`, `.new`, `.enroll`, `resolve_and_store_images`, `sse.rs`, `native/catalog.rs`, `ApiError`, `run_inbound_pump`, `Result`, `list_models`, `http.rs`, `recv_or_pending`, `SchedulerHandle`?**
-  _High betweenness centrality (0.285) - this node is a cross-community bridge._
-- **Why does `ContentHash` connect `ContentHash` to `workers.rs`, `generations.rs`, `llama.rs`, `gpq-worker/src/session.rs`, `pool.rs`, `executor.rs`, `transfer.rs`, `mlx.rs`, `ExecutionTarget`, `gpq-worker/src/artifacts.rs`, `.serialize`, `SlotCapability`, `Modality`, `backend/mod.rs`, `BackendError`, `plan_assignments`, `src/models.rs`, `schedule.rs`, `gpq-domain/src/lib.rs`, `Candidate`, `list_models`?**
-  _High betweenness centrality (0.196) - this node is a cross-community bridge._
-- **Why does `FailureKind` connect `executor.rs` to `record_accepted_result`, `generations.rs`, `gpq-worker/src/session.rs`, `backend/mod.rs`, `BackendError`, `attempts.rs`, `GenerationEvent`, `backend/comfy.rs`, `gpq-remote/src/session.rs`, `native/mod.rs`, `ApiError`?**
+- **Why does `AppState` connect `AppState` to `gpq-remote/src/artifacts.rs`, `native/generation.rs`, `tenants.rs`, `chat.rs`, `GenerationEvent`, `native/catalog.rs`, `responses.rs`, `transfer.rs`, `gpq-remote/src/session.rs`, `native/mod.rs`, `src/cli.rs`, `admission.rs`, `record_accepted_result`, `scheduler.rs`, `Db`, `openai/mod.rs`, `gpq-remote/src/config.rs`, `plan_assignments`, `.new`, `.enroll`, `resolve_and_store_images`, `sse.rs`, `ApiError`, `run_inbound_pump`, `Result`, `list_models`, `http.rs`, `recv_or_pending`, `SchedulerHandle`?**
+  _High betweenness centrality (0.274) - this node is a cross-community bridge._
+- **Why does `ContentHash` connect `ContentHash` to `workers.rs`, `gpq-worker/src/artifacts.rs`, `Candidate`, `list_models`, `db/catalog.rs`, `SlotCapability`, `Modality`, `generations.rs`, `llama.rs`, `backend/mod.rs`, `BackendError`, `executor.rs`, `plan_assignments`, `src/models.rs`, `pool.rs`, `schedule.rs`, `transfer.rs`, `mlx.rs`?**
+  _High betweenness centrality (0.203) - this node is a cross-community bridge._
+- **Why does `FailureKind` connect `executor.rs` to `record_accepted_result`, `generations.rs`, `Modality`, `gpq-worker/src/session.rs`, `backend/mod.rs`, `BackendError`, `attempts.rs`, `GenerationEvent`, `backend/comfy.rs`, `gpq-remote/src/session.rs`, `native/mod.rs`, `ApiError`?**
   _High betweenness centrality (0.091) - this node is a cross-community bridge._
 - **What connects `UsageJson`, `DeltaEvent`, `remote_session_start.sh script` to the rest of the system?**
   _59 weakly-connected nodes found - possible documentation gaps or missing edges._

@@ -142,6 +142,12 @@ target/release/gpq-remote serve
 
 Readiness requires PostgreSQL. Object storage is optional and does not affect `/readyz`.
 
+## Tenant Console
+
+Remote serves a Tenant-scoped settings console at `/console`. Connect with a Tenant Master Key to read or update queue age, queue capacity, Artifact size limits, execution timeout ceiling, and default priority. The page calls the existing `TenantService` on the same origin and keeps the Master Key only in the current tab's memory; it never writes the key to browser storage.
+
+Tenant creation, deletion, Master Key rotation, and Worker revocation remain local administration commands and are not available in the console.
+
 ## Tenant administration
 
 Administration commands require the `gpq_admin` database credential plus the same `GPQ_CREDENTIAL_KEY` used by Remote.

@@ -35,6 +35,7 @@ pub fn router(state: AppState) -> axum::Router {
         .into_axum_router();
 
     health
+        .merge(crate::tenant_console::router())
         .merge(crate::openai::router(state.clone()))
         .merge(crate::artifacts::download_router(state))
         .merge(worker_and_native_rpc)

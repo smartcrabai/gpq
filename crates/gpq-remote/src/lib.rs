@@ -24,4 +24,5 @@ pub mod scheduler;
 pub mod session;
 pub mod state;
 pub mod telemetry;
+pub mod tenant_console;
 pub mod transfer;

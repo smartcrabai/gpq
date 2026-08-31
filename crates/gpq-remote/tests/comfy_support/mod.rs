@@ -157,6 +157,7 @@ struct Inner {
     prompts: HashMap<String, PromptRecord>,
     history: HashMap<String, Value>,
     interrupted: HashSet<String>,
+    last_prompt_graph: Option<Value>,
 }
 
 fn lock(mutex: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
@@ -214,6 +215,12 @@ impl FakeComfy {
         lock(&self.inner).interrupted.len()
     }
 
+    /// Most recent graph accepted by `POST /prompt`.
+    #[must_use]
+    pub fn last_prompt_graph(&self) -> Option<Value> {
+        lock(&self.inner).last_prompt_graph.clone()
+    }
+
     fn send_to_client(&self, client_id: &str, message: Message) {
         let sender = lock(&self.inner).ws_clients.get(client_id).cloned();
         if let Some(sender) = sender {
@@ -239,6 +246,10 @@ impl FakeComfy {
                 interrupt: notify,
             },
         );
+    }
+
+    fn record_prompt_graph(&self, graph: Value) {
+        lock(&self.inner).last_prompt_graph = Some(graph);
     }
 
     fn record_history(&self, prompt_id: &str, node: &str, output: Value) {
@@ -453,6 +464,7 @@ async fn prompt(State(state): State<FakeComfy>, Json(body): Json<Value>) -> Resp
     {
         return model_not_in_list_response(&ckpt);
     }
+    state.record_prompt_graph(Value::Object(graph.clone()));
     let client_id = obj
         .get("client_id")
         .and_then(Value::as_str)

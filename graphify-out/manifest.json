@@ -156,10 +156,10 @@
     "semantic_hash": ""
   },
   "crates/gpq-remote/src/artifacts.rs": {
-    "mtime": 1787554045.5766404,
-    "seen": 1787556748.360272,
-    "ast_hash": "3a013c505b056a1a6ce1df93abad5aae",
-    "semantic_hash": "3a013c505b056a1a6ce1df93abad5aae"
+    "mtime": 1788169324.500859,
+    "seen": 1788169555.6902862,
+    "ast_hash": "c84832f37bcb989211743e798cd7542a",
+    "semantic_hash": ""
   },
   "crates/gpq-remote/src/auth.rs": {
     "mtime": 1787487819.2599566,
@@ -246,14 +246,14 @@
     "semantic_hash": "c9f94905b28267f49012a3f8dbc623e8"
   },
   "crates/gpq-remote/src/http.rs": {
-    "mtime": 1788140804.473714,
-    "seen": 1788141044.446652,
+    "mtime": 1788141928.0057094,
+    "seen": 1788169555.6905699,
     "ast_hash": "cce68c3e415eee10c8a507d95d296581",
     "semantic_hash": ""
   },
   "crates/gpq-remote/src/lib.rs": {
-    "mtime": 1788140817.216485,
-    "seen": 1788141044.446652,
+    "mtime": 1788141928.0059462,
+    "seen": 1788169555.6905699,
     "ast_hash": "93dc15df83eb63c31ad2bada42f3c649",
     "semantic_hash": ""
   },
@@ -294,10 +294,10 @@
     "semantic_hash": "4b38bcea8e29f9d6b56e637f6b2af255"
   },
   "crates/gpq-remote/src/openai/mod.rs": {
-    "mtime": 1787290578.8656194,
-    "seen": 1787556748.360279,
-    "ast_hash": "d0aa8e062ae85f4f10f832840597593e",
-    "semantic_hash": "d0aa8e062ae85f4f10f832840597593e"
+    "mtime": 1788169265.795649,
+    "seen": 1788169555.6906931,
+    "ast_hash": "a29a0461866282fecd3f8c63efcb46de",
+    "semantic_hash": ""
   },
   "crates/gpq-remote/src/openai/models.rs": {
     "mtime": 1787230232.9903913,
@@ -354,16 +354,16 @@
     "semantic_hash": "7694e19628e1253f583073ee089fe0b2"
   },
   "crates/gpq-remote/tests/comfy.rs": {
-    "mtime": 1787291685.4262235,
-    "seen": 1787556748.3602822,
-    "ast_hash": "963fa0753371e2c74bce9c190191c418",
-    "semantic_hash": "963fa0753371e2c74bce9c190191c418"
+    "mtime": 1788169537.9725132,
+    "seen": 1788169555.6908748,
+    "ast_hash": "9d78080685a39a765bfa595265410880",
+    "semantic_hash": ""
   },
   "crates/gpq-remote/tests/comfy_support/mod.rs": {
-    "mtime": 1787248679.8306534,
-    "seen": 1787556748.360283,
-    "ast_hash": "14e114e310fa98049c5f6b79582d8373",
-    "semantic_hash": "14e114e310fa98049c5f6b79582d8373"
+    "mtime": 1788169286.9359794,
+    "seen": 1788169555.6908748,
+    "ast_hash": "2c46567dda58744fe8827f33aa55f1d0",
+    "semantic_hash": ""
   },
   "crates/gpq-remote/tests/e2e.rs": {
     "mtime": 1787248893.9761593,
@@ -450,9 +450,9 @@
     "semantic_hash": "61740a9241d4944468ebffb2445c901c"
   },
   "crates/gpq-worker/src/backend/comfy.rs": {
-    "mtime": 1788028083.5944045,
-    "seen": 1788141044.447254,
-    "ast_hash": "b2c71f2e91016c038041eb8f1dd63391",
+    "mtime": 1788169518.7337534,
+    "seen": 1788169555.691147,
+    "ast_hash": "da3c8a4f422bff076c627bb3c91dea0a",
     "semantic_hash": ""
   },
   "crates/gpq-worker/src/backend/llama.rs": {
@@ -564,9 +564,9 @@
     "semantic_hash": ""
   },
   "README.md": {
-    "mtime": 1788141025.4837418,
-    "seen": 1788141044.447475,
-    "ast_hash": "68b789823e4b57ab53e5282214edd45c",
+    "mtime": 1788169465.842555,
+    "seen": 1788169555.691542,
+    "ast_hash": "279b72a8a2a84c04797684d67f784587",
     "semantic_hash": ""
   },
   "buf.yaml": {
@@ -606,16 +606,16 @@
     "semantic_hash": ""
   },
   "docs/adr/0006-offer-compatible-and-native-apis.md": {
-    "mtime": 1787201938.7768452,
-    "seen": 1787556748.360296,
-    "ast_hash": "9dbbd685bece7ff0539553f1881822f4",
-    "semantic_hash": "9dbbd685bece7ff0539553f1881822f4"
+    "mtime": 1788169465.8455863,
+    "seen": 1788169555.691648,
+    "ast_hash": "edc9b151ef251849e10800545c43eef7",
+    "semantic_hash": ""
   },
   "docs/adr/0007-unify-generation-lifecycle-only.md": {
-    "mtime": 1787201316.9340425,
-    "seen": 1787556748.360297,
-    "ast_hash": "aef9685298695f19847f4770d977eb55",
-    "semantic_hash": "aef9685298695f19847f4770d977eb55"
+    "mtime": 1788169465.8470325,
+    "seen": 1788169555.691649,
+    "ast_hash": "14a12cf379665a94c412cb055bd4b40b",
+    "semantic_hash": ""
   },
   "docs/adr/0008-keep-records-but-expire-artifacts.md": {
     "mtime": 1787202811.1356552,
@@ -720,15 +720,21 @@
     "semantic_hash": ""
   },
   "crates/gpq-remote/src/tenant_console.rs": {
-    "mtime": 1788141275.4974546,
-    "seen": 1788141422.2666419,
+    "mtime": 1788141928.0063202,
+    "seen": 1788169555.690856,
     "ast_hash": "ad940bbc69d4ea6d54582de0f7f88d91",
     "semantic_hash": ""
   },
   "crates/gpq-remote/src/tenant_console.html": {
-    "mtime": 1788141252.5175922,
-    "seen": 1788141422.267434,
+    "mtime": 1788141928.0061128,
+    "seen": 1788169555.691558,
     "ast_hash": "650fac55723a10cc8c80433aa59b6561",
+    "semantic_hash": ""
+  },
+  "crates/gpq-remote/src/openai/images.rs": {
+    "mtime": 1788169518.7428513,
+    "seen": 1788169555.6906922,
+    "ast_hash": "282bc5b197241190d3578ed188b43348",
     "semantic_hash": ""
   }
 }

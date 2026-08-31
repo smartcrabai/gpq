@@ -1,8 +1,8 @@
 //! OpenAI-compatible surface (ADR 0006).
 //!
-//! Exactly three routes are served: `GET /v1/models`, `POST
-//! /v1/chat/completions`, and `POST /v1/responses`. Files and every other
-//! `OpenAI` API are intentionally absent. Requests authenticate with the Tenant
+//! Four routes are served: `GET /v1/models`, `POST /v1/chat/completions`,
+//! `POST /v1/responses`, and `POST /v1/images/generations`. Files and every
+//! other `OpenAI` API are intentionally absent. Requests authenticate with the Tenant
 //! Master Key as an `Authorization: Bearer` token and hold their connection
 //! open while queued, cancelling their Generation on disconnect (ADR 0003,
 //! ADR 0006). Multimodal image inputs are resolved here under SSRF-safe
@@ -10,6 +10,7 @@
 //! Artifacts (ADR 0008) rather than exposing Worker egress.
 
 mod chat;
+mod images;
 mod models;
 mod responses;
 mod sse;
@@ -63,6 +64,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/models", get(models::list_models))
         .route("/v1/chat/completions", post(chat::chat_completions))
+        .route("/v1/images/generations", post(images::create_image))
         .route("/v1/responses", post(responses::create_response))
         .with_state(state)
 }

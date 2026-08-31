@@ -15,17 +15,17 @@
 //! narrow, self-contained convention for how the Generation envelope's
 //! opaque `parameters` document customizes a graph:
 //!
-//! - Every key of `parameters` other than `"$seed"` MUST be a string of the
-//!   form `"<node_id>.<input_name>"` and is applied as
+//! - The reserved key `"$seed"`, when present, MUST contain a
+//!   `"<node_id>.<input_name>"` pointer. When the Generation has a shared seed,
+//!   the adapter writes it to that input.
+//! - Every other key beginning with `$` replaces every equal string placeholder
+//!   in the graph with its value. This lets portable API fields such as
+//!   `$prompt`, `$width`, and `$height` bind to an operator-defined workflow
+//!   without guessing node ids. A missing placeholder is `InvalidInput`.
+//! - Every remaining key MUST be a string of the form
+//!   `"<node_id>.<input_name>"` and is applied as
 //!   `graph[node_id]["inputs"][input_name] = value`. A `node_id` absent from
 //!   the graph is an `InvalidInput` failure, never a silent no-op.
-//! - The reserved key `"$seed"`, when present, MUST be a string in the same
-//!   `"<node_id>.<input_name>"` form. It is not itself applied as a value;
-//!   instead, when the Generation's shared `seed` is `Some`, that numeric
-//!   seed is written to the input it points at. A `seed` with no `"$seed"`
-//!   pointer is dropped: some workflows have no seed-driven randomness to
-//!   control, and the manifest carries no dedicated seed field to make this
-//!   mandatory.
 //! - Input Artifacts are wired into the graph by placeholder substitution:
 //!   after every `request.inputs` entry is uploaded via `POST /upload/image`,
 //!   every JSON string in the graph equal to that Artifact's `artifact_id` is
@@ -1104,6 +1104,22 @@ fn apply_parameters(
         if key == SEED_POINTER_KEY {
             continue;
         }
+        if key.starts_with('$') {
+            let mut replaced = false;
+            for graph_value in graph.values_mut() {
+                replaced |= substitute_parameter_placeholder(graph_value, key, value);
+            }
+            if !replaced {
+                return Err(BackendError {
+                    kind: FailureKind::InvalidInput,
+                    message: format!(
+                        "comfyui parameter placeholder '{key}' does not occur in the workflow graph"
+                    ),
+                    retry_hint: false,
+                });
+            }
+            continue;
+        }
         apply_override(graph, key, value.clone())?;
     }
     Ok(())
@@ -1140,6 +1156,35 @@ fn apply_override(
     };
     inputs.insert(input_name.to_string(), value);
     Ok(())
+}
+
+/// Replaces every JSON string equal to `placeholder` with `replacement`.
+fn substitute_parameter_placeholder(
+    value: &mut Value,
+    placeholder: &str,
+    replacement: &Value,
+) -> bool {
+    match value {
+        Value::String(text) if text == placeholder => {
+            *value = replacement.clone();
+            true
+        }
+        Value::Array(items) => {
+            let mut replaced = false;
+            for item in items {
+                replaced |= substitute_parameter_placeholder(item, placeholder, replacement);
+            }
+            replaced
+        }
+        Value::Object(map) => {
+            let mut replaced = false;
+            for item in map.values_mut() {
+                replaced |= substitute_parameter_placeholder(item, placeholder, replacement);
+            }
+            replaced
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
 }
 
 /// Recursively replaces any JSON string equal to an uploaded input
@@ -1332,6 +1377,28 @@ mod tests {
             panic!("seed placement must apply");
         };
         assert_eq!(graph["3"]["inputs"]["seed"], json!(42));
+    }
+
+    #[test]
+    fn apply_parameters_replaces_portable_placeholders() {
+        let mut graph = sample_graph();
+        graph["3"]["inputs"]["prompt"] = json!("$prompt");
+        graph["3"]["inputs"]["width"] = json!("$width");
+        let parameters = json!({ "$prompt": "a red panda", "$width": 1024 });
+        let Ok(()) = apply_parameters(&mut graph, &parameters, None) else {
+            panic!("portable placeholders must apply");
+        };
+        assert_eq!(graph["3"]["inputs"]["prompt"], json!("a red panda"));
+        assert_eq!(graph["3"]["inputs"]["width"], json!(1024));
+    }
+
+    #[test]
+    fn apply_parameters_rejects_missing_portable_placeholder() {
+        let mut graph = sample_graph();
+        let Err(error) = apply_parameters(&mut graph, &json!({ "$prompt": "unused" }), None) else {
+            panic!("missing portable placeholder must fail");
+        };
+        assert_eq!(error.kind, FailureKind::InvalidInput);
     }
 
     #[test]

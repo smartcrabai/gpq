@@ -662,6 +662,46 @@ async fn deliver_worker_local(
     response
 }
 
+/// Consumes one Worker-local output into memory for a synchronous API response.
+/// Uses the same one-shot, resumable, integrity-checked delivery path as the
+/// public Artifact download route while bounding the buffered response.
+///
+/// # Errors
+/// Returns an error when delivery cannot start or finish, exceeds `limit`, or
+/// produces a byte count different from the recorded manifest.
+pub(crate) async fn consume_worker_local_output(
+    state: &AppState,
+    tenant: TenantId,
+    row: ArtifactRow,
+    limit: usize,
+) -> anyhow::Result<Bytes> {
+    let artifact = row.id;
+    let expected_size = row.manifest.size_bytes;
+    if expected_size > u64::try_from(limit).unwrap_or(u64::MAX) {
+        bail!("artifact {artifact} exceeds the inline response limit");
+    }
+    let conn = state
+        .db
+        .begin_tenant(tenant)
+        .await
+        .context("failed to begin artifact delivery transaction")?;
+    let response = deliver_worker_local(state, conn, tenant, artifact, row).await;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("artifact {artifact} delivery returned HTTP {status}");
+    }
+    let bytes = axum::body::to_bytes(response.into_body(), limit)
+        .await
+        .with_context(|| format!("failed to buffer artifact {artifact}"))?;
+    if as_u64(bytes.len()) != expected_size {
+        bail!(
+            "artifact {artifact} delivered {} bytes, expected {expected_size}",
+            bytes.len()
+        );
+    }
+    Ok(bytes)
+}
+
 fn deliver_request(artifact: ArtifactId, delivery_token: &str, offset: u64) -> RemoteMessage {
     RemoteMessage {
         message: Some(RemoteMessageKind::from(DeliverRequest {

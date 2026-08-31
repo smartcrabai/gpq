@@ -300,7 +300,7 @@ Uninstalling also removes the stored Worker Credential.
 
 ## OpenAI-compatible usage
 
-Create model aliases through `gpq.v1.CatalogService` after a Worker has advertised the matching model version. Then use the Tenant Master Key as the OpenAI API key.
+Create Model aliases through `gpq.v1.CatalogService` after a Worker has advertised the matching Model Version. Image generation instead names an image Workflow alias. Use the Tenant Master Key as the OpenAI API key.
 
 List available model aliases:
 
@@ -321,7 +321,24 @@ curl 'https://gpq.example.com/v1/chat/completions' \
   }'
 ```
 
-Streaming uses the standard `"stream": true` request field. `POST /v1/responses` accepts the corresponding OpenAI Responses API shape. OpenAI image content parts may use `http:`, `https:`, or `data:` URLs; Remote rejects private and otherwise unsafe network targets.
+Generate an image through the OpenAI-compatible endpoint used by generic clients such as `@ai-sdk/openai-compatible`:
+
+```sh
+curl 'https://gpq.example.com/v1/images/generations' \
+  -H 'Authorization: Bearer <tenant-master-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "example-image-workflow",
+    "prompt": "A red panda astronaut",
+    "n": 1,
+    "size": "1024x1024",
+    "response_format": "b64_json"
+  }'
+```
+
+The image Workflow graph binds portable request values with exact string placeholders: `$prompt`, `$width`, `$height`, `$n`, and `$seed_value`. Additional request fields bind to `$<field-name>`. Omit optional fields whose placeholders the graph does not declare. The endpoint returns exactly the requested number of images as `data[].b64_json`; inline image bytes are limited to 64 MiB per response.
+
+Chat streaming uses the standard `"stream": true` request field. `POST /v1/responses` accepts the corresponding OpenAI Responses API shape. OpenAI image content parts may use `http:`, `https:`, or `data:` URLs; Remote rejects private and otherwise unsafe network targets. Image-generation streaming and `/v1/images/edits` are not supported.
 
 ## Native API
 

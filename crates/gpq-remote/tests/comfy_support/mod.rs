@@ -355,9 +355,16 @@ fn event(kind: &str, data: &Value) -> Message {
     Message::Text(json!({"type": kind, "data": data}).to_string().into())
 }
 
+/// Mirrors upstream `ComfyUI`'s `/system_stats`, whose `comfy_package_versions`
+/// is an array of `{name, installed, required}` entries.
 async fn system_stats() -> Json<Value> {
     Json(json!({
-        "system": {"comfyui_version": "1.0.0-fake", "comfy_package_versions": {}},
+        "system": {
+            "comfyui_version": "1.0.0-fake",
+            "comfy_package_versions": [
+                {"name": "comfyui-frontend-package", "installed": "1.0.0", "required": "1.0.0"}
+            ],
+        },
         "devices": [{"vram_free": 8_000_000_000_u64, "vram_total": 8_000_000_000_u64}],
     }))
 }

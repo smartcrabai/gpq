@@ -33,7 +33,7 @@ use gpq_proto::gpq::worker::v1::{
 };
 use rand::{Rng, RngExt};
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::artifacts::LocalArtifactStore;
@@ -275,6 +275,7 @@ async fn connect_and_serve(
     heartbeat_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut maintenance_ticker = tokio::time::interval(MAINTENANCE_INTERVAL);
     maintenance_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut maintenance = MaintenanceTask::default();
     let mut capability_changes = pools.watch_changes();
     let mut attempt_tasks: JoinSet<()> = JoinSet::new();
 
@@ -318,7 +319,7 @@ async fn connect_and_serve(
                 renew_leases(&ctx.live, now);
             }
             _ = maintenance_ticker.tick() => {
-                run_maintenance_tick(pools, artifacts).await;
+                maintenance.run_if_idle(pools, artifacts);
             }
             changed = capability_changes.changed() => {
                 if changed.is_err() {
@@ -347,6 +348,36 @@ async fn connect_and_serve(
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+/// The in-flight maintenance pass, if any. Maintenance re-probes every
+/// backend and may digest a multi-gigabyte model directory, so it runs as
+/// its own task: awaiting it inside the session loop would starve heartbeats
+/// and lease intake for longer than the 45-second lease TTL. A tick that
+/// arrives while the previous pass is still running is skipped; the task is
+/// aborted when the session ends so a reconnect never overlaps two passes.
+#[derive(Default)]
+struct MaintenanceTask(Option<JoinHandle<()>>);
+
+impl MaintenanceTask {
+    fn run_if_idle(&mut self, pools: &Arc<PoolSupervisor>, artifacts: &Arc<LocalArtifactStore>) {
+        if self.0.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let pools = pools.clone();
+        let artifacts = artifacts.clone();
+        self.0 = Some(tokio::spawn(async move {
+            run_maintenance_tick(&pools, &artifacts).await;
+        }));
+    }
+}
+
+impl Drop for MaintenanceTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
         }
     }
 }

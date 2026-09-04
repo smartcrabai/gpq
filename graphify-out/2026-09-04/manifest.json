@@ -738,9 +738,9 @@
     "semantic_hash": ""
   },
   "examples/refine-and-generate/main.ts": {
-    "mtime": 1788498497.8677351,
-    "seen": 1788498627.8797598,
-    "ast_hash": "286989710389db9bf1aea0d7fac3aeb9",
+    "mtime": 1788494611.8137617,
+    "seen": 1788494709.022743,
+    "ast_hash": "76931f21bb7ee6a5fb49a18e7c53af42",
     "semantic_hash": ""
   },
   "examples/refine-and-generate/package.json": {

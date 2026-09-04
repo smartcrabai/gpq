@@ -338,6 +338,18 @@ curl 'https://gpq.example.com/v1/images/generations' \
 
 The image Workflow graph binds portable request values with exact string placeholders: `$prompt`, `$width`, `$height`, `$n`, and `$seed_value`. Additional request fields bind to `$<field-name>`. Omit optional fields whose placeholders the graph does not declare. The endpoint returns exactly the requested number of images as `data[].b64_json`; inline image bytes are limited to 64 MiB per response.
 
+[`examples/refine-and-generate`](examples/refine-and-generate/main.ts) chains both endpoints from one TypeScript script with the Vercel AI SDK: a chat Model alias refines a short idea into a detailed prompt, then an image Workflow alias renders it. Run it with Node.js 22.18 or newer:
+
+```sh
+cd examples/refine-and-generate
+npm install
+GPQ_BASE_URL='https://gpq.example.com' \
+GPQ_MASTER_KEY='<tenant-master-key>' \
+GPQ_TEXT_MODEL='example-model' \
+GPQ_IMAGE_WORKFLOW='example-image-workflow' \
+  node main.ts 'A red panda astronaut' --size 1024x1024 --out panda.png
+```
+
 Chat streaming uses the standard `"stream": true` request field. `POST /v1/responses` accepts the corresponding OpenAI Responses API shape. OpenAI image content parts may use `http:`, `https:`, or `data:` URLs; Remote rejects private and otherwise unsafe network targets. Image-generation streaming and `/v1/images/edits` are not supported.
 
 ## Native API

@@ -1,5 +1,9 @@
 /target
 
+# examples
+/examples/*/node_modules/
+/examples/*/*.png
+
 # graphify
 /graphify-out/cache/
 /graphify-out/converted/

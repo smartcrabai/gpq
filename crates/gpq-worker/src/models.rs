@@ -119,6 +119,28 @@ pub(crate) fn hash_model_fresh_cancellable(
     }
 }
 
+/// Metadata fingerprint of one model file or directory: size, modification
+/// time, and file identity of the model itself and of every member. Cheap
+/// to read even for a multi-gigabyte model, so a backend adapter can bind a
+/// content hash once per process and reuse it while the fingerprint is
+/// unchanged, refusing to trust the material (rather than rehashing it) once
+/// it differs (ADR 0012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelSnapshot {
+    key: CacheKey,
+    members: BTreeMap<String, CacheKey>,
+}
+
+impl ModelSnapshot {
+    pub(crate) fn read(path: &Path) -> anyhow::Result<Self> {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("reading metadata for model {}", path.display()))?;
+        let key = cache_key(&metadata)?;
+        let (members, _) = model_files(path, &metadata)?;
+        Ok(Self { key, members })
+    }
+}
+
 fn model_files(path: &Path, metadata: &Metadata) -> anyhow::Result<ModelFiles> {
     let mut members = BTreeMap::new();
     let mut files = Vec::new();

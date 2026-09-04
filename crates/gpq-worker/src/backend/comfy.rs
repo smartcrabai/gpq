@@ -187,7 +187,7 @@ impl ComfyBackend {
         let object_info = self.object_info().await?;
         Ok(custom_node_versions(
             &object_info,
-            &stats.system.comfy_package_versions,
+            &stats.system.package_versions(),
         ))
     }
 
@@ -693,7 +693,7 @@ impl Backend for ComfyBackend {
     async fn probe(&self) -> Result<BackendCapabilities, BackendError> {
         let stats = self.system_stats().await?;
         let object_info = self.object_info().await?;
-        let custom_nodes = custom_node_versions(&object_info, &stats.system.comfy_package_versions);
+        let custom_nodes = custom_node_versions(&object_info, &stats.system.package_versions());
 
         let streaming_ok = self.probe_streaming().await;
         let mut probes = BTreeMap::new();
@@ -930,8 +930,36 @@ struct SystemStatsResponse {
 #[derive(Debug, Deserialize)]
 struct SystemStatsSystem {
     comfyui_version: String,
+    /// Upstream reports every `comfy*` package pinned in its
+    /// `requirements.txt` as `{name, installed, required}` entries
+    /// (`app/frontend_management.py::get_comfy_package_versions`); builds
+    /// older than that field omit it entirely.
     #[serde(default)]
-    comfy_package_versions: BTreeMap<String, String>,
+    comfy_package_versions: Vec<ComfyPackageVersion>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComfyPackageVersion {
+    name: String,
+    #[serde(default)]
+    installed: Option<String>,
+}
+
+impl SystemStatsSystem {
+    /// Installed package -> version map; packages `ComfyUI` could not resolve
+    /// an installed version for are omitted so they fall back to `"unknown"`
+    /// in [`custom_node_versions`].
+    fn package_versions(&self) -> BTreeMap<String, String> {
+        self.comfy_package_versions
+            .iter()
+            .filter_map(|package| {
+                package
+                    .installed
+                    .as_ref()
+                    .map(|installed| (package.name.clone(), installed.clone()))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1625,6 +1653,34 @@ mod tests {
         );
         let nodes = custom_node_versions(&object_info, &BTreeMap::new());
         assert_eq!(nodes.get("SomePack"), Some(&"unknown".to_string()));
+    }
+
+    /// `GET /system_stats` as emitted by upstream `ComfyUI` 0.34: the
+    /// `comfy_package_versions` field is an array of package entries, and an
+    /// entry whose installed version is unresolvable carries `null`.
+    #[test]
+    fn system_stats_parses_upstream_package_version_entries() {
+        let raw = json!({
+            "system": {
+                "os": "darwin",
+                "comfyui_version": "0.34.2",
+                "comfy_package_versions": [
+                    {"name": "comfyui-frontend-package", "installed": "1.49.6", "required": "1.49.6"},
+                    {"name": "comfyui-embedded-docs", "installed": null, "required": "0.4.0"}
+                ],
+                "python_version": "3.13.12"
+            },
+            "devices": [{"name": "mps", "type": "mps", "index": null, "vram_total": 64, "vram_free": 32}]
+        });
+        let Ok(stats) = serde_json::from_value::<SystemStatsResponse>(raw) else {
+            panic!("upstream system_stats shape must deserialize");
+        };
+        assert_eq!(stats.system.comfyui_version, "0.34.2");
+        assert_eq!(
+            stats.system.package_versions(),
+            BTreeMap::from([("comfyui-frontend-package".to_string(), "1.49.6".to_string())])
+        );
+        assert_eq!(stats.devices[0].vram_free, Some(32));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use super::{
     http_client, run_with_timeout,
 };
 use crate::config::PoolConfig;
-use crate::models::hash_model_fresh_cancellable;
+use crate::models::{ModelSnapshot, hash_model_fresh_cancellable};
 
 const BACKEND_NAME: &str = "mlx-dspark";
 /// Bounds backend-reported/configured slots before capability serialization
@@ -39,7 +39,14 @@ pub struct MlxDsparkBackend {
     base_url: url::Url,
     model_path: PathBuf,
     configured_slots: Option<u32>,
-    resident: Mutex<Option<ContentHash>>,
+    resident: Mutex<Option<ResidentModel>>,
+}
+
+/// The Model Version bound to the running `mlx-dspark` process: its content
+/// hash plus the directory fingerprint that hash was computed against.
+struct ResidentModel {
+    snapshot: ModelSnapshot,
+    hash: ContentHash,
 }
 
 struct CancelHashOnDrop(CancellationToken);
@@ -136,6 +143,12 @@ impl MlxDsparkBackend {
             })
     }
 
+    /// Resolves the loaded target to its pinned Model Version hash. The
+    /// directory is digested once per process; while its metadata fingerprint
+    /// is unchanged the bound hash is reused, since rehashing a multi-gigabyte
+    /// MLX checkpoint on every probe and Attempt would take longer than the
+    /// lease TTL. A changed fingerprint is refused rather than rehashed
+    /// against the still-running process (ADR 0012), matching llama.cpp.
     async fn resident_model_hash(
         &self,
         target: &str,
@@ -152,7 +165,26 @@ impl MlxDsparkBackend {
             });
         }
 
+        let snapshot = ModelSnapshot::read(&path).map_err(|err| BackendError {
+            kind: FailureKind::ModelUnavailable,
+            message: format!("reading metadata for model {}: {err}", path.display()),
+            retry_hint: true,
+        })?;
         let mut resident = self.resident.lock().await;
+        match resident.as_ref() {
+            Some(bound) if bound.snapshot == snapshot => return Ok(bound.hash),
+            Some(_) => {
+                return Err(BackendError {
+                    kind: FailureKind::ModelUnavailable,
+                    message: format!(
+                        "model {} changed on disk after mlx-dspark loaded it",
+                        path.display()
+                    ),
+                    retry_hint: false,
+                });
+            }
+            None => {}
+        }
         let hash_path = path.clone();
         let hash_cancel = CancellationToken::new();
         let task_cancel = hash_cancel.clone();
@@ -186,21 +218,8 @@ impl MlxDsparkBackend {
                 }
             })?;
 
-        match resident.as_ref() {
-            Some(&bound) if bound == hash => Ok(hash),
-            Some(_) => Err(BackendError {
-                kind: FailureKind::ModelUnavailable,
-                message: format!(
-                    "model {} changed on disk after mlx-dspark loaded it",
-                    path.display()
-                ),
-                retry_hint: false,
-            }),
-            None => {
-                *resident = Some(hash);
-                Ok(hash)
-            }
-        }
+        *resident = Some(ResidentModel { snapshot, hash });
+        Ok(hash)
     }
 
     async fn ready_model(
@@ -445,6 +464,50 @@ mod tests {
         let path = PathBuf::from("/models/Qwen3-8B-8bit");
         assert!(resolve_target(&path, "/models/Qwen3-8B-8bit"));
         assert!(!resolve_target(&path, "mlx-community/Qwen3-8B-8bit"));
+    }
+
+    /// The directory digest binds once; an unchanged fingerprint reuses it,
+    /// and a member rewritten under the running process is refused instead
+    /// of being rehashed (ADR 0012).
+    #[tokio::test]
+    async fn bound_model_hash_is_reused_until_the_directory_changes() {
+        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let model_path = root.path().join("model");
+        std::fs::create_dir(&model_path)
+            .unwrap_or_else(|err| panic!("create model directory: {err}"));
+        std::fs::write(model_path.join("config.json"), b"{}")
+            .unwrap_or_else(|err| panic!("write model config: {err}"));
+        let state_dir = root.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap_or_else(|err| panic!("create state dir: {err}"));
+        let unreachable = "http://127.0.0.1:9"
+            .parse()
+            .unwrap_or_else(|err| panic!("unreachable URL: {err}"));
+        let backend =
+            MlxDsparkBackend::new(&test_pool(&state_dir, model_path.clone(), unreachable));
+        let target = model_path.to_string_lossy().into_owned();
+        let cancel = CancellationToken::new();
+
+        let first = backend
+            .resident_model_hash(&target, &cancel)
+            .await
+            .unwrap_or_else(|err| panic!("first bind: {err}"));
+        let again = backend
+            .resident_model_hash(&target, &cancel)
+            .await
+            .unwrap_or_else(|err| panic!("rebind: {err}"));
+        assert_eq!(first, again);
+
+        std::fs::write(model_path.join("config.json"), b"{\"changed\": true}")
+            .unwrap_or_else(|err| panic!("rewrite model config: {err}"));
+        let Err(error) = backend.resident_model_hash(&target, &cancel).await else {
+            panic!("a changed model directory must be refused");
+        };
+        assert_eq!(error.kind, FailureKind::ModelUnavailable);
+        assert!(
+            error.message.contains("changed on disk"),
+            "{}",
+            error.message
+        );
     }
 
     #[tokio::test]

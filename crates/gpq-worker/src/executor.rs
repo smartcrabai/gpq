@@ -782,10 +782,40 @@ async fn upload_to_object_store(
         .map_err(|err| (FailureKind::Internal, err.to_string()))
 }
 
+/// Decodes a protobuf `Struct` into JSON for the backend. `Struct` carries
+/// every number as a double, so an integral value such as a `ComfyUI` link
+/// output index `["1", 0]` or a `$width` parameter would otherwise reach the
+/// backend as `0.0`; `ComfyUI` indexes node outputs with it and rejects a
+/// float. Integral doubles that fit `i64` are restored to JSON integers.
 fn struct_to_json(
     value: &buffa_types::google::protobuf::Struct,
 ) -> Result<serde_json::Value, String> {
-    serde_json::to_value(value).map_err(|err| format!("workflow struct decode failed: {err}"))
+    let mut json = serde_json::to_value(value)
+        .map_err(|err| format!("workflow struct decode failed: {err}"))?;
+    restore_integers(&mut json);
+    Ok(json)
+}
+
+/// Largest magnitude a double represents exactly as an integer (2^53).
+const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
+
+fn restore_integers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number) => {
+            let Some(float) = number.as_f64() else {
+                return;
+            };
+            if float.fract() == 0.0 && float.abs() <= EXACT_INTEGER_LIMIT {
+                // Exact: `float` is integral and far inside the `i64` range.
+                #[expect(clippy::cast_possible_truncation)]
+                let integer = float as i64;
+                *value = serde_json::Value::from(integer);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(restore_integers),
+        serde_json::Value::Object(map) => map.values_mut().for_each(restore_integers),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_) => {}
+    }
 }
 
 fn manifest_from_proto(manifest: &v1::ArtifactManifest) -> Result<ArtifactManifest, String> {
@@ -917,6 +947,33 @@ fn workflow_manifest_from_proto(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A protobuf `Struct` round trip turns every number into a double; the
+    /// backend must still see `ComfyUI` link indices and integer inputs as
+    /// JSON integers while genuine fractions stay floats.
+    #[test]
+    fn struct_to_json_restores_integral_numbers() {
+        let wire = serde_json::json!({
+            "9": { "class_type": "SaveImage", "inputs": { "images": ["1", 0] } },
+            "1": { "class_type": "EmptyImage", "inputs": { "width": 640, "color": 14_709_792 } },
+            "3": { "class_type": "KSampler", "inputs": { "cfg": 7.5, "denoise": 1.0, "seed": -1 } },
+        });
+        let Ok(graph) = serde_json::from_value::<buffa_types::google::protobuf::Struct>(wire)
+        else {
+            panic!("graph literal must be a Struct");
+        };
+        let Ok(json) = struct_to_json(&graph) else {
+            panic!("struct must decode");
+        };
+        assert_eq!(json["9"]["inputs"]["images"][1], serde_json::json!(0));
+        assert!(json["9"]["inputs"]["images"][1].is_i64());
+        assert!(json["1"]["inputs"]["width"].is_i64());
+        assert!(json["1"]["inputs"]["color"].is_i64());
+        assert_eq!(json["3"]["inputs"]["seed"], serde_json::json!(-1));
+        assert_eq!(json["3"]["inputs"]["cfg"], serde_json::json!(7.5));
+        assert!(json["3"]["inputs"]["denoise"].is_i64());
+        assert_eq!(json["9"]["inputs"]["images"].to_string(), r#"["1",0]"#);
+    }
 
     #[test]
     fn download_verification_accepts_matching_bytes() {

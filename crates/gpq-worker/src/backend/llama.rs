@@ -899,6 +899,7 @@ mod tests {
             modality: Modality::Llm,
             model_sha256: None,
             model_path: None,
+            comfy_prompt: None,
             workflow_graph: None,
             workflow_manifest: None,
             parameters: json!({"messages": []}),

@@ -225,7 +225,8 @@ pub struct PoolRow {
     pub resident_model_sha256: Option<ContentHash>,
     /// Accelerator memory reported by the backend, when known.
     pub accelerator_memory_bytes: Option<u64>,
-    /// Installed custom nodes, package name to exact version.
+    /// Installed custom nodes, package name to the discovered or
+    /// operator-declared version; `"unknown"` means unavailable.
     pub custom_nodes: BTreeMap<String, String>,
     /// Content hashes of every Model Version installed for this Pool.
     pub model_hashes: Vec<String>,
@@ -370,7 +371,8 @@ pub struct PoolUpsert {
     pub resident_model_sha256: Option<ContentHash>,
     /// Accelerator memory reported by the backend, when known.
     pub accelerator_memory_bytes: Option<u64>,
-    /// Installed custom nodes, package name to exact version.
+    /// Installed custom nodes, package name to the discovered or
+    /// operator-declared version; `"unknown"` means unavailable.
     pub custom_nodes: BTreeMap<String, String>,
     /// Probe results per required backend operation.
     pub probes: BTreeMap<String, bool>,
@@ -554,9 +556,10 @@ pub async fn release_slot(
 }
 
 /// Marks `version_hash` incapable on `pool_id` (ADR 0003): a runtime OOM
-/// proved the Pool cannot host this Model or Workflow Version.
+/// proved the Pool cannot host this Model or Workflow Version, or raw prompt
+/// target.
 ///
-/// Upserts the `pool_models` row so a Model that had not yet been recorded
+/// Upserts the `pool_models` row so a target that had not yet been recorded
 /// (e.g. a stale advertisement) is still marked.
 ///
 /// # Errors
@@ -593,6 +596,7 @@ struct PoolCapabilityRow {
     resident_model_sha256: Option<String>,
     accelerator_memory_bytes: Option<i64>,
     custom_nodes: Json<BTreeMap<String, String>>,
+    probes: Json<BTreeMap<String, bool>>,
     capable_models: Vec<String>,
     incapable_models: Vec<String>,
 }
@@ -636,6 +640,7 @@ fn build_slot_capability(
         accelerator_memory_bytes: row
             .accelerator_memory_bytes
             .and_then(|value| u64::try_from(value).ok()),
+        supports_comfy_prompt: row.probes.0.get("comfy_prompt").copied().unwrap_or(false),
         incapable_versions,
     };
     let free_slots = u32::try_from(row.free_slots).unwrap_or(0);
@@ -678,6 +683,7 @@ pub async fn pool_capabilities(
             dp.resident_model_sha256 AS resident_model_sha256, \
             dp.accelerator_memory_bytes AS accelerator_memory_bytes, \
             dp.custom_nodes AS custom_nodes, \
+            dp.probes AS probes, \
             COALESCE(array_agg(pm.content_sha256) FILTER (WHERE pm.content_sha256 IS NOT NULL AND pm.incapable_since IS NULL), ARRAY[]::text[]) AS capable_models, \
             COALESCE(array_agg(pm.content_sha256) FILTER (WHERE pm.content_sha256 IS NOT NULL AND pm.incapable_since IS NOT NULL), ARRAY[]::text[]) AS incapable_models \
          FROM device_pools dp \
@@ -685,7 +691,7 @@ pub async fn pool_capabilities(
          LEFT JOIN pool_models pm ON pm.tenant_id = dp.tenant_id AND pm.pool_id = dp.id \
          WHERE dp.tenant_id = $1 AND dp.ready AND w.revoked_at IS NULL \
          GROUP BY dp.id, dp.worker_id, dp.pool_key, dp.backend_kind, dp.backend_version, \
-                  dp.free_slots, dp.resident_model_sha256, dp.accelerator_memory_bytes, dp.custom_nodes",
+                  dp.free_slots, dp.resident_model_sha256, dp.accelerator_memory_bytes, dp.custom_nodes, dp.probes",
     )
     .bind(tenant_id.as_uuid())
     .fetch_all(&mut *conn)
@@ -760,6 +766,7 @@ mod tests {
             resident_model_sha256: Some(hash(1).to_hex()),
             accelerator_memory_bytes: Some(1024),
             custom_nodes: Json(BTreeMap::new()),
+            probes: Json(BTreeMap::new()),
             capable_models: vec![hash(1).to_hex()],
             incapable_models: vec![hash(2).to_hex()],
         }

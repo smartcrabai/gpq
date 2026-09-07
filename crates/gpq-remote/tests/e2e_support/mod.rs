@@ -41,6 +41,10 @@ use uuid::Uuid;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Bytes written to the `ComfyUI` harness model path and hashed into Workflow
+/// model-pin integration requests.
+pub const FAKE_MODEL_BYTES: &[u8] = b"fake model bytes for the gpq e2e harness";
+
 /// Polls `attempt` until it resolves `Some`, or fails after `timeout`.
 pub async fn wait_until<T, F, Fut>(mut attempt: F, timeout: Duration) -> anyhow::Result<T>
 where
@@ -133,7 +137,7 @@ pub enum PoolKind {
     /// A llama.cpp Pool, the default the OpenAI-compatible tests need.
     #[default]
     LlamaCpp,
-    /// A `ComfyUI` Pool, for the image, video, and music modalities.
+    /// A `ComfyUI` Pool, for image, video, music, and raw prompt modalities.
     ComfyUi,
 }
 
@@ -171,6 +175,11 @@ fn worker_config_toml(
     pool_base_url: &str,
     model_path: &Path,
 ) -> String {
+    let custom_node_versions = if pool_kind == PoolKind::ComfyUi {
+        "\n[pools.custom_node_versions]\nSomePack = \"1.0.0\"\n"
+    } else {
+        ""
+    };
     format!(
         "name = \"{worker_name}\"\n\
          remote_url = \"{remote_base}\"\n\
@@ -184,11 +193,13 @@ fn worker_config_toml(
          state_dir = \"{pool_state_dir}\"\n\
          startup_timeout_secs = 20\n\
          base_url = \"{pool_base_url}\"\n\
-         model_paths = [\"{model_path}\"]\n",
+         model_paths = [\"{model_path}\"]\n\
+         {custom_node_versions}",
         worker_state_dir = worker_state_dir.display(),
         pool_state_dir = pool_state_dir.display(),
         backend = pool_kind.as_str(),
         model_path = model_path.display(),
+        custom_node_versions = custom_node_versions,
     )
 }
 
@@ -659,6 +670,26 @@ impl Harness {
         Ok((ready == Some(expected)).then_some(()))
     }
 
+    /// Whether this harness Worker's public `ListWorkers` status currently
+    /// reports the expected online state.
+    ///
+    /// # Errors
+    /// Returns an error if the public `ListWorkers` RPC fails.
+    pub async fn worker_is_online(&self, expected: bool) -> anyhow::Result<Option<()>> {
+        let response = self
+            .catalog_client(&self.tenant1.master_key)
+            .list_workers(pb::ListWorkersRequest::default())
+            .await
+            .map_err(|err| anyhow::anyhow!("ListWorkers failed: {err}"))?
+            .into_owned();
+        let online = response
+            .workers
+            .iter()
+            .find(|worker| worker.name == self.worker_name)
+            .is_some_and(|worker| worker.online);
+        Ok((online == expected).then_some(()))
+    }
+
     /// The OS pid of the fake backend's currently managed process (a plain
     /// `sleep`), read from the Pool's durable process-identity record.
     /// `None` before the Worker has spawned it yet.
@@ -909,9 +940,8 @@ impl Harness {
         ] {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        let model_path = tmp_root.join("fake-model.bin");
-        std::fs::write(&model_path, b"fake model bytes for the gpq e2e harness")
-            .context("writing the fake model file")?;
+        let model_path = tmp_root.join("fake-model.safetensors");
+        std::fs::write(&model_path, FAKE_MODEL_BYTES).context("writing the fake model file")?;
 
         let fake_port = free_port()?;
         let fake = FakeLlama::spawn(fake_port, model_path.clone())

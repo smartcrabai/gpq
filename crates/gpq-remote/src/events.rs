@@ -201,6 +201,7 @@ async fn append_persisted(
 #[derive(Clone, Default)]
 pub struct EventHub {
     channels: std::sync::Arc<Mutex<HashMap<GenerationId, broadcast::Sender<GenerationEvent>>>>,
+    tenant_channels: std::sync::Arc<Mutex<HashMap<TenantId, broadcast::Sender<GenerationId>>>>,
 }
 
 impl EventHub {
@@ -250,6 +251,7 @@ impl EventHub {
     ) -> anyhow::Result<()> {
         let persisted = persisted_form(event)
             .with_context(|| format!("failed to encode {event:?} for persistence"))?;
+        let durable = persisted.is_some();
         if let Some((kind, payload)) = persisted
             && let Err(err) = append_persisted(db, tenant, generation, kind, payload).await
         {
@@ -262,6 +264,9 @@ impl EventHub {
             return Err(err);
         }
         self.publish(generation, event.clone());
+        if durable {
+            self.notify_tenant(tenant, generation);
+        }
         Ok(())
     }
 
@@ -274,6 +279,35 @@ impl EventHub {
             .entry(generation)
             .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
             .subscribe()
+    }
+
+    /// Subscribes to notifications for any Generation belonging to a Tenant.
+    #[must_use]
+    pub fn subscribe_tenant(&self, tenant: TenantId) -> broadcast::Receiver<GenerationId> {
+        let mut channels = self
+            .tenant_channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        channels
+            .entry(tenant)
+            .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
+            .subscribe()
+    }
+
+    /// Wakes Tenant-scoped subscribers after a durable Generation change.
+    pub fn notify_tenant(&self, tenant: TenantId, generation: GenerationId) {
+        let mut channels = self
+            .tenant_channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(sender) = channels.get(&tenant) else {
+            return;
+        };
+        if sender.receiver_count() == 0 {
+            channels.remove(&tenant);
+            return;
+        }
+        let _ = sender.send(generation);
     }
 }
 
@@ -429,5 +463,18 @@ mod tests {
             serde_json::json!({ "unexpected": true }),
         );
         assert!(decode_persisted(&row).is_none());
+    }
+
+    #[tokio::test]
+    async fn tenant_notifications_are_scoped_and_delivered() {
+        let hub = EventHub::default();
+        let tenant = TenantId::new();
+        let other_tenant = TenantId::new();
+        let generation = GenerationId::new();
+        let mut receiver = hub.subscribe_tenant(tenant);
+        hub.notify_tenant(other_tenant, generation);
+        assert!(receiver.try_recv().is_err());
+        hub.notify_tenant(tenant, generation);
+        assert_eq!(receiver.recv().await, Ok(generation));
     }
 }

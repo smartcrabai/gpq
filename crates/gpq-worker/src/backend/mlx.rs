@@ -434,6 +434,7 @@ mod tests {
             slots: None,
             model_paths: vec![model_path],
             expected_hashes: BTreeMap::new(),
+            custom_node_versions: BTreeMap::new(),
         }
     }
 
@@ -538,6 +539,7 @@ mod tests {
             modality: Modality::Llm,
             model_sha256: Some(resident),
             model_path: Some(model_path),
+            comfy_prompt: None,
             workflow_graph: None,
             workflow_manifest: None,
             parameters: json!({"messages": [{"role": "user", "content": "hi"}]}),

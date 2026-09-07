@@ -565,6 +565,7 @@ mod tests {
             slots: None,
             model_paths: vec![model_path],
             expected_hashes,
+            custom_node_versions: BTreeMap::new(),
         };
 
         let result = super::scan_models(&pool);

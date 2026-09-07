@@ -57,8 +57,8 @@ async fn migrations_apply_in_order_and_reapplication_is_a_noop() -> anyhow::Resu
         versions,
         // 0004 makes `device_pools.free_slots` a generated column derived
         // from `claimed_slots`; 0005 indexes the execution-deadline sweep;
-        // 0006 admits the mlx-dspark backend kind.
-        vec![1, 2, 3, 4, 5, 6],
+        // 0006 admits the mlx-dspark backend kind; 0007 adds raw Comfy prompts.
+        vec![1, 2, 3, 4, 5, 6, 7],
         "unexpected applied migration versions: {versions:?}"
     );
 

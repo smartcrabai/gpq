@@ -21,7 +21,7 @@ include!(concat!(env!("OUT_DIR"), "/_gpq_proto.rs"));
 pub const PROTOCOL_MAJOR: u32 = 1;
 
 /// Minor protocol version, incremented for backward-compatible additions.
-pub const PROTOCOL_MINOR: u32 = 0;
+pub const PROTOCOL_MINOR: u32 = 1;
 
 /// Whether a Worker reporting `major` may join this Remote.
 #[must_use]

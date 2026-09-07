@@ -10,7 +10,7 @@ use crate::state::state_enum;
 state_enum! {
     /// The kind of result a Generation produces.
     ///
-    /// Modality is derived after alias resolution, never sent by callers (ADR 0006).
+    /// Modality is derived after target resolution, never sent by callers (ADR 0006).
     Modality {
         /// Text generation on an LLM runtime such as llama.cpp or mlx-dspark.
         Llm => "llm",
@@ -20,6 +20,8 @@ state_enum! {
         Video => "video",
         /// Music or audio generation on a `ComfyUI` runtime.
         Music => "music",
+        /// Raw `ComfyUI` Server API workflow execution.
+        Comfy => "comfy",
     }
 }
 
@@ -30,7 +32,7 @@ impl Modality {
         match self {
             Self::Llm => Duration::from_mins(30),
             Self::Image => Duration::from_hours(2),
-            Self::Video | Self::Music => Duration::from_hours(24),
+            Self::Video | Self::Music | Self::Comfy => Duration::from_hours(24),
         }
     }
 
@@ -40,7 +42,7 @@ impl Modality {
     pub const fn backend_kind(&self) -> BackendKind {
         match self {
             Self::Llm => BackendKind::LlamaCpp,
-            Self::Image | Self::Video | Self::Music => BackendKind::ComfyUi,
+            Self::Image | Self::Video | Self::Music | Self::Comfy => BackendKind::ComfyUi,
         }
     }
 }
@@ -110,12 +112,21 @@ mod tests {
             Modality::Music.default_execution_timeout(),
             Duration::from_hours(24)
         );
+        assert_eq!(
+            Modality::Comfy.default_execution_timeout(),
+            Duration::from_hours(24)
+        );
     }
 
     #[test]
     fn modalities_map_to_backends() {
         assert_eq!(Modality::Llm.backend_kind(), BackendKind::LlamaCpp);
-        for modality in [Modality::Image, Modality::Video, Modality::Music] {
+        for modality in [
+            Modality::Image,
+            Modality::Video,
+            Modality::Music,
+            Modality::Comfy,
+        ] {
             assert_eq!(modality.backend_kind(), BackendKind::ComfyUi);
         }
     }

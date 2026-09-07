@@ -2,7 +2,7 @@
 //!
 //! Tenant Master Keys and Worker Credentials are stored only as keyed hashes,
 //! never in plaintext, so a leaked database backup cannot be used to
-//! impersonate a Tenant or Worker. Both public API families authenticate with
+//! impersonate a Tenant or Worker. Authenticated public API surfaces use
 //! `Authorization: Bearer <secret>` (ADR 0006).
 
 use base64::Engine as _;

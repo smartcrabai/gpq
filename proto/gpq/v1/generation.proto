@@ -17,9 +17,9 @@ message Generation {
   string generation_id = 1;
   GenerationState state = 2;
   Modality modality = 3;
-  // The alias the caller named.
+  // The alias the caller named, empty for a raw ComfyUI prompt.
   string alias = 4;
-  // Immutable version hash the alias resolved to at admission (ADR 0012).
+  // Immutable content hash resolved or computed at admission (ADR 0012).
   string version_sha256 = 5;
   uint32 priority = 6;
   uint64 seed = 7;

@@ -5,8 +5,10 @@
 //! subprocesses and loopback backend HTTP/SSE or `ComfyUI` HTTP/WebSocket
 //! APIs, never C/C++ FFI or Python imports."). It never installs, downloads,
 //! or otherwise manages custom nodes: those are entirely an operator
-//! responsibility, and a graph that names an absent node or model is rejected
-//! before an Attempt is ever created (ADR 0007, ADR 0018).
+//! responsibility. Registered Workflow graphs that name an absent node or
+//! model are rejected by capability checks or Worker revalidation, while raw
+//! prompts are unregistered and may fail backend validation during their
+//! Attempt (ADR 0007, ADR 0018).
 //!
 //! # Parameter and seed injection contract (ADR 0007)
 //!
@@ -77,8 +79,8 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(30);
 /// How long the execution WebSocket may go without receiving any frame —
 /// data, ping, or pong — before this adapter treats a still-open
 /// connection as wedged and fails the Attempt fast rather than waiting out
-/// its full deadline, which ADR 0003 allows up to 24 hours for video/music
-/// Generations.
+/// its full deadline, which ADR 0003 allows up to 24 hours for video, music,
+/// and raw `ComfyUI` Generations.
 const WS_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// How often this adapter sends a WebSocket ping while otherwise idle, so
@@ -102,6 +104,9 @@ pub struct ComfyBackend {
     /// checkpoint-loader filename to a concrete path for pinned-Model-
     /// Version revalidation (ADR 0012).
     model_paths: Vec<PathBuf>,
+    /// Operator-declared exact custom-node versions, used when `ComfyUI` cannot
+    /// expose a package version through its API (ADR 0007).
+    custom_node_versions: BTreeMap<String, String>,
 }
 
 impl ComfyBackend {
@@ -122,6 +127,7 @@ impl ComfyBackend {
                 .slots
                 .unwrap_or_else(|| BackendKind::ComfyUi.default_slots()),
             model_paths: pool.model_paths.clone(),
+            custom_node_versions: pool.custom_node_versions.clone(),
         }
     }
 
@@ -188,6 +194,7 @@ impl ComfyBackend {
         Ok(custom_node_versions(
             &object_info,
             &stats.system.package_versions(),
+            &self.custom_node_versions,
         ))
     }
 
@@ -258,8 +265,8 @@ impl ComfyBackend {
         .await
     }
 
-    /// Rejects graphs referencing custom nodes or Models absent from this
-    /// `ComfyUI` instance before an Attempt starts wasting execution time
+    /// Rejects registered Workflow graphs referencing custom nodes or Models
+    /// absent from this `ComfyUI` instance before an Attempt starts wasting execution time
     /// (ADR 0007: "Worker revalidation before execution"; ADR 0018: absent
     /// nodes are rejected, never installed). When the pinned Workflow
     /// Version requires a Model Version, this also rehashes the actual
@@ -271,7 +278,13 @@ impl ComfyBackend {
         manifest: &WorkflowManifest,
         request: &ExecutionRequest,
     ) -> Result<(), BackendError> {
-        let expected_kind = expected_media_kind(request.modality);
+        let Some(expected_kind) = expected_media_kind(request.modality) else {
+            return Err(BackendError {
+                kind: FailureKind::InvalidInput,
+                message: "raw ComfyUI prompts must not use a workflow manifest".to_owned(),
+                retry_hint: false,
+            });
+        };
         if expected_kind != manifest.artifact_kind {
             return Err(BackendError {
                 kind: FailureKind::InvalidInput,
@@ -284,33 +297,14 @@ impl ComfyBackend {
         }
         if !manifest.required_custom_nodes.is_empty() {
             let installed = self.installed_custom_nodes().await?;
-            for package in manifest.required_custom_nodes.keys() {
-                if !installed.contains_key(package) {
-                    return Err(BackendError {
-                        kind: FailureKind::UnsupportedCapability,
-                        message: format!(
-                            "comfyui custom node package '{package}' is not installed"
-                        ),
-                        retry_hint: false,
-                    });
-                }
-            }
+            validate_custom_node_requirements(&manifest.required_custom_nodes, &installed)?;
         }
         if !manifest.required_models.is_empty() {
-            let Some(expected_hash) = request
-                .model_sha256
-                .filter(|hash| manifest.required_models.contains(hash))
-            else {
-                return Err(BackendError {
-                    kind: FailureKind::ModelUnavailable,
-                    message:
-                        "comfyui workflow requires a model version not resolved for this attempt"
-                            .to_string(),
-                    retry_hint: false,
-                });
-            };
-            self.verify_pinned_checkpoint(expected_hash, request.workflow_graph.as_ref())
-                .await?;
+            self.verify_pinned_checkpoint(
+                &manifest.required_models,
+                request.workflow_graph.as_ref(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -332,45 +326,46 @@ impl ComfyBackend {
     /// failure, so it passes.
     async fn verify_pinned_checkpoint(
         &self,
-        expected_hash: ContentHash,
+        expected_hashes: &[ContentHash],
         graph: Option<&Value>,
     ) -> Result<(), BackendError> {
-        let Some(ckpt_name) = graph.and_then(checkpoint_name) else {
+        let Some(graph) = graph else {
             return Ok(());
         };
-        let Some(path) = resolve_checkpoint_path(&self.model_paths, ckpt_name) else {
-            return Err(BackendError {
-                kind: FailureKind::ModelUnavailable,
-                message: format!(
-                    "comfyui graph names checkpoint '{ckpt_name}' but no configured model path on this pool resolves it"
-                ),
-                retry_hint: false,
-            });
-        };
-        let path = path.to_path_buf();
-        let hash = tokio::task::spawn_blocking(move || hash_model_fresh(&path))
-            .await
-            .map_err(|err| BackendError {
-                kind: FailureKind::Internal,
-                message: format!("model hashing task panicked: {err}"),
-                retry_hint: FailureKind::Internal.is_retryable(),
-            })?
-            .map_err(|err| BackendError {
-                kind: FailureKind::ModelUnavailable,
-                message: format!("hashing checkpoint '{ckpt_name}': {err}"),
-                retry_hint: true,
-            })?;
-        if hash == expected_hash {
-            Ok(())
-        } else {
-            Err(BackendError {
-                kind: FailureKind::ModelUnavailable,
-                message: format!(
-                    "checkpoint '{ckpt_name}' on disk is {hash} but this attempt is pinned to {expected_hash}"
-                ),
-                retry_hint: false,
-            })
+        for ckpt_name in checkpoint_names(graph) {
+            let Some(path) = resolve_checkpoint_path(&self.model_paths, ckpt_name) else {
+                return Err(BackendError {
+                    kind: FailureKind::ModelUnavailable,
+                    message: format!(
+                        "comfyui graph names checkpoint '{ckpt_name}' but no configured model path on this pool resolves it"
+                    ),
+                    retry_hint: false,
+                });
+            };
+            let path = path.to_path_buf();
+            let hash = tokio::task::spawn_blocking(move || hash_model_fresh(&path))
+                .await
+                .map_err(|err| BackendError {
+                    kind: FailureKind::Internal,
+                    message: format!("model hashing task panicked: {err}"),
+                    retry_hint: FailureKind::Internal.is_retryable(),
+                })?
+                .map_err(|err| BackendError {
+                    kind: FailureKind::ModelUnavailable,
+                    message: format!("hashing checkpoint '{ckpt_name}': {err}"),
+                    retry_hint: true,
+                })?;
+            if !expected_hashes.contains(&hash) {
+                return Err(BackendError {
+                    kind: FailureKind::ModelUnavailable,
+                    message: format!(
+                        "checkpoint '{ckpt_name}' on disk is {hash} but this attempt is pinned to one of {expected_hashes:?}"
+                    ),
+                    retry_hint: false,
+                });
+            }
         }
+        Ok(())
     }
 
     /// Uploads one input Artifact via `POST /upload/image` and returns the
@@ -436,11 +431,25 @@ impl ComfyBackend {
     /// `prompt_id`.
     async fn submit_prompt(
         &self,
-        graph: &Map<String, Value>,
+        prompt: Value,
         client_id: &str,
+        extra_data: Option<&Map<String, Value>>,
+        partial_execution_targets: Option<&[String]>,
     ) -> Result<String, BackendError> {
-        let body =
-            serde_json::json!({ "prompt": Value::Object(graph.clone()), "client_id": client_id });
+        let mut body = Map::new();
+        body.insert("prompt".to_owned(), prompt);
+        body.insert("client_id".to_owned(), Value::String(client_id.to_owned()));
+        if let Some(extra_data) = extra_data {
+            let mut extra_data = extra_data.clone();
+            extra_data.insert("client_id".to_owned(), Value::String(client_id.to_owned()));
+            body.insert("extra_data".to_owned(), Value::Object(extra_data));
+        }
+        if let Some(targets) = partial_execution_targets {
+            body.insert(
+                "partial_execution_targets".to_owned(),
+                Value::Array(targets.iter().cloned().map(Value::String).collect()),
+            );
+        }
         let resp = self
             .client
             .post(endpoint(&self.base_url, "/prompt"))
@@ -518,17 +527,31 @@ impl ComfyBackend {
     /// `GET /view`: streams one declared output file's bytes straight to
     /// `dest`, hashing incrementally over the same pass (ADR 0008: the
     /// reported manifest is always computed from the actual transferred
-    /// bytes, never assumed). A video or music Workflow Version's output
-    /// can be a multi-gigabyte file — ADR 0003 budgets a 24-hour deadline
+    /// bytes, never assumed). A video or music Workflow Version, or a raw
+    /// `ComfyUI` prompt, can produce a multi-gigabyte file — ADR 0003 budgets a 24-hour deadline
     /// for exactly those — so this holds only one `reqwest` chunk in memory
     /// at a time rather than the whole file, on a host already loaded with
     /// GPU work.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "streaming a Comfy output must keep request, cancellation, deadline, hashing, and file-write handling together"
+    )]
     async fn download_view(
         &self,
         entry: &ViewRef,
         dest: &Path,
-    ) -> Result<(ContentHash, u64), BackendError> {
-        let resp = self
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(ContentHash, u64, String), BackendError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(BackendError {
+                kind: FailureKind::ExecutionTimedOut,
+                message: "comfyui output download exceeded the Attempt deadline".to_owned(),
+                retry_hint: false,
+            });
+        }
+        let request = self
             .client
             .get(endpoint(&self.base_url, "/view"))
             .query(&[
@@ -536,9 +559,27 @@ impl ComfyBackend {
                 ("subfolder", entry.subfolder.as_str()),
                 ("type", entry.kind.as_str()),
             ])
-            .send()
-            .await
-            .map_err(|e| super::normalize_transport_error(&e))?;
+            .timeout(remaining);
+        let resp = tokio::select! {
+            () = cancel.cancelled() => {
+                return Err(BackendError {
+                    kind: FailureKind::Cancelled,
+                    message: "comfyui output download cancelled".to_owned(),
+                    retry_hint: false,
+                });
+            }
+            result = request.send() => result.map_err(|e| {
+                if Instant::now() >= deadline {
+                    BackendError {
+                        kind: FailureKind::ExecutionTimedOut,
+                        message: "comfyui output download exceeded the Attempt deadline".to_owned(),
+                        retry_hint: false,
+                    }
+                } else {
+                    super::normalize_transport_error(&e)
+                }
+            })?
+        };
         if !resp.status().is_success() {
             return Err(BackendError {
                 kind: FailureKind::TransferFailed,
@@ -546,6 +587,14 @@ impl ComfyBackend {
                 retry_hint: true,
             });
         }
+        let mime_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or(value).trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
         let mut file = tokio::fs::File::create(dest).await.map_err(|e| {
             internal_error(format!(
                 "creating comfyui output file '{}': {e}",
@@ -555,7 +604,25 @@ impl ComfyBackend {
         let mut hasher = Hasher::new();
         let mut size = 0_u64;
         let mut chunks = resp.bytes_stream();
-        while let Some(chunk) = chunks.next().await {
+        loop {
+            let chunk = tokio::select! {
+                () = cancel.cancelled() => {
+                    return Err(BackendError {
+                        kind: FailureKind::Cancelled,
+                        message: "comfyui output download cancelled".to_owned(),
+                        retry_hint: false,
+                    });
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(BackendError {
+                        kind: FailureKind::ExecutionTimedOut,
+                        message: "comfyui output download exceeded the Attempt deadline".to_owned(),
+                        retry_hint: false,
+                    });
+                }
+                chunk = chunks.next() => chunk,
+            };
+            let Some(chunk) = chunk else { break };
             let chunk = chunk.map_err(|e| BackendError {
                 kind: FailureKind::TransferFailed,
                 message: format!("comfyui view transfer failed: {e}"),
@@ -567,10 +634,17 @@ impl ComfyBackend {
                 internal_error(format!("writing comfyui output '{}': {e}", dest.display()))
             })?;
         }
+        if Instant::now() >= deadline {
+            return Err(BackendError {
+                kind: FailureKind::ExecutionTimedOut,
+                message: "comfyui output download exceeded the Attempt deadline".to_owned(),
+                retry_hint: false,
+            });
+        }
         file.flush().await.map_err(|e| {
             internal_error(format!("flushing comfyui output '{}': {e}", dest.display()))
         })?;
-        Ok((hasher.finish(), size))
+        Ok((hasher.finish(), size, mime_type))
     }
 
     /// Downloads every declared output of `manifest.output_node` /
@@ -578,6 +652,10 @@ impl ComfyBackend {
     /// output directory (see [`Self::download_view`]), and emits one
     /// [`ExecutionEvent::Output`] per file (ADR 0008: the reported manifest
     /// is always computed from the actual transferred bytes, never assumed).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "registered Comfy output collection needs its prompt, manifest, live output, event, cancellation, and deadline context"
+    )]
     async fn collect_outputs(
         &self,
         prompt_id: &str,
@@ -585,17 +663,20 @@ impl ComfyBackend {
         live_outputs: &HashMap<String, Value>,
         out_dir: &Path,
         events: &mpsc::Sender<ExecutionEvent>,
+        cancel: &CancellationToken,
+        deadline: Instant,
     ) -> Result<(), BackendError> {
         let output = if let Some(value) = live_outputs.get(&manifest.output_node) {
             value.clone()
         } else {
-            let history = self.get_history(prompt_id).await?;
+            let history = wait_for_history(self, prompt_id, cancel, deadline).await?;
             history_output(&history, prompt_id, &manifest.output_node)?
         };
         let entries = extract_output_entries(&output, &manifest.output_name)?;
         for (index, entry) in entries.iter().enumerate() {
             let path = out_dir.join(format!("{index}_{}", entry.filename));
-            let (digest, size_bytes) = self.download_view(entry, &path).await?;
+            let (digest, size_bytes, _mime_type) =
+                self.download_view(entry, &path, cancel, deadline).await?;
             let output_manifest = ArtifactManifest {
                 size_bytes,
                 digest,
@@ -606,10 +687,59 @@ impl ComfyBackend {
                 .send(ExecutionEvent::Output {
                     path,
                     manifest: output_manifest,
+                    comfy_output_pointers: Vec::new(),
                 })
                 .await
                 .map_err(|_| internal_error("worker executor dropped the output event channel"))?;
         }
+        Ok(())
+    }
+    /// Downloads each unique file referenced by raw history outputs, preserving
+    /// every JSON pointer that refers to it and retaining the complete metadata.
+    async fn collect_raw_outputs(
+        &self,
+        outputs: &Value,
+        output_node_ids: Vec<String>,
+        out_dir: &Path,
+        events: &mpsc::Sender<ExecutionEvent>,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(), BackendError> {
+        let plans = plan_raw_outputs(outputs)?;
+        for (index, plan) in plans.into_iter().enumerate() {
+            let path = out_dir.join(index.to_string());
+            let (digest, size_bytes, mime_type) = tokio::select! {
+                () = cancel.cancelled() => {
+                    return Err(BackendError {
+                        kind: FailureKind::Cancelled,
+                        message: "raw ComfyUI output recovery cancelled".to_owned(),
+                        retry_hint: false,
+                    });
+                }
+                result = self.download_view(&plan.view, &path, cancel, deadline) => result?,
+            };
+            let output_manifest = ArtifactManifest {
+                size_bytes,
+                digest,
+                kind: MediaKind::from_mime(&mime_type),
+                mime_type,
+            };
+            events
+                .send(ExecutionEvent::Output {
+                    path,
+                    manifest: output_manifest,
+                    comfy_output_pointers: plan.pointers,
+                })
+                .await
+                .map_err(|_| internal_error("worker executor dropped the output event channel"))?;
+        }
+        events
+            .send(ExecutionEvent::ComfyOutputs {
+                outputs: outputs.clone(),
+                output_node_ids,
+            })
+            .await
+            .map_err(|_| internal_error("worker executor dropped the output event channel"))?;
         Ok(())
     }
 }
@@ -625,26 +755,17 @@ async fn probe_ok(
     matches!(request.send().await, Ok(resp) if accept(resp.status()))
 }
 
-/// The `MediaKind` a Generation's modality implies for `ComfyUI` output
-/// classification. Every modality `ComfyUI` actually executes implies
-/// exactly one output kind; the pinned Workflow Version's declared
-/// `artifact_kind` must agree with it before an Attempt is created (ADR
-/// 0003: capability mismatches discovered before execution must not create
-/// an Attempt).
-fn expected_media_kind(modality: Modality) -> MediaKind {
+/// The `MediaKind` a declared Workflow's modality implies for its output.
+fn expected_media_kind(modality: Modality) -> Option<MediaKind> {
     match modality {
-        Modality::Image => MediaKind::Image,
-        Modality::Video => MediaKind::Video,
-        Modality::Music => MediaKind::Audio,
-        // ComfyUI never executes an Llm Generation (ADR 0005 routes those to
-        // an LLM backend); kept exhaustive so a future modality still fails
-        // closed here instead of silently matching every workflow.
-        Modality::Llm => MediaKind::Text,
+        Modality::Image => Some(MediaKind::Image),
+        Modality::Video => Some(MediaKind::Video),
+        Modality::Music => Some(MediaKind::Audio),
+        Modality::Llm | Modality::Comfy => None,
     }
 }
 
-/// Extracts the checkpoint filename an execution graph's loader node
-/// names, when it has one.
+/// Extracts every checkpoint filename an execution graph's loader nodes name.
 ///
 /// `ComfyUI` API-format graphs are opaque backend payloads (ADR 0007); the
 /// one convention this adapter relies on is that every checkpoint-loading
@@ -654,11 +775,16 @@ fn expected_media_kind(modality: Modality) -> MediaKind {
 /// checkpoint at all (e.g. a post-processing-only Workflow Version), which
 /// is a legitimate shape the caller must treat as "nothing to verify", not
 /// a missing-input error.
-fn checkpoint_name(graph: &Value) -> Option<&str> {
+fn checkpoint_names(graph: &Value) -> Vec<&str> {
     graph
-        .as_object()?
-        .values()
-        .find_map(|node| node.get("inputs")?.get("ckpt_name")?.as_str())
+        .as_object()
+        .map(|object| {
+            object
+                .values()
+                .filter_map(|node| node.get("inputs")?.get("ckpt_name")?.as_str())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Resolves a `ComfyUI`-relative checkpoint filename (as named by a
@@ -685,30 +811,34 @@ fn resolve_checkpoint_path<'a>(model_paths: &'a [PathBuf], ckpt_name: &str) -> O
 }
 
 #[async_trait]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the cooperative cancel/deadline/websocket-event state machine in execute() is one cohesive unit; splitting it would scatter shared local state across helper functions"
-)]
 impl Backend for ComfyBackend {
     async fn probe(&self) -> Result<BackendCapabilities, BackendError> {
         let stats = self.system_stats().await?;
         let object_info = self.object_info().await?;
-        let custom_nodes = custom_node_versions(&object_info, &stats.system.package_versions());
+        let custom_nodes = custom_node_versions(
+            &object_info,
+            &stats.system.package_versions(),
+            &self.custom_node_versions,
+        );
 
+        let generation_ok = self.probe_generation().await;
         let streaming_ok = self.probe_streaming().await;
+        let result_ok = self.probe_result().await;
+        let cancellation_ok = self.probe_cancellation().await;
+        let memory_release_ok = self.probe_memory_release().await;
         let mut probes = BTreeMap::new();
-        probes.insert("generation".to_string(), self.probe_generation().await);
+        probes.insert("generation".to_string(), generation_ok);
         probes.insert("streaming".to_string(), streaming_ok);
         // Progress events ride the same WebSocket channel as generation
         // streaming; ComfyUI exposes no separate endpoint to probe (ADR 0005).
         probes.insert("progress".to_string(), streaming_ok);
-        probes.insert("result".to_string(), self.probe_result().await);
-        probes.insert("cancellation".to_string(), self.probe_cancellation().await);
+        probes.insert("result".to_string(), result_ok);
+        probes.insert("cancellation".to_string(), cancellation_ok);
+        probes.insert("memory_release".to_string(), memory_release_ok);
         probes.insert(
-            "memory_release".to_string(),
-            self.probe_memory_release().await,
+            "comfy_prompt".to_string(),
+            generation_ok && streaming_ok && result_ok,
         );
-
         let accelerator_memory_bytes = stats
             .devices
             .first()
@@ -727,43 +857,58 @@ impl Backend for ComfyBackend {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "raw and registered ComfyUI execution share one cancellation and event state machine"
+    )]
     async fn execute(
         &self,
         request: ExecutionRequest,
         events: mpsc::Sender<ExecutionEvent>,
         cancel: CancellationToken,
     ) -> Result<(), BackendError> {
-        let Some(manifest) = request.workflow_manifest.clone() else {
-            return Err(BackendError {
-                kind: FailureKind::InvalidInput,
-                message: "comfyui execution requires a workflow manifest".to_string(),
-                retry_hint: false,
-            });
-        };
-        let Some(Value::Object(mut graph)) = request.workflow_graph.clone() else {
-            return Err(BackendError {
-                kind: FailureKind::InvalidInput,
-                message: "comfyui execution requires an API-format workflow graph object"
-                    .to_string(),
-                retry_hint: false,
-            });
-        };
-
-        self.revalidate(&manifest, &request).await?;
-
-        if !request.inputs.is_empty() {
-            let mut uploads = HashMap::with_capacity(request.inputs.len());
-            for artifact in &request.inputs {
-                let uploaded_name = self.upload_input(artifact).await?;
-                uploads.insert(artifact.artifact_id.clone(), uploaded_name);
+        let (graph, manifest, raw_prompt) = if let Some(raw_payload) = request.comfy_prompt.as_ref()
+        {
+            if request.modality != Modality::Comfy {
+                return Err(internal_error(
+                    "raw ComfyUI payload requires comfy modality",
+                ));
             }
-            for value in graph.values_mut() {
-                substitute_artifact_placeholders(value, &uploads);
+            let raw = parse_raw_prompt(raw_payload)?;
+            (raw.graph.clone(), None, Some(raw))
+        } else {
+            let Some(manifest) = request.workflow_manifest.clone() else {
+                return Err(BackendError {
+                    kind: FailureKind::InvalidInput,
+                    message: "comfyui execution requires a workflow manifest".to_string(),
+                    retry_hint: false,
+                });
+            };
+            let Some(Value::Object(mut graph)) = request.workflow_graph.clone() else {
+                return Err(BackendError {
+                    kind: FailureKind::InvalidInput,
+                    message: "comfyui execution requires an API-format workflow graph object"
+                        .to_string(),
+                    retry_hint: false,
+                });
+            };
+
+            self.revalidate(&manifest, &request).await?;
+
+            if !request.inputs.is_empty() {
+                let mut uploads = HashMap::with_capacity(request.inputs.len());
+                for artifact in &request.inputs {
+                    let uploaded_name = self.upload_input(artifact).await?;
+                    uploads.insert(artifact.artifact_id.clone(), uploaded_name);
+                }
+                for value in graph.values_mut() {
+                    substitute_artifact_placeholders(value, &uploads);
+                }
             }
-        }
 
-        apply_parameters(&mut graph, &request.parameters, request.seed)?;
-
+            apply_parameters(&mut graph, &request.parameters, request.seed)?;
+            (graph, Some(manifest), None)
+        };
         let client_id = Uuid::now_v7().to_string();
         let ws_url = self.ws_url(&client_id)?;
         let (ws_stream, _response) = tokio_tungstenite::connect_async(ws_url.as_str())
@@ -775,7 +920,16 @@ impl Backend for ComfyBackend {
             })?;
         let (mut ws_write, mut ws_stream) = ws_stream.split();
 
-        let prompt_id = self.submit_prompt(&graph, &client_id).await?;
+        let prompt_id = self
+            .submit_prompt(
+                Value::Object(graph),
+                &client_id,
+                raw_prompt.as_ref().map(|raw| &raw.extra_data),
+                raw_prompt
+                    .as_ref()
+                    .and_then(|raw| raw.partial_execution_targets.as_deref()),
+            )
+            .await?;
 
         let out_dir = self
             .state_dir
@@ -871,6 +1025,14 @@ impl Backend for ComfyBackend {
                                 total_steps: 0,
                             }).await;
                         }
+                        // Official ComfyUI uses `executing` with `node: null`
+                        // as the completion marker. Some versions also emit
+                        // `execution_success`, which is handled below.
+                        ComfyEvent::Executing { prompt_id: pid, node: None }
+                            if pid == prompt_id && pending.is_none() =>
+                        {
+                            break 'wait;
+                        }
                         ComfyEvent::Executed { prompt_id: pid, node, output: Some(output) } if pid == prompt_id => {
                             live_outputs.insert(node, output);
                         }
@@ -901,8 +1063,35 @@ impl Backend for ComfyBackend {
             }
         }
 
-        self.collect_outputs(&prompt_id, &manifest, &live_outputs, &out_dir, &events)
+        if raw_prompt.is_some() {
+            let history = wait_for_history(self, &prompt_id, &cancel, deadline_instant).await?;
+            let (outputs, output_node_ids) = raw_history_result(&history, &prompt_id)?;
+            self.collect_raw_outputs(
+                &outputs,
+                output_node_ids,
+                &out_dir,
+                &events,
+                &cancel,
+                deadline_instant,
+            )
             .await
+        } else {
+            let Some(manifest) = manifest else {
+                return Err(internal_error(
+                    "declared Comfy execution lost its workflow manifest",
+                ));
+            };
+            self.collect_outputs(
+                &prompt_id,
+                &manifest,
+                &live_outputs,
+                &out_dir,
+                &events,
+                &cancel,
+                deadline_instant,
+            )
+            .await
+        }
     }
 
     async fn release_memory(&self) -> Result<bool, BackendError> {
@@ -979,9 +1168,9 @@ struct ObjectInfoEntry {
 }
 
 /// One declared output file inside a `history[...].outputs[node_id][name]`
-/// array (ADR 0007; `ComfyUI`'s `SaveImage`/`PreviewImage` shape, the only one
-/// verified in the upstream source).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// array (ADR 0007; the file-reference shape used by `ComfyUI` core and
+/// custom nodes).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 struct ViewRef {
     filename: String,
     #[serde(default)]
@@ -992,6 +1181,258 @@ struct ViewRef {
 
 fn default_view_kind() -> String {
     "output".to_string()
+}
+
+#[derive(Debug, Clone)]
+struct RawPrompt {
+    graph: Map<String, Value>,
+    extra_data: Map<String, Value>,
+    partial_execution_targets: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct RawOutputPlan {
+    view: ViewRef,
+    pointers: Vec<String>,
+}
+
+fn parse_raw_prompt(value: &Value) -> Result<RawPrompt, BackendError> {
+    let Value::Object(envelope) = value else {
+        return Err(internal_error(
+            "raw ComfyUI prompt envelope must be an object",
+        ));
+    };
+    if envelope.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "prompt" | "extra_data" | "partial_execution_targets"
+        )
+    }) {
+        return Err(internal_error(
+            "raw ComfyUI prompt envelope has unknown fields",
+        ));
+    }
+    let Some(Value::Object(graph)) = envelope.get("prompt") else {
+        return Err(internal_error(
+            "raw ComfyUI prompt envelope has no graph object",
+        ));
+    };
+    if graph.is_empty() {
+        return Err(internal_error("raw ComfyUI prompt graph is empty"));
+    }
+    for (node_id, node) in graph {
+        let Some(node) = node.as_object() else {
+            return Err(internal_error(format!(
+                "raw ComfyUI node '{node_id}' is not an object"
+            )));
+        };
+        if node
+            .get("class_type")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            || !node.get("inputs").is_some_and(Value::is_object)
+        {
+            return Err(internal_error(format!(
+                "raw ComfyUI node '{node_id}' has an invalid class_type or inputs"
+            )));
+        }
+    }
+    let extra_data = match envelope.get("extra_data") {
+        None => Map::new(),
+        Some(Value::Object(extra_data)) => extra_data.clone(),
+        Some(_) => return Err(internal_error("raw ComfyUI extra_data is not an object")),
+    };
+    let partial_execution_targets = match envelope.get("partial_execution_targets") {
+        None => None,
+        Some(Value::Array(targets)) if !targets.is_empty() => Some(
+            targets
+                .iter()
+                .map(|target| {
+                    target.as_str().map(str::to_owned).ok_or_else(|| {
+                        internal_error("raw ComfyUI partial execution target is not a string")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Some(Value::Array(_)) => {
+            return Err(internal_error(
+                "raw ComfyUI partial execution targets are empty",
+            ));
+        }
+        Some(_) => {
+            return Err(internal_error(
+                "raw ComfyUI partial execution targets are not an array",
+            ));
+        }
+    };
+    if partial_execution_targets
+        .as_ref()
+        .is_some_and(|targets| targets.iter().any(|target| !graph.contains_key(target)))
+    {
+        return Err(internal_error(
+            "raw ComfyUI partial execution target is not in the graph",
+        ));
+    }
+    Ok(RawPrompt {
+        graph: graph.clone(),
+        extra_data,
+        partial_execution_targets,
+    })
+}
+
+async fn wait_for_history(
+    backend: &ComfyBackend,
+    prompt_id: &str,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<Value, BackendError> {
+    let history_deadline = (Instant::now() + Duration::from_secs(30)).min(deadline);
+    loop {
+        let history = tokio::select! {
+            () = cancel.cancelled() => {
+                return Err(BackendError {
+                    kind: FailureKind::Cancelled,
+                    message: "raw ComfyUI history lookup cancelled".to_owned(),
+                    retry_hint: false,
+                });
+            }
+            history = backend.get_history(prompt_id) => history?,
+        };
+        if history.get(prompt_id).is_some() {
+            return Ok(history);
+        }
+        let now = Instant::now();
+        if now >= history_deadline {
+            return Err(BackendError {
+                kind: FailureKind::TransferFailed,
+                message: "ComfyUI history was not published before the deadline".to_owned(),
+                retry_hint: true,
+            });
+        }
+        let next = (now + Duration::from_millis(100)).min(history_deadline);
+        tokio::select! {
+            () = cancel.cancelled() => {
+                return Err(BackendError {
+                    kind: FailureKind::Cancelled,
+                    message: "raw ComfyUI history lookup cancelled".to_owned(),
+                    retry_hint: false,
+                });
+            }
+            () = tokio::time::sleep_until(next) => {}
+        }
+    }
+}
+
+fn raw_history_result(
+    history: &Value,
+    prompt_id: &str,
+) -> Result<(Value, Vec<String>), BackendError> {
+    let Some(entry) = history.get(prompt_id).and_then(Value::as_object) else {
+        return Err(internal_error("ComfyUI history entry is not an object"));
+    };
+    let Some(outputs) = entry.get("outputs").filter(|value| value.is_object()) else {
+        return Err(internal_error(
+            "ComfyUI history entry has no outputs object",
+        ));
+    };
+    let Some(prompt) = entry.get("prompt").and_then(Value::as_array) else {
+        return Err(internal_error("ComfyUI history entry has no prompt tuple"));
+    };
+    let Some(node_ids) = prompt.get(4).and_then(Value::as_array) else {
+        return Err(internal_error(
+            "ComfyUI history prompt tuple has no output node ids",
+        ));
+    };
+    let mut output_node_ids = Vec::with_capacity(node_ids.len());
+    for node_id in node_ids {
+        let Some(node_id) = node_id.as_str() else {
+            return Err(internal_error("ComfyUI output node id is not a string"));
+        };
+        if output_node_ids.iter().any(|seen| seen == node_id) {
+            return Err(internal_error("ComfyUI output node ids contain duplicates"));
+        }
+        output_node_ids.push(node_id.to_owned());
+    }
+    Ok((outputs.clone(), output_node_ids))
+}
+
+fn plan_raw_outputs(outputs: &Value) -> Result<Vec<RawOutputPlan>, BackendError> {
+    if !outputs.is_object() {
+        return Err(internal_error("ComfyUI outputs metadata is not an object"));
+    }
+    let mut plans = Vec::new();
+    let mut indexes = BTreeMap::new();
+    collect_raw_output_refs(outputs, "", &mut plans, &mut indexes)?;
+    Ok(plans)
+}
+
+fn collect_raw_output_refs(
+    value: &Value,
+    pointer: &str,
+    plans: &mut Vec<RawOutputPlan>,
+    indexes: &mut BTreeMap<ViewRef, usize>,
+) -> Result<(), BackendError> {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key("filename") {
+                let view: ViewRef = serde_json::from_value(value.clone()).map_err(|error| {
+                    internal_error(format!("malformed ComfyUI file reference: {error}"))
+                })?;
+                validate_view_ref(&view)?;
+                let index = if let Some(index) = indexes.get(&view).copied() {
+                    index
+                } else {
+                    let index = plans.len();
+                    indexes.insert(view.clone(), index);
+                    plans.push(RawOutputPlan {
+                        view,
+                        pointers: Vec::new(),
+                    });
+                    index
+                };
+                plans[index].pointers.push(pointer.to_owned());
+            }
+            for (key, child) in map {
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                let child_pointer = format!("{pointer}/{escaped}");
+                collect_raw_output_refs(child, &child_pointer, plans, indexes)?;
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_raw_output_refs(child, &format!("{pointer}/{index}"), plans, indexes)?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+    Ok(())
+}
+
+fn validate_view_ref(view: &ViewRef) -> Result<(), BackendError> {
+    if view.filename.is_empty()
+        || view.filename == "."
+        || view.filename == ".."
+        || view.filename.contains(['/', '\\', ':'])
+        || view.filename.starts_with(['/', '\\'])
+        || Path::new(&view.filename).is_absolute()
+    {
+        return Err(internal_error("ComfyUI output filename is not a basename"));
+    }
+    if view.subfolder.starts_with(['/', '\\'])
+        || view.subfolder.contains('\\')
+        || view.subfolder.contains(':')
+        || (!view.subfolder.is_empty()
+            && view
+                .subfolder
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".."))
+    {
+        return Err(internal_error("ComfyUI output subfolder is not relative"));
+    }
+    if !matches!(view.kind.as_str(), "input" | "output" | "temp") {
+        return Err(internal_error("ComfyUI output type is unsupported"));
+    }
+    Ok(())
 }
 
 /// One parsed `ComfyUI` WebSocket event frame (`{"type": ..., "data": ...}`).
@@ -1083,6 +1524,7 @@ fn parse_event(frame: &str) -> Option<ComfyEvent> {
 fn custom_node_versions(
     object_info: &BTreeMap<String, ObjectInfoEntry>,
     package_versions: &BTreeMap<String, String>,
+    configured_versions: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut nodes = BTreeMap::new();
     for entry in object_info.values() {
@@ -1090,13 +1532,41 @@ fn custom_node_versions(
             continue;
         };
         nodes.entry(package.to_string()).or_insert_with(|| {
-            package_versions
+            configured_versions
                 .get(package)
                 .cloned()
+                .or_else(|| package_versions.get(package).cloned())
                 .unwrap_or_else(|| "unknown".to_string())
         });
     }
     nodes
+}
+
+/// Verifies that every required custom-node package is installed at its exact
+/// manifest version, not merely present in the backend's node registry.
+fn validate_custom_node_requirements(
+    required: &BTreeMap<String, String>,
+    installed: &BTreeMap<String, String>,
+) -> Result<(), BackendError> {
+    for (package, required_version) in required {
+        let Some(installed_version) = installed.get(package) else {
+            return Err(BackendError {
+                kind: FailureKind::UnsupportedCapability,
+                message: format!("comfyui custom node package '{package}' is not installed"),
+                retry_hint: false,
+            });
+        };
+        if installed_version == "unknown" || installed_version != required_version {
+            return Err(BackendError {
+                kind: FailureKind::UnsupportedCapability,
+                message: format!(
+                    "comfyui custom node package '{package}' requires version {required_version}, found {installed_version}"
+                ),
+                retry_hint: false,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Extracts the custom-node package (folder) name from a node's
@@ -1305,7 +1775,11 @@ fn classify_execution_error(exception_type: &str, exception_message: &str) -> Fa
 /// /history/{prompt_id}` response body.
 fn history_output(history: &Value, prompt_id: &str, node_id: &str) -> Result<Value, BackendError> {
     history
-        .pointer(&format!("/{prompt_id}/outputs/{node_id}"))
+        .get(prompt_id)
+        .and_then(Value::as_object)
+        .and_then(|entry| entry.get("outputs"))
+        .and_then(Value::as_object)
+        .and_then(|outputs| outputs.get(node_id))
         .cloned()
         .ok_or_else(|| {
             internal_error(format!(
@@ -1324,11 +1798,13 @@ fn extract_output_entries(output: &Value, output_name: &str) -> Result<Vec<ViewR
     entries
         .iter()
         .map(|entry| {
-            serde_json::from_value::<ViewRef>(entry.clone()).map_err(|e| {
+            let entry = serde_json::from_value::<ViewRef>(entry.clone()).map_err(|e| {
                 internal_error(format!(
                     "malformed comfyui output entry for '{output_name}': {e}"
                 ))
-            })
+            })?;
+            validate_view_ref(&entry)?;
+            Ok(entry)
         })
         .collect()
 }
@@ -1362,9 +1838,9 @@ mod tests {
 
     #[test]
     fn expected_media_kind_matches_each_comfyui_modality() {
-        assert_eq!(expected_media_kind(Modality::Image), MediaKind::Image);
-        assert_eq!(expected_media_kind(Modality::Video), MediaKind::Video);
-        assert_eq!(expected_media_kind(Modality::Music), MediaKind::Audio);
+        assert_eq!(expected_media_kind(Modality::Image), Some(MediaKind::Image));
+        assert_eq!(expected_media_kind(Modality::Video), Some(MediaKind::Video));
+        assert_eq!(expected_media_kind(Modality::Music), Some(MediaKind::Audio));
     }
 
     #[test]
@@ -1480,6 +1956,19 @@ mod tests {
             Some(ComfyEvent::Executing {
                 prompt_id: "p1".to_string(),
                 node: Some("3".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn parse_event_reads_comfy_completion_marker() {
+        let frame =
+            json!({ "type": "executing", "data": { "node": null, "prompt_id": "p1" } }).to_string();
+        assert_eq!(
+            parse_event(&frame),
+            Some(ComfyEvent::Executing {
+                prompt_id: "p1".to_string(),
+                node: None
             })
         );
     }
@@ -1637,7 +2126,7 @@ mod tests {
         let mut package_versions = BTreeMap::new();
         package_versions.insert("ComfyUI-Impact-Pack".to_string(), "7.1.0".to_string());
 
-        let nodes = custom_node_versions(&object_info, &package_versions);
+        let nodes = custom_node_versions(&object_info, &package_versions, &BTreeMap::new());
         assert_eq!(nodes.get("ComfyUI-Impact-Pack"), Some(&"7.1.0".to_string()));
         assert!(!nodes.contains_key("KSampler"));
     }
@@ -1651,8 +2140,23 @@ mod tests {
                 python_module: "custom_nodes.SomePack.nodes".to_string(),
             },
         );
-        let nodes = custom_node_versions(&object_info, &BTreeMap::new());
+        let nodes = custom_node_versions(&object_info, &BTreeMap::new(), &BTreeMap::new());
         assert_eq!(nodes.get("SomePack"), Some(&"unknown".to_string()));
+    }
+
+    #[test]
+    fn custom_node_versions_prefer_operator_configuration() {
+        let object_info = BTreeMap::from([(
+            "Foo".to_string(),
+            ObjectInfoEntry {
+                python_module: "custom_nodes.SomePack.nodes".to_string(),
+            },
+        )]);
+        let package_versions = BTreeMap::from([(String::from("SomePack"), String::from("1.0.0"))]);
+        let configured_versions =
+            BTreeMap::from([(String::from("SomePack"), String::from("2.0.0"))]);
+        let nodes = custom_node_versions(&object_info, &package_versions, &configured_versions);
+        assert_eq!(nodes.get("SomePack"), Some(&"2.0.0".to_string()));
     }
 
     /// `GET /system_stats` as emitted by upstream `ComfyUI` 0.34: the
@@ -1719,6 +2223,48 @@ mod tests {
     }
 
     #[test]
+    fn history_output_reads_opaque_node_ids_without_pointer_parsing() {
+        let history = json!({
+            "p1": { "outputs": { "node/one~two": { "images": [] } } }
+        });
+        let Ok(output) = history_output(&history, "p1", "node/one~two") else {
+            panic!("opaque node ids must be looked up as object keys");
+        };
+        assert_eq!(output, json!({ "images": [] }));
+    }
+
+    #[test]
+    fn custom_node_requirements_require_the_exact_version() {
+        let required = BTreeMap::from([(String::from("SomePack"), String::from("1.0.0"))]);
+        let installed = BTreeMap::from([(String::from("SomePack"), String::from("2.0.0"))]);
+        let Err(error) = validate_custom_node_requirements(&required, &installed) else {
+            panic!("a mismatched custom-node version must be rejected");
+        };
+        assert_eq!(error.kind, FailureKind::UnsupportedCapability);
+    }
+
+    #[test]
+    fn unknown_custom_node_version_does_not_satisfy_an_exact_pin() {
+        let required = BTreeMap::from([(String::from("SomePack"), String::from("unknown"))]);
+        let installed = BTreeMap::from([(String::from("SomePack"), String::from("unknown"))]);
+        let Err(error) = validate_custom_node_requirements(&required, &installed) else {
+            panic!("an unknown custom-node version must be rejected");
+        };
+        assert_eq!(error.kind, FailureKind::UnsupportedCapability);
+    }
+
+    #[test]
+    fn registered_output_entries_reject_path_traversal() {
+        let output = json!({
+            "images": [{ "filename": "nested/../../outside.png", "type": "output" }]
+        });
+        let Err(error) = extract_output_entries(&output, "images") else {
+            panic!("output filenames must be basenames");
+        };
+        assert_eq!(error.kind, FailureKind::Internal);
+    }
+
+    #[test]
     fn history_output_rejects_missing_node() {
         let history = json!({ "p1": { "outputs": {} } });
         let Err(err) = history_output(&history, "p1", "9") else {
@@ -1750,13 +2296,142 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn revalidate_uses_workflow_manifest_model_pins() {
+        let Ok(temp_dir) = tempfile::tempdir() else {
+            panic!("temporary directory must be available");
+        };
+        let model_path = temp_dir.path().join("model.safetensors");
+        if let Err(error) = std::fs::write(&model_path, b"model-bytes") {
+            panic!("model fixture must be writable: {error}");
+        }
+        let Ok(base_url) = Url::parse("http://127.0.0.1:8188") else {
+            panic!("fixture URL must parse");
+        };
+        let pool = PoolConfig {
+            key: "pool".to_owned(),
+            backend: BackendKind::ComfyUi,
+            executable: PathBuf::from("/bin/true"),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            state_dir: temp_dir.path().to_path_buf(),
+            startup_timeout: Duration::from_secs(1),
+            base_url,
+            slots: Some(1),
+            model_paths: vec![model_path],
+            expected_hashes: BTreeMap::new(),
+            custom_node_versions: BTreeMap::new(),
+        };
+        let backend = ComfyBackend::new(&pool);
+        let expected_hash = hash_model_fresh(&pool.model_paths[0])
+            .unwrap_or_else(|error| panic!("model fixture must hash: {error}"));
+        let manifest = WorkflowManifest {
+            output_node: "9".to_owned(),
+            output_name: "images".to_owned(),
+            artifact_kind: MediaKind::Image,
+            artifact_mime: "image/png".to_owned(),
+            required_models: vec![expected_hash],
+            required_custom_nodes: BTreeMap::new(),
+        };
+        let request = ExecutionRequest {
+            attempt_id: "attempt".to_owned(),
+            modality: Modality::Image,
+            model_sha256: None,
+            model_path: None,
+            comfy_prompt: None,
+            workflow_graph: Some(json!({
+                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "model.safetensors"}}
+            })),
+            workflow_manifest: Some(manifest.clone()),
+            parameters: json!({}),
+            inputs: Vec::new(),
+            seed: None,
+            stream_tokens: false,
+            deadline: Duration::from_secs(1),
+        };
+
+        assert!(
+            backend.revalidate(&manifest, &request).await.is_ok(),
+            "workflow model hashes must come from the workflow manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidate_checks_every_checkpoint_model_pin() {
+        let Ok(temp_dir) = tempfile::tempdir() else {
+            panic!("temporary directory must be available");
+        };
+        let first_path = temp_dir.path().join("first.safetensors");
+        let second_path = temp_dir.path().join("second.safetensors");
+        if let Err(error) = std::fs::write(&first_path, b"first-model") {
+            panic!("first model fixture must be writable: {error}");
+        }
+        if let Err(error) = std::fs::write(&second_path, b"second-model") {
+            panic!("second model fixture must be writable: {error}");
+        }
+        let Ok(base_url) = Url::parse("http://127.0.0.1:8188") else {
+            panic!("fixture URL must parse");
+        };
+        let pool = PoolConfig {
+            key: "pool".to_owned(),
+            backend: BackendKind::ComfyUi,
+            executable: PathBuf::from("/bin/true"),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            state_dir: temp_dir.path().to_path_buf(),
+            startup_timeout: Duration::from_secs(1),
+            base_url,
+            slots: Some(1),
+            model_paths: vec![first_path.clone(), second_path.clone()],
+            expected_hashes: BTreeMap::new(),
+            custom_node_versions: BTreeMap::new(),
+        };
+        let backend = ComfyBackend::new(&pool);
+        let first_hash = hash_model_fresh(&first_path)
+            .unwrap_or_else(|error| panic!("first model fixture must hash: {error}"));
+        let second_expected_hash = ContentHash::digest(b"different-second-model");
+        let manifest = WorkflowManifest {
+            output_node: "9".to_owned(),
+            output_name: "images".to_owned(),
+            artifact_kind: MediaKind::Image,
+            artifact_mime: "image/png".to_owned(),
+            required_models: vec![first_hash, second_expected_hash],
+            required_custom_nodes: BTreeMap::new(),
+        };
+        let request = ExecutionRequest {
+            attempt_id: "attempt".to_owned(),
+            modality: Modality::Image,
+            model_sha256: None,
+            model_path: None,
+            comfy_prompt: None,
+            workflow_graph: Some(json!({
+                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "first.safetensors"}},
+                "2": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "second.safetensors"}}
+            })),
+            workflow_manifest: Some(manifest.clone()),
+            parameters: json!({}),
+            inputs: Vec::new(),
+            seed: None,
+            stream_tokens: false,
+            deadline: Duration::from_secs(1),
+        };
+
+        let Err(error) = backend.revalidate(&manifest, &request).await else {
+            panic!("a mismatched second checkpoint pin must be rejected");
+        };
+        assert_eq!(error.kind, FailureKind::ModelUnavailable);
+    }
+
     #[test]
-    fn checkpoint_name_reads_ckpt_name_input() {
+    fn checkpoint_names_read_every_ckpt_name_input() {
         let graph = json!({
             "4": { "class_type": "CheckpointLoaderSimple", "inputs": { "ckpt_name": "sdxl/base.safetensors" } },
-            "5": { "class_type": "KSampler", "inputs": { "steps": 20 } },
+            "5": { "class_type": "CheckpointLoaderSimple", "inputs": { "ckpt_name": "clip.safetensors" } },
         });
-        assert_eq!(checkpoint_name(&graph), Some("sdxl/base.safetensors"));
+        assert_eq!(
+            checkpoint_names(&graph),
+            vec!["sdxl/base.safetensors", "clip.safetensors"]
+        );
     }
 
     #[test]
@@ -1764,7 +2439,7 @@ mod tests {
         let graph = json!({
             "5": { "class_type": "KSampler", "inputs": { "steps": 20 } },
         });
-        assert_eq!(checkpoint_name(&graph), None);
+        assert!(checkpoint_names(&graph).is_empty());
     }
 
     #[test]
@@ -1790,5 +2465,55 @@ mod tests {
             resolve_checkpoint_path(&model_paths, "missing.safetensors"),
             None
         );
+    }
+
+    #[test]
+    fn raw_prompt_parser_preserves_large_integer_values() {
+        let payload = json!({
+            "prompt": {
+                "node": {
+                    "class_type": "RawNode",
+                    "inputs": {"seed": 18_446_744_073_709_551_615_u64, "link": ["other", 0]}
+                }
+            },
+            "extra_data": {}
+        });
+        let parsed =
+            parse_raw_prompt(&payload).unwrap_or_else(|error| panic!("valid raw prompt: {error}"));
+        assert_eq!(
+            parsed.graph["node"]["inputs"]["seed"],
+            json!(18_446_744_073_709_551_615_u64)
+        );
+        assert_eq!(parsed.graph["node"]["inputs"]["link"][1], json!(0));
+    }
+
+    #[test]
+    fn raw_output_plan_deduplicates_and_escapes_pointers() {
+        let outputs = json!({
+            "node/one~two": {
+                "images": [
+                    {"filename": "same.png"},
+                    {"filename": "same.png"}
+                ]
+            }
+        });
+        let plans =
+            plan_raw_outputs(&outputs).unwrap_or_else(|error| panic!("valid outputs: {error}"));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].pointers,
+            [
+                "/node~1one~0two/images/0".to_owned(),
+                "/node~1one~0two/images/1".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_output_plan_rejects_path_traversal() {
+        let error = plan_raw_outputs(&json!({"node": [{"filename": "../secret"}]}))
+            .err()
+            .unwrap_or_else(|| panic!("path traversal must be rejected"));
+        assert_eq!(error.kind, FailureKind::Internal);
     }
 }

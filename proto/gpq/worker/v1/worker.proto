@@ -79,7 +79,8 @@ message PoolAdvertisement {
   uint64 accelerator_memory_bytes = 8;
   // Content hashes of Model Versions installed for this Pool.
   repeated string model_sha256 = 9;
-  // Installed custom nodes, package name to exact version.
+  // Installed custom nodes, package name to the discovered or operator-declared
+  // version; "unknown" means no version was available.
   map<string, string> custom_nodes = 10;
   // Probe results per required backend operation (ADR 0005).
   map<string, bool> probes = 11;
@@ -121,6 +122,8 @@ message AttemptOutput {
   string object_key = 3;
   // Opaque token the Worker accepts in DeliverArtifact for worker-local bytes.
   string delivery_token = 4;
+  // RFC6901 pointers into the raw ComfyUI history outputs object.
+  repeated string comfy_output_pointers = 5;
 }
 
 // Result commitment. Remote verifies the live lease, a nonterminal Generation,
@@ -130,6 +133,10 @@ message AttemptResult {
   string output_text = 2;
   repeated AttemptOutput outputs = 3;
   gpq.v1.Usage usage = 4;
+  // The accepted raw ComfyUI history outputs object.
+  bytes comfy_outputs_json = 5;
+  // Output node IDs from the raw ComfyUI history prompt tuple.
+  repeated string comfy_output_node_ids = 6;
 }
 
 message AttemptFailure {
@@ -182,7 +189,8 @@ message LeaseAssignment {
   gpq.v1.Modality modality = 5;
   // Pinned Model Version for LLM backend work (ADR 0012).
   string model_sha256 = 6;
-  // Pinned Workflow Version, its graph, and its manifest for ComfyUI work. The
+  // Pinned registered Workflow Version, its graph, and its manifest for
+  // registered ComfyUI Workflow work. Raw prompt JSON is carried below. The
   // graph travels with the lease and the Worker revalidates before execution
   // (ADR 0007).
   string workflow_sha256 = 7;
@@ -199,6 +207,10 @@ message LeaseAssignment {
   google.protobuf.Duration execution_timeout = 16;
   google.protobuf.Timestamp lease_expires_at = 17;
   bool stream_tokens = 18;
+  // Canonical raw ComfyUI prompt JSON, preserving integer values.
+  bytes comfy_prompt_json = 19;
+  // SHA-256 of comfy_prompt_json.
+  string comfy_prompt_sha256 = 20;
 }
 
 // Cooperative cancellation. After lease expiry the Worker must cancel even

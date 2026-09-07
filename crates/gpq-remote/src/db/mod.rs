@@ -12,6 +12,7 @@
 pub mod artifacts;
 pub mod attempts;
 pub mod catalog;
+pub mod comfy;
 pub mod events;
 pub mod generations;
 pub mod tenants;

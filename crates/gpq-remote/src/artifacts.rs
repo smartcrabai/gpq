@@ -507,8 +507,8 @@ pub fn classify_download(row: Option<&ArtifactRow>, worker_online: bool) -> Down
 }
 
 /// Serves the one-shot output download route, `GET /v1/artifacts/{artifact_id}`
-/// (ADR 0006 keeps Artifact download on Axum alongside `OpenAI` and health
-/// routes).
+/// (ADR 0006 keeps Artifact download on Axum alongside `OpenAI`, `ComfyUI`,
+/// and health routes).
 #[must_use = "the router is inert until mounted onto the application"]
 pub fn download_router(state: AppState) -> axum::Router {
     axum::Router::new()
@@ -532,8 +532,15 @@ async fn download_artifact(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let artifact = ArtifactId::from_uuid(artifact_id);
+    download_for_tenant(&state, tenant, ArtifactId::from_uuid(artifact_id)).await
+}
 
+/// Serves one artifact after the caller has already been authenticated.
+pub(crate) async fn download_for_tenant(
+    state: &AppState,
+    tenant: TenantId,
+    artifact: ArtifactId,
+) -> Response {
     let mut conn = match state.db.begin_tenant(tenant).await {
         Ok(conn) => conn,
         Err(err) => {
@@ -553,8 +560,7 @@ async fn download_artifact(
         .and_then(|row| row.worker_id)
         .is_some_and(|worker| state.workers.is_online(worker));
 
-    let outcome = classify_download(row.as_ref(), worker_online);
-    match outcome {
+    match classify_download(row.as_ref(), worker_online) {
         DownloadOutcome::NotFound => StatusCode::NOT_FOUND.into_response(),
         DownloadOutcome::Gone => StatusCode::GONE.into_response(),
         DownloadOutcome::Conflict => StatusCode::CONFLICT.into_response(),
@@ -563,13 +569,13 @@ async fn download_artifact(
             let Some(row) = row else {
                 return StatusCode::NOT_FOUND.into_response();
             };
-            redirect_to_object_store(&state, conn, tenant, artifact, row).await
+            redirect_to_object_store(state, conn, tenant, artifact, row).await
         }
         DownloadOutcome::Deliver => {
             let Some(row) = row else {
                 return StatusCode::NOT_FOUND.into_response();
             };
-            deliver_worker_local(&state, conn, tenant, artifact, row).await
+            deliver_worker_local(state, conn, tenant, artifact, row).await
         }
     }
 }
@@ -1126,6 +1132,7 @@ mod tests {
             object_key: (placement == ArtifactPlacement::ObjectStore).then(|| "key".to_owned()),
             worker_id: (placement == ArtifactPlacement::WorkerLocal).then(WorkerId::new),
             delivery_token: None,
+            comfy_output_pointers: Vec::new(),
             committed_offset: 0,
         }
     }

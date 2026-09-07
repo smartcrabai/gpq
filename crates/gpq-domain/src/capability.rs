@@ -1,7 +1,8 @@
 //! Capability matching between a Generation and an Execution Slot.
 //!
 //! ADR 0001 keeps every Slot inside one Tenant. ADR 0012 pins exact Model and
-//! Workflow Versions, so a match is by content hash and never by alias. ADR 0005
+//! Workflow Versions, while raw `ComfyUI` prompts use content hashes, so a match
+//! is by content hash and never by alias. ADR 0005
 //! makes accelerator memory optional, backend-derived telemetry: unknown memory
 //! does not reject work, and a runtime OOM corrects the claim afterwards. ADR
 //! 0007 matches the Workflow manifest's required Models and custom-node versions
@@ -24,14 +25,16 @@ pub struct Requirement {
     pub tenant_id: TenantId,
     /// Runtime kind compatible with the Slot's Active Runtime.
     pub backend_kind: BackendKind,
-    /// Pinned Model or Workflow Version hash.
+    /// Pinned Model or Workflow Version, or raw prompt content hash.
     pub version: ContentHash,
     /// Model Versions the execution loads.
     pub required_models: BTreeSet<ContentHash>,
     /// Custom-node package name to exact required version.
     pub required_custom_nodes: BTreeMap<String, String>,
-    /// Estimated accelerator memory, when the version declares one.
+    /// Estimated accelerator memory, when the target declares one.
     pub estimated_vram_bytes: Option<u64>,
+    /// Whether this is a raw `ComfyUI` prompt requiring the new adapter.
+    pub requires_comfy_prompt: bool,
 }
 
 impl Requirement {
@@ -45,6 +48,21 @@ impl Requirement {
             required_models: BTreeSet::from([version]),
             required_custom_nodes: BTreeMap::new(),
             estimated_vram_bytes: vram_bytes,
+            requires_comfy_prompt: false,
+        }
+    }
+
+    /// Builds the requirement of a raw `ComfyUI` Server API prompt.
+    #[must_use]
+    pub fn for_comfy_prompt(tenant_id: TenantId, version: ContentHash) -> Self {
+        Self {
+            tenant_id,
+            backend_kind: BackendKind::ComfyUi,
+            version,
+            required_models: BTreeSet::new(),
+            required_custom_nodes: BTreeMap::new(),
+            estimated_vram_bytes: None,
+            requires_comfy_prompt: true,
         }
     }
 
@@ -63,6 +81,7 @@ impl Requirement {
             required_models: manifest.required_models.iter().copied().collect(),
             required_custom_nodes: manifest.required_custom_nodes.clone(),
             estimated_vram_bytes: vram_bytes,
+            requires_comfy_prompt: false,
         }
     }
 }
@@ -84,12 +103,15 @@ pub struct SlotCapability {
     pub backend_version: String,
     /// Model Versions present on the host, by content hash.
     pub model_versions: BTreeSet<ContentHash>,
-    /// Installed custom nodes, package name to exact version.
+    /// Installed custom nodes, package name to the discovered or
+    /// operator-declared version; `"unknown"` means unavailable.
     pub custom_nodes: BTreeMap<String, String>,
     /// Model Version currently loaded in the Pool, if any.
     pub resident_model: Option<ContentHash>,
     /// Accelerator memory reported by the backend, when known.
     pub accelerator_memory_bytes: Option<u64>,
+    /// Whether the Worker implements raw `ComfyUI` prompts.
+    pub supports_comfy_prompt: bool,
     /// Versions this Slot proved incapable of, e.g. by running out of memory.
     pub incapable_versions: BTreeSet<ContentHash>,
 }
@@ -121,7 +143,10 @@ pub enum IncapableReason {
         /// Version installed on the host, if the package exists at all.
         found: Option<String>,
     },
-    /// This Slot already failed the version for a candidate-specific reason.
+    /// This Slot does not implement raw `ComfyUI` prompt execution.
+    #[error("slot does not support raw ComfyUI prompts")]
+    UnsupportedComfyPrompt,
+    /// A Slot already failed the version for a candidate-specific reason.
     #[error("slot is known incapable of version {0}")]
     KnownIncapable(ContentHash),
     /// Known accelerator memory is smaller than the version's estimate.
@@ -153,6 +178,9 @@ impl SlotCapability {
                 found: self.backend_kind,
             });
         }
+        if requirement.requires_comfy_prompt && !self.supports_comfy_prompt {
+            return Err(IncapableReason::UnsupportedComfyPrompt);
+        }
         if self.incapable_versions.contains(&requirement.version) {
             return Err(IncapableReason::KnownIncapable(requirement.version));
         }
@@ -163,7 +191,9 @@ impl SlotCapability {
         }
         for (name, required) in &requirement.required_custom_nodes {
             let found = self.custom_nodes.get(name);
-            if found.map(String::as_str) != Some(required.as_str()) {
+            if found.map(String::as_str) != Some(required.as_str())
+                || found.is_some_and(|version| version == "unknown")
+            {
                 return Err(IncapableReason::MissingCustomNode {
                     name: name.clone(),
                     required: required.clone(),
@@ -236,6 +266,7 @@ mod tests {
             custom_nodes: BTreeMap::new(),
             resident_model: None,
             accelerator_memory_bytes: None,
+            supports_comfy_prompt: false,
             incapable_versions: BTreeSet::new(),
         }
     }
@@ -319,6 +350,33 @@ mod tests {
                 found: Some("1.2.0".to_owned()),
             })
         );
+    }
+
+    #[test]
+    fn unknown_custom_node_version_does_not_satisfy_an_exact_pin() {
+        let tenant = TenantId::new();
+        let mut slot = slot(tenant, BackendKind::ComfyUi);
+        slot.custom_nodes
+            .insert("comfyui-extra".to_owned(), "unknown".to_owned());
+        let manifest = WorkflowManifest {
+            output_node: "9".to_owned(),
+            output_name: "images".to_owned(),
+            artifact_kind: crate::artifact::MediaKind::Image,
+            artifact_mime: "image/png".to_owned(),
+            required_models: Vec::new(),
+            required_custom_nodes: BTreeMap::from([(
+                "comfyui-extra".to_owned(),
+                "unknown".to_owned(),
+            )]),
+        };
+        let requirement = Requirement::for_workflow(tenant, hash(b"w"), &manifest, None);
+        assert!(matches!(
+            slot.admits(&requirement),
+            Err(IncapableReason::MissingCustomNode {
+                found: Some(found),
+                ..
+            }) if found == "unknown"
+        ));
     }
 
     #[test]
@@ -449,5 +507,18 @@ mod tests {
         comfy.resident_model = Some(hash(b"sd"));
         let workflow_requirement = Requirement::for_workflow(tenant, hash(b"w"), &manifest, None);
         assert!(comfy.holds_resident_model(&workflow_requirement));
+    }
+
+    #[test]
+    fn raw_comfy_prompts_require_the_adapter_flag() {
+        let tenant = TenantId::new();
+        let requirement = Requirement::for_comfy_prompt(tenant, hash(b"raw"));
+        let mut slot = slot(tenant, BackendKind::ComfyUi);
+        assert_eq!(
+            slot.admits(&requirement),
+            Err(IncapableReason::UnsupportedComfyPrompt)
+        );
+        slot.supports_comfy_prompt = true;
+        assert_eq!(slot.admits(&requirement), Ok(()));
     }
 }

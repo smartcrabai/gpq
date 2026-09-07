@@ -36,7 +36,7 @@ enum Command {
     /// schema-owner connection string rather than the forced-RLS role
     /// `serve` uses.
     Migrate,
-    /// Serves OpenAI-compatible, Native, and Worker RPC traffic.
+    /// Serves OpenAI-compatible, ComfyUI-compatible, Native, and Worker traffic.
     Serve,
     /// Tenant lifecycle and credential administration (ADR 0009).
     Tenant {
@@ -172,8 +172,8 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// off mid-transaction. `abort` remains the fallback if it does not.
 const BACKGROUND_TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Serves OpenAI-compatible, Native, and Worker RPC traffic until a shutdown
-/// signal arrives.
+/// Serves OpenAI-compatible, ComfyUI-compatible, Native, and Worker traffic
+/// until a shutdown signal arrives.
 async fn run_serve() -> anyhow::Result<()> {
     let config = Arc::new(RemoteConfig::from_env()?);
     let db = Db::connect(&config).await?;

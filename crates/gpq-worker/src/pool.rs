@@ -66,7 +66,8 @@ pub struct PoolAdvertisementData {
     pub accelerator_memory_bytes: Option<u64>,
     /// Every Model Version registered on this Pool (ADR 0012).
     pub models: Vec<ContentHash>,
-    /// Installed `ComfyUI` custom-node package name to exact version.
+    /// Installed `ComfyUI` custom-node package name to the discovered or
+    /// operator-declared version; `"unknown"` means unavailable.
     pub custom_nodes: BTreeMap<String, String>,
     /// Required-endpoint probe name to whether it passed.
     pub probes: BTreeMap<String, bool>,

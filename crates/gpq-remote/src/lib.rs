@@ -11,6 +11,7 @@ pub mod admission;
 pub mod artifacts;
 pub mod auth;
 pub mod cli;
+pub mod comfy;
 pub mod config;
 pub mod db;
 pub mod enrollment;

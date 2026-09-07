@@ -106,8 +106,9 @@ state_enum! {
 
 /// The pinned execution target resolved at admission (ADR 0012).
 ///
-/// A Generation names exactly one Model or Workflow alias; admission resolves it
-/// to an immutable version hash that every Attempt must reuse.
+/// A Generation names one Model or Workflow alias, or a raw `ComfyUI` prompt.
+/// Admission resolves aliases or hashes the raw prompt to an immutable content
+/// hash that every Attempt must reuse.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum ExecutionTarget {
     /// An LLM Model Version, served by llama.cpp or mlx-dspark.
@@ -120,14 +121,21 @@ pub enum ExecutionTarget {
         /// Content hash of the immutable graph and output manifest.
         version: ContentHash,
     },
+    /// A raw `ComfyUI` Server API prompt.
+    ComfyPrompt {
+        /// Content hash of the canonical prompt payload.
+        version: ContentHash,
+    },
 }
 
 impl ExecutionTarget {
-    /// The version hash regardless of target kind.
+    /// The content hash regardless of target kind.
     #[must_use]
     pub const fn version(&self) -> ContentHash {
         match self {
-            Self::Model { version } | Self::Workflow { version } => *version,
+            Self::Model { version }
+            | Self::Workflow { version }
+            | Self::ComfyPrompt { version } => *version,
         }
     }
 
@@ -136,14 +144,22 @@ impl ExecutionTarget {
     pub const fn backend_kind(&self) -> BackendKind {
         match self {
             Self::Model { .. } => BackendKind::LlamaCpp,
-            Self::Workflow { .. } => BackendKind::ComfyUi,
+            Self::Workflow { .. } | Self::ComfyPrompt { .. } => BackendKind::ComfyUi,
         }
     }
 
     /// Whether the target is consistent with a derived modality.
     #[must_use]
     pub fn matches_modality(&self, modality: Modality) -> bool {
-        self.backend_kind() == modality.backend_kind()
+        matches!(
+            (self, modality),
+            (Self::Model { .. }, Modality::Llm)
+                | (
+                    Self::Workflow { .. },
+                    Modality::Image | Modality::Video | Modality::Music
+                )
+                | (Self::ComfyPrompt { .. }, Modality::Comfy)
+        )
     }
 }
 

@@ -1,7 +1,7 @@
 //! Executes one Attempt end to end on a Worker (ADR 0003, ADR 0005, ADR 0008).
 //!
 //! [`execute`] fetches and verifies input Artifacts, revalidates that the
-//! Pool still has the pinned Model/Workflow capability before touching a
+//! Pool still has the pinned Model, Workflow, or raw prompt capability before touching a
 //! backend, runs the backend while forwarding progress/tokens to the
 //! control session, enforces the lease's execution timeout, publishes
 //! outputs, and reports exactly one terminal outcome
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use buffa::{EnumValue, MessageField};
+use buffa::{EnumValue, Message, MessageField};
 use buffa_types::google::protobuf::Timestamp;
 use chrono::Utc;
 use futures::StreamExt;
@@ -103,6 +103,8 @@ struct ExecutionOutcome {
     output_text: String,
     outputs: Vec<AttemptOutput>,
     usage: Option<v1::Usage>,
+    comfy_outputs: Option<serde_json::Value>,
+    comfy_output_node_ids: Vec<String>,
 }
 
 /// Executes `ctx.lease` and reports exactly one terminal `WorkerMessage`.
@@ -134,6 +136,8 @@ pub async fn execute(ctx: ExecutionContext) {
 
 async fn run(ctx: &ExecutionContext) -> Result<ExecutionOutcome, Stop> {
     let modality = modality_from_proto(ctx.lease.modality).map_err(internal)?;
+    let comfy_prompt = decode_comfy_prompt(&ctx.lease, modality).map_err(internal)?;
+    let raw_prompt_active = comfy_prompt.is_some();
     let inputs = fetch_inputs(ctx).await?;
 
     let model_hash = if ctx.lease.model_sha256.is_empty() {
@@ -161,13 +165,18 @@ async fn run(ctx: &ExecutionContext) -> Result<ExecutionOutcome, Stop> {
             retry_hint: true,
         });
     };
-    revalidate_capabilities(pool, modality, model_hash, workflow_manifest.as_ref()).map_err(
-        |(kind, message)| Stop::Failed {
-            kind,
-            message,
-            retry_hint: false,
-        },
-    )?;
+    revalidate_capabilities(
+        pool,
+        modality,
+        model_hash,
+        workflow_manifest.as_ref(),
+        raw_prompt_active,
+    )
+    .map_err(|(kind, message)| Stop::Failed {
+        kind,
+        message,
+        retry_hint: false,
+    })?;
 
     let model_path = if modality == Modality::Llm {
         model_hash.and_then(|hash| ctx.pools.resolve_model_path(&ctx.pool_key, hash))
@@ -201,11 +210,12 @@ async fn run(ctx: &ExecutionContext) -> Result<ExecutionOutcome, Stop> {
         modality,
         model_sha256: model_hash,
         model_path,
+        comfy_prompt,
         workflow_graph,
         workflow_manifest,
         parameters,
         inputs,
-        seed: Some(ctx.lease.seed),
+        seed: (!raw_prompt_active).then_some(ctx.lease.seed),
         stream_tokens: ctx.lease.stream_tokens,
         deadline: exec_timeout,
     };
@@ -221,6 +231,56 @@ async fn run(ctx: &ExecutionContext) -> Result<ExecutionOutcome, Stop> {
     .await;
 
     run_backend(ctx, request, exec_timeout).await
+}
+
+/// Decodes and validates the byte-preserved raw `ComfyUI` lease payload.
+fn decode_comfy_prompt(
+    lease: &LeaseAssignment,
+    modality: Modality,
+) -> Result<Option<serde_json::Value>, String> {
+    let raw = &lease.comfy_prompt_json;
+    if raw.is_empty() {
+        if modality == Modality::Comfy || !lease.comfy_prompt_sha256.is_empty() {
+            return Err("raw ComfyUI modality requires a prompt payload and hash".to_owned());
+        }
+        return Ok(None);
+    }
+    if modality != Modality::Comfy {
+        return Err("only raw ComfyUI modality may carry a prompt payload".to_owned());
+    }
+    if raw.len() > 2 * 1024 * 1024 {
+        return Err("raw ComfyUI prompt exceeds the 2 MiB limit".to_owned());
+    }
+    if lease.comfy_prompt_sha256.is_empty()
+        || !lease.model_sha256.is_empty()
+        || !lease.workflow_sha256.is_empty()
+        || lease.workflow_graph.as_option().is_some()
+        || lease.workflow_manifest.as_option().is_some()
+        || lease.parameters.as_option().is_some()
+        || !lease.inputs.is_empty()
+        || lease.seed != 0
+        || lease.stream_tokens
+        || !lease.output_upload_url.is_empty()
+        || !lease.output_object_key.is_empty()
+        || !matches!(
+            lease.output_placement,
+            EnumValue::Known(ProtoArtifactPlacement::ARTIFACT_PLACEMENT_WORKER_LOCAL)
+        )
+    {
+        return Err("raw ComfyUI lease contains incompatible target fields".to_owned());
+    }
+    let expected = ContentHash::digest(raw);
+    let actual = ContentHash::from_str(&lease.comfy_prompt_sha256)
+        .map_err(|err| format!("invalid raw ComfyUI prompt hash: {err}"))?;
+    if expected != actual {
+        return Err("raw ComfyUI prompt hash does not match its payload".to_owned());
+    }
+    let value: serde_json::Value = serde_json::from_slice(raw)
+        .map_err(|err| format!("raw ComfyUI prompt JSON is invalid: {err}"))?;
+    if !value.is_object() {
+        return Err("raw ComfyUI prompt payload must be a JSON object".to_owned());
+    }
+    Ok(Some(value))
 }
 
 /// The Attempt's execution deadline duration, taken from the leased value
@@ -249,6 +309,10 @@ const TIMEOUT_RELEASE_GRACE: std::time::Duration = std::time::Duration::from_sec
 
 /// Runs the backend to completion, forwarding events and enforcing the
 /// execution timeout, which starts now (ADR 0003) and is never retried.
+#[expect(
+    clippy::too_many_lines,
+    reason = "backend execution, timeout, event forwarding, and output publication form one state machine"
+)]
 async fn run_backend(
     ctx: &ExecutionContext,
     request: ExecutionRequest,
@@ -266,7 +330,9 @@ async fn run_backend(
     tokio::pin!(release_grace);
 
     let mut output_text = String::new();
-    let mut raw_outputs: Vec<(PathBuf, ArtifactManifest)> = Vec::new();
+    let mut raw_outputs: Vec<(PathBuf, ArtifactManifest, Vec<String>)> = Vec::new();
+    let mut comfy_outputs: Option<serde_json::Value> = None;
+    let mut comfy_output_node_ids = Vec::new();
     let mut usage: Option<v1::Usage> = None;
     let mut timed_out = false;
     let mut release_armed = false;
@@ -277,7 +343,7 @@ async fn run_backend(
         tokio::select! {
             maybe_event = events_rx.recv() => {
                 if let Some(event) = maybe_event {
-                    handle_event(ctx, event, &mut output_text, &mut raw_outputs, &mut usage).await;
+                    handle_event(ctx, event, &mut output_text, &mut raw_outputs, &mut usage, &mut comfy_outputs, &mut comfy_output_node_ids).await;
                 }
             }
             result = &mut execute_fut => {
@@ -316,7 +382,16 @@ async fn run_backend(
         let _ = ctx.backend.release_memory().await;
     }
     while let Ok(event) = events_rx.try_recv() {
-        handle_event(ctx, event, &mut output_text, &mut raw_outputs, &mut usage).await;
+        handle_event(
+            ctx,
+            event,
+            &mut output_text,
+            &mut raw_outputs,
+            &mut usage,
+            &mut comfy_outputs,
+            &mut comfy_output_node_ids,
+        )
+        .await;
     }
 
     let Some(result) = backend_result else {
@@ -346,22 +421,36 @@ async fn run_backend(
         });
     }
 
+    if ctx.lease.comfy_prompt_json.is_empty() && comfy_outputs.is_some() {
+        return Err(internal(
+            "non-raw execution unexpectedly produced ComfyUI metadata".to_owned(),
+        ));
+    }
+    if !ctx.lease.comfy_prompt_json.is_empty() && comfy_outputs.is_none() {
+        return Err(internal(
+            "raw ComfyUI execution produced no history outputs metadata".to_owned(),
+        ));
+    }
     let mut outputs = Vec::with_capacity(raw_outputs.len());
-    for (path, manifest) in raw_outputs {
-        outputs.push(
-            publish_output(ctx, &path, manifest)
-                .await
-                .map_err(|(kind, message)| Stop::Failed {
+    for (path, manifest, pointers) in raw_outputs {
+        match publish_output(ctx, &path, manifest, pointers).await {
+            Ok(output) => outputs.push(output),
+            Err((kind, message)) => {
+                discard_published_outputs(ctx, &outputs).await;
+                return Err(Stop::Failed {
                     kind,
                     retry_hint: kind.is_retryable(),
                     message,
-                })?,
-        );
+                });
+            }
+        }
     }
     Ok(ExecutionOutcome {
         output_text,
         outputs,
         usage,
+        comfy_outputs,
+        comfy_output_node_ids,
     })
 }
 
@@ -369,8 +458,10 @@ async fn handle_event(
     ctx: &ExecutionContext,
     event: ExecutionEvent,
     output_text: &mut String,
-    outputs: &mut Vec<(PathBuf, ArtifactManifest)>,
+    outputs: &mut Vec<(PathBuf, ArtifactManifest, Vec<String>)>,
     usage: &mut Option<v1::Usage>,
+    comfy_outputs: &mut Option<serde_json::Value>,
+    comfy_output_node_ids: &mut Vec<String>,
 ) {
     match event {
         ExecutionEvent::Progress {
@@ -415,7 +506,18 @@ async fn handle_event(
                 .await;
             }
         }
-        ExecutionEvent::Output { path, manifest } => outputs.push((path, manifest)),
+        ExecutionEvent::Output {
+            path,
+            manifest,
+            comfy_output_pointers,
+        } => outputs.push((path, manifest, comfy_output_pointers)),
+        ExecutionEvent::ComfyOutputs {
+            outputs,
+            output_node_ids,
+        } => {
+            *comfy_outputs = Some(outputs);
+            *comfy_output_node_ids = output_node_ids;
+        }
         ExecutionEvent::Text { text } => *output_text = text,
         ExecutionEvent::Usage {
             prompt_tokens,
@@ -443,18 +545,69 @@ async fn send(ctx: &ExecutionContext, message: worker_message::Message) {
 }
 
 async fn report_success(ctx: &ExecutionContext, outcome: ExecutionOutcome) {
-    send(
-        ctx,
-        AttemptResult {
-            attempt_id: ctx.attempt_id.to_string(),
-            output_text: outcome.output_text,
-            outputs: outcome.outputs,
-            usage: outcome.usage.map(MessageField::some).unwrap_or_default(),
-            ..Default::default()
+    let comfy_outputs_json = match outcome.comfy_outputs {
+        Some(outputs) => match serde_json::to_vec(&outputs) {
+            Ok(bytes) if bytes.len() <= 2 * 1024 * 1024 => bytes,
+            Ok(_) => {
+                discard_published_outputs(ctx, &outcome.outputs).await;
+                report_failure(
+                    ctx,
+                    FailureKind::InvalidInput,
+                    "raw ComfyUI outputs exceed the 2 MiB limit".to_owned(),
+                    false,
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                discard_published_outputs(ctx, &outcome.outputs).await;
+                report_failure(
+                    ctx,
+                    FailureKind::Internal,
+                    format!("serializing raw ComfyUI outputs failed: {error}"),
+                    false,
+                )
+                .await;
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
+    let attempt_result = AttemptResult {
+        attempt_id: ctx.attempt_id.to_string(),
+        output_text: outcome.output_text,
+        outputs: outcome.outputs,
+        usage: outcome.usage.map(MessageField::some).unwrap_or_default(),
+        comfy_outputs_json,
+        comfy_output_node_ids: outcome.comfy_output_node_ids,
+        ..Default::default()
+    };
+    let worker_message = WorkerMessage {
+        message: Some(attempt_result.into()),
+        ..Default::default()
+    };
+    if worker_message.encoded_len() > 4 * 1024 * 1024 {
+        if let Some(worker_message::Message::AttemptResult(result)) = &worker_message.message {
+            discard_published_outputs(ctx, &result.outputs).await;
         }
-        .into(),
-    )
-    .await;
+        report_failure(
+            ctx,
+            FailureKind::InvalidInput,
+            "raw ComfyUI result exceeds the 4 MiB transport limit".to_owned(),
+            false,
+        )
+        .await;
+        return;
+    }
+    let _ = ctx.outbound.send(worker_message).await;
+}
+
+async fn discard_published_outputs(ctx: &ExecutionContext, outputs: &[AttemptOutput]) {
+    for output in outputs {
+        if !output.delivery_token.is_empty() {
+            let _ = ctx.artifacts.delete(&output.delivery_token).await;
+        }
+    }
 }
 
 async fn report_failure(
@@ -497,7 +650,7 @@ fn internal(message: String) -> Stop {
 }
 
 /// Re-checks that the Pool's currently advertised capabilities still satisfy
-/// the lease's pinned Model/Workflow Version, guarding against a race where
+/// the lease's pinned target, guarding against a race where
 /// the Active Runtime changed again between `ensure_runtime` (before the
 /// Slot was even acquired) and this task actually starting (ADR 0003,
 /// ADR 0005). A mismatch here must not be retried on this Worker.
@@ -506,7 +659,20 @@ fn revalidate_capabilities(
     modality: Modality,
     model_hash: Option<ContentHash>,
     workflow_manifest: Option<&gpq_domain::WorkflowManifest>,
+    raw_prompt: bool,
 ) -> Result<(), (FailureKind, String)> {
+    if raw_prompt
+        && (pool.backend != gpq_domain::BackendKind::ComfyUi
+            || pool.probes.get("comfy_prompt") != Some(&true))
+    {
+        return Err((
+            FailureKind::UnsupportedCapability,
+            format!(
+                "pool {} does not support raw ComfyUI prompts",
+                pool.pool_key
+            ),
+        ));
+    }
     if modality == Modality::Llm
         && let Some(expected) = model_hash
         && pool.resident_model != Some(expected)
@@ -685,6 +851,7 @@ async fn publish_output(
     ctx: &ExecutionContext,
     path: &Path,
     manifest: ArtifactManifest,
+    comfy_output_pointers: Vec<String>,
 ) -> Result<AttemptOutput, (FailureKind, String)> {
     match output_publish_strategy(ctx.lease.output_placement)? {
         OutputPublishStrategy::ObjectStore => {
@@ -696,6 +863,7 @@ async fn publish_output(
                 ),
                 object_key: ctx.lease.output_object_key.clone(),
                 delivery_token: String::new(),
+                comfy_output_pointers,
                 ..Default::default()
             })
         }
@@ -712,6 +880,7 @@ async fn publish_output(
                 ),
                 object_key: String::new(),
                 delivery_token: handle.delivery_token(),
+                comfy_output_pointers,
                 ..Default::default()
             })
         }
@@ -721,8 +890,8 @@ async fn publish_output(
 /// Running tally over a streamed output upload: bytes actually put on the
 /// wire and their digest, computed incrementally so `upload_to_object_store`
 /// never has to hold the whole output file in memory to verify it (ADR
-/// 0003's multi-hour image/video/music execution budgets imply outputs that
-/// can be multi-gigabyte).
+/// 0003's multi-hour image/video/music/raw-ComfyUI execution budgets imply
+/// outputs that can be multi-gigabyte).
 #[derive(Default, Clone)]
 struct UploadTally {
     bytes: u64,
@@ -807,7 +976,10 @@ fn restore_integers(value: &mut serde_json::Value) {
             };
             if float.fract() == 0.0 && float.abs() <= EXACT_INTEGER_LIMIT {
                 // Exact: `float` is integral and far inside the `i64` range.
-                #[expect(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "the exact-integer bound proves this f64 fits in i64"
+                )]
                 let integer = float as i64;
                 *value = serde_json::Value::from(integer);
             }
@@ -862,7 +1034,7 @@ fn media_kind_to_proto(kind: gpq_domain::MediaKind) -> v1::MediaKind {
 }
 
 /// Converts the proto `Modality` on a lease to the domain type. Remote
-/// derives modality after alias resolution, so a lease always carries a
+/// derives modality from the execution target, so a lease always carries a
 /// concrete, known value (ADR 0006); anything else is a protocol error.
 pub(crate) fn modality_from_proto(modality: EnumValue<v1::Modality>) -> Result<Modality, String> {
     match modality {
@@ -870,6 +1042,7 @@ pub(crate) fn modality_from_proto(modality: EnumValue<v1::Modality>) -> Result<M
         EnumValue::Known(v1::Modality::MODALITY_IMAGE) => Ok(Modality::Image),
         EnumValue::Known(v1::Modality::MODALITY_VIDEO) => Ok(Modality::Video),
         EnumValue::Known(v1::Modality::MODALITY_MUSIC) => Ok(Modality::Music),
+        EnumValue::Known(v1::Modality::MODALITY_COMFY) => Ok(Modality::Comfy),
         other => Err(format!("unknown modality: {other:?}")),
     }
 }
@@ -1040,7 +1213,7 @@ mod tests {
             probes: std::collections::BTreeMap::new(),
         };
         let requested = ContentHash::digest(b"requested-model");
-        let result = revalidate_capabilities(&pool, Modality::Llm, Some(requested), None);
+        let result = revalidate_capabilities(&pool, Modality::Llm, Some(requested), None, false);
         assert!(matches!(result, Err((FailureKind::ModelUnavailable, _))));
     }
 
@@ -1071,7 +1244,7 @@ mod tests {
                 "1.2.0".to_owned(),
             )]),
         };
-        let result = revalidate_capabilities(&pool, Modality::Image, None, Some(&manifest));
+        let result = revalidate_capabilities(&pool, Modality::Image, None, Some(&manifest), false);
         assert!(matches!(
             result,
             Err((FailureKind::UnsupportedCapability, _))
@@ -1163,7 +1336,7 @@ mod tests {
             custom_nodes: std::collections::BTreeMap::new(),
             probes: std::collections::BTreeMap::new(),
         };
-        assert!(revalidate_capabilities(&pool, Modality::Llm, Some(hash), None).is_ok());
+        assert!(revalidate_capabilities(&pool, Modality::Llm, Some(hash), None, false).is_ok());
     }
 
     #[test]
@@ -1190,7 +1363,7 @@ mod tests {
             required_models: vec![ContentHash::digest(b"checkpoint")],
             required_custom_nodes: std::collections::BTreeMap::new(),
         };
-        let result = revalidate_capabilities(&pool, Modality::Image, None, Some(&manifest));
+        let result = revalidate_capabilities(&pool, Modality::Image, None, Some(&manifest), false);
         assert!(matches!(result, Err((FailureKind::ModelUnavailable, _))));
     }
 }

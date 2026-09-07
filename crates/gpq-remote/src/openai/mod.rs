@@ -32,7 +32,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use percent_encoding::percent_decode;
 use serde::Serialize;
 
-use crate::admission::{AdmissionRequest, AliasTarget};
+use crate::admission::{AdmissionRequest, AdmissionTarget};
 use crate::db::generations::GenerationRow;
 use crate::events::GenerationEvent;
 use crate::state::AppState;
@@ -172,6 +172,12 @@ impl ApiError {
                 "invalid_request_error",
                 "invalid_request_error",
                 message,
+            ),
+            AdmissionError::PromptIdConflict => Self::new(
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                "prompt_id_conflict",
+                "The prompt id already exists.",
             ),
             AdmissionError::CapacityExceeded => Self::new(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -371,7 +377,7 @@ pub(crate) fn build_admission_request(
     stream_tokens: bool,
 ) -> AdmissionRequest {
     AdmissionRequest {
-        alias_target: AliasTarget::Model(model.to_owned()),
+        target: AdmissionTarget::Model(model.to_owned()),
         parameters,
         input_artifact_ids,
         output_placement: gpq_domain::ArtifactPlacement::WorkerLocal,
@@ -392,21 +398,6 @@ pub(crate) fn build_admission_request(
 pub(crate) struct ResolvedImage {
     pub bytes: Vec<u8>,
     pub mime_type: String,
-}
-
-fn media_kind_from_mime(mime: &str) -> MediaKind {
-    let essence = mime.split(';').next().unwrap_or(mime).trim();
-    if essence.starts_with("image/") {
-        MediaKind::Image
-    } else if essence.starts_with("video/") {
-        MediaKind::Video
-    } else if essence.starts_with("audio/") {
-        MediaKind::Audio
-    } else if essence.starts_with("text/") {
-        MediaKind::Text
-    } else {
-        MediaKind::Binary
-    }
 }
 
 /// Whether an IP address is safe to connect to while resolving an externally
@@ -647,7 +638,7 @@ pub(crate) async fn store_inline_input_artifact(
     let manifest = ArtifactManifest {
         size_bytes: bytes.len() as u64,
         digest: ContentHash::digest(&bytes),
-        kind: media_kind_from_mime(&mime_type),
+        kind: MediaKind::from_mime(&mime_type),
         mime_type,
     };
     let mut tx = state.db.begin_tenant(tenant_id).await.map_err(|err| {

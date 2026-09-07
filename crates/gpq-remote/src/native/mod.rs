@@ -58,6 +58,7 @@ pub(crate) fn modality_to_proto(modality: gpq_domain::Modality) -> EnumValue<pb:
         D::Image => pb::Modality::MODALITY_IMAGE,
         D::Video => pb::Modality::MODALITY_VIDEO,
         D::Music => pb::Modality::MODALITY_MUSIC,
+        D::Comfy => pb::Modality::MODALITY_COMFY,
     })
 }
 
@@ -70,6 +71,7 @@ pub(crate) fn modality_from_proto(value: EnumValue<pb::Modality>) -> Option<gpq_
         pb::Modality::MODALITY_IMAGE => Some(D::Image),
         pb::Modality::MODALITY_VIDEO => Some(D::Video),
         pb::Modality::MODALITY_MUSIC => Some(D::Music),
+        pb::Modality::MODALITY_COMFY => Some(D::Comfy),
         pb::Modality::MODALITY_UNSPECIFIED => None,
     }
 }
@@ -249,6 +251,7 @@ mod tests {
             Modality::Image,
             Modality::Video,
             Modality::Music,
+            Modality::Comfy,
         ] {
             let proto = modality_to_proto(modality);
             assert_eq!(modality_from_proto(proto), Some(modality));

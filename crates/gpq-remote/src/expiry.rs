@@ -580,6 +580,7 @@ mod tests {
             object_key: object_key.map(str::to_owned),
             worker_id: None,
             delivery_token: None,
+            comfy_output_pointers: Vec::new(),
             committed_offset: 0,
         }
     }

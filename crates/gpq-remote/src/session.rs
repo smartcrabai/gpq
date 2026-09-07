@@ -26,6 +26,7 @@ use gpq_proto::gpq::worker::v1::{
     HandshakeAck, Heartbeat, LeaseRejected, PoolAdvertisement, RemoteMessage, WorkerMessage,
     WorkerSessionService,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -637,7 +638,8 @@ async fn try_handle_capability_report(
 
     // ADR 0012: LLM Model Versions are automatically registered by content
     // hash. ComfyUI's on-disk models are referenced through Tenant-registered
-    // Workflow Versions instead, so they are not auto-registered here.
+    // Workflow Versions for registered workflows; raw prompts carry no catalog
+    // model identity, so they are not auto-registered here.
     let llm_versions: Vec<(ContentHash, Modality, ExecutionLimits)> = report
         .pools
         .iter()
@@ -868,6 +870,35 @@ fn output_placement_worker(placement: ArtifactPlacement, worker_id: WorkerId) ->
     matches!(placement, ArtifactPlacement::WorkerLocal).then_some(worker_id)
 }
 
+fn rewrite_comfy_output_pointer(
+    outputs: &mut serde_json::Value,
+    pointer: &str,
+    artifact_id: ArtifactId,
+) -> anyhow::Result<()> {
+    let Some(entry) = outputs
+        .pointer_mut(pointer)
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        anyhow::bail!("raw ComfyUI output pointer does not identify an object");
+    };
+    let Some(filename) = entry.get("filename").and_then(serde_json::Value::as_str) else {
+        anyhow::bail!("raw ComfyUI output pointer has no filename");
+    };
+    entry.insert(
+        "filename".to_owned(),
+        serde_json::Value::String(format!("{artifact_id}_{filename}")),
+    );
+    entry.insert(
+        "subfolder".to_owned(),
+        serde_json::Value::String(String::new()),
+    );
+    entry.insert(
+        "type".to_owned(),
+        serde_json::Value::String("output".to_owned()),
+    );
+    Ok(())
+}
+
 /// Loads the authenticated Tenant's mutable settings, for the output-size
 /// gate in [`try_handle_attempt_result`] (mirrors `openai::tenant_settings`,
 /// but returns `sqlx::Result` to match this file's other DB helpers).
@@ -930,6 +961,171 @@ async fn reject_oversized_outputs(
     }
     Ok(false)
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComfyViewRef {
+    filename: String,
+    subfolder: String,
+    kind: String,
+}
+
+fn validate_comfy_view_ref(view: &ComfyViewRef) -> Result<(), String> {
+    if view.filename.is_empty()
+        || view.filename == "."
+        || view.filename == ".."
+        || view.filename.chars().any(|c| matches!(c, '/' | '\\' | ':'))
+        || view.filename.starts_with('/')
+        || view.filename.starts_with('\\')
+        || std::path::Path::new(&view.filename).is_absolute()
+    {
+        return Err("raw ComfyUI output filename is not a basename".to_owned());
+    }
+    if view.subfolder.starts_with('/')
+        || view.subfolder.starts_with('\\')
+        || view.subfolder.contains('\\')
+        || view.subfolder.contains(':')
+        || (!view.subfolder.is_empty()
+            && view
+                .subfolder
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".."))
+    {
+        return Err("raw ComfyUI output subfolder is not relative".to_owned());
+    }
+    if !matches!(view.kind.as_str(), "input" | "output" | "temp") {
+        return Err("raw ComfyUI output type is unsupported".to_owned());
+    }
+    Ok(())
+}
+
+fn parse_comfy_view_ref(value: &serde_json::Value) -> Result<ComfyViewRef, String> {
+    let Some(object) = value.as_object() else {
+        return Err("raw ComfyUI file reference is not an object".to_owned());
+    };
+    let Some(filename) = object.get("filename").and_then(serde_json::Value::as_str) else {
+        return Err("raw ComfyUI file reference has no string filename".to_owned());
+    };
+    let subfolder = match object.get("subfolder") {
+        None => String::new(),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| "raw ComfyUI file reference has an invalid subfolder".to_owned())?
+            .to_owned(),
+    };
+    let kind = match object.get("type") {
+        None => "output".to_owned(),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| "raw ComfyUI file reference has an invalid type".to_owned())?
+            .to_owned(),
+    };
+    let view = ComfyViewRef {
+        filename: filename.to_owned(),
+        subfolder,
+        kind,
+    };
+    validate_comfy_view_ref(&view)?;
+    Ok(view)
+}
+
+fn collect_comfy_view_refs(
+    value: &serde_json::Value,
+    pointer: &str,
+    refs: &mut BTreeMap<String, ComfyViewRef>,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.contains_key("filename") {
+                refs.insert(pointer.to_owned(), parse_comfy_view_ref(value)?);
+            }
+            for (key, child) in object {
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                collect_comfy_view_refs(child, &format!("{pointer}/{escaped}"), refs)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_comfy_view_refs(child, &format!("{pointer}/{index}"), refs)?;
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+    Ok(())
+}
+
+fn validate_comfy_result(
+    generation: &crate::db::generations::GenerationRow,
+    result: &AttemptResult,
+) -> Result<Option<(serde_json::Value, Vec<String>)>, String> {
+    let raw = generation.target_kind == "comfy_prompt";
+    if !raw {
+        if !result.comfy_outputs_json.is_empty()
+            || !result.comfy_output_node_ids.is_empty()
+            || result
+                .outputs
+                .iter()
+                .any(|output| !output.comfy_output_pointers.is_empty())
+        {
+            return Err("non-raw result carries ComfyUI metadata".to_owned());
+        }
+        return Ok(None);
+    }
+    if result.comfy_outputs_json.is_empty() || result.comfy_outputs_json.len() > 2 * 1024 * 1024 {
+        return Err("raw ComfyUI outputs JSON is missing or exceeds the 2 MiB limit".to_owned());
+    }
+    let outputs: serde_json::Value = serde_json::from_slice(&result.comfy_outputs_json)
+        .map_err(|error| format!("raw ComfyUI outputs JSON is invalid: {error}"))?;
+    if !outputs.is_object() {
+        return Err("raw ComfyUI outputs JSON is not an object".to_owned());
+    }
+    let mut node_ids = BTreeSet::new();
+    for node_id in &result.comfy_output_node_ids {
+        if !node_ids.insert(node_id) {
+            return Err("raw ComfyUI output node ids contain duplicates".to_owned());
+        }
+    }
+    let mut refs = BTreeMap::new();
+    collect_comfy_view_refs(&outputs, "", &mut refs)?;
+    let mut covered = BTreeSet::new();
+    for output in &result.outputs {
+        if output
+            .manifest
+            .as_option()
+            .and_then(domain_manifest_from_proto)
+            .is_none()
+        {
+            return Err("raw ComfyUI result has an invalid artifact manifest".to_owned());
+        }
+        if domain_placement(output.placement) != Some(ArtifactPlacement::WorkerLocal)
+            || !output.object_key.is_empty()
+            || output.delivery_token.is_empty()
+            || output.comfy_output_pointers.is_empty()
+        {
+            return Err("raw ComfyUI result has an invalid artifact placement".to_owned());
+        }
+        let mut output_view = None;
+        for pointer in &output.comfy_output_pointers {
+            if !covered.insert(pointer) {
+                return Err("raw ComfyUI result repeats an output pointer".to_owned());
+            }
+            let Some(view) = refs.get(pointer) else {
+                return Err("raw ComfyUI result points outside history outputs".to_owned());
+            };
+            if output_view.is_some_and(|seen| seen != view) {
+                return Err("raw ComfyUI artifact pointers refer to different files".to_owned());
+            }
+            output_view = Some(view);
+        }
+    }
+    if covered.len() != refs.len() {
+        return Err(
+            "raw ComfyUI result does not cover every file reference exactly once".to_owned(),
+        );
+    }
+    Ok(Some((outputs, result.comfy_output_node_ids.clone())))
+}
 
 /// Records every output Artifact reported for an accepted result, deletes
 /// the now-terminal Generation's input Artifacts (ADR 0008: "Inputs are
@@ -946,6 +1142,10 @@ async fn reject_oversized_outputs(
 /// (ADR 0008's confused-deputy prevention), or if recording an output,
 /// deleting inputs, reading the post-commit Generation snapshot,
 /// committing `tx`, or publishing the state transition fails.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "this helper mirrors the accepted-result transaction inputs and is kept separate from the session dispatcher"
+)]
 async fn record_accepted_result(
     state: &AppState,
     tenant_id: TenantId,
@@ -953,9 +1153,12 @@ async fn record_accepted_result(
     attempt_id: AttemptId,
     generation_id: GenerationId,
     outputs: &[AttemptOutput],
+    comfy_outputs: Option<&serde_json::Value>,
+    comfy_output_node_ids: &[String],
     mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
 ) -> anyhow::Result<()> {
     let mut output_ids = Vec::new();
+    let mut public_outputs = comfy_outputs.cloned();
     for output in outputs {
         let Some(manifest_proto) = output.manifest.as_option() else {
             continue;
@@ -1004,9 +1207,26 @@ async fn record_accepted_result(
             placement,
             object_key,
             delivery_token,
+            &output.comfy_output_pointers,
         )
         .await?;
+        if let Some(outputs) = public_outputs.as_mut() {
+            for pointer in &output.comfy_output_pointers {
+                rewrite_comfy_output_pointer(outputs, pointer, row.id)?;
+            }
+        }
         output_ids.push(row.id);
+    }
+
+    if let Some(outputs) = public_outputs.as_ref() {
+        crate::db::comfy::update_outputs(
+            &mut tx,
+            tenant_id,
+            generation_id,
+            outputs,
+            comfy_output_node_ids,
+        )
+        .await?;
     }
 
     // ADR 0008: "Inputs are deleted when the Generation terminates".
@@ -1034,6 +1254,10 @@ async fn record_accepted_result(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "result acceptance, metadata validation, and stale-output cleanup form one transaction state machine"
+)]
 async fn try_handle_attempt_result(
     state: &AppState,
     tenant_id: TenantId,
@@ -1043,7 +1267,7 @@ async fn try_handle_attempt_result(
 ) -> anyhow::Result<()> {
     let attempt_id = parse_uuid_id(&result.attempt_id, AttemptId::from_uuid)?;
     let now = state.db.now().await?;
-    let usage = result.usage.into_option().map(|usage| {
+    let usage = result.usage.as_option().map(|usage| {
         (
             usage.prompt_tokens,
             usage.completion_tokens,
@@ -1070,6 +1294,14 @@ async fn try_handle_attempt_result(
     }
 
     let mut tx = state.db.begin_tenant(tenant_id).await?;
+    let generation_id =
+        crate::db::attempts::generation_id_of(&mut tx, tenant_id, attempt_id).await?;
+    let generation = match generation_id {
+        Some(generation_id) => {
+            crate::db::generations::get(&mut tx, tenant_id, generation_id).await?
+        }
+        None => None,
+    };
     let outcome = crate::db::generations::accept_result(
         &mut tx,
         tenant_id,
@@ -1083,6 +1315,36 @@ async fn try_handle_attempt_result(
 
     match classify_result_outcome(outcome) {
         ResultReply::Accepted(generation_id) => {
+            let metadata = generation
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("accepted attempt has no generation row"))
+                .and_then(|generation| {
+                    validate_comfy_result(generation, &result)
+                        .map_err(|message| anyhow::anyhow!("malformed raw result: {message}"))
+                });
+            let metadata = match metadata {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    tx.rollback().await?;
+                    settle_attempt_failure(
+                        state,
+                        tenant_id,
+                        attempt_id,
+                        FailureKind::InvalidInput,
+                        &error.to_string(),
+                        false,
+                        now,
+                    )
+                    .await?;
+                    discard_worker_outputs(outbound, &result.outputs, "malformed result metadata")
+                        .await;
+                    return Ok(());
+                }
+            };
+            let comfy_outputs = metadata.as_ref().map(|(outputs, _)| outputs);
+            let comfy_output_node_ids = metadata
+                .as_ref()
+                .map_or(&[][..], |(_, node_ids)| node_ids.as_slice());
             record_accepted_result(
                 state,
                 tenant_id,
@@ -1090,6 +1352,8 @@ async fn try_handle_attempt_result(
                 attempt_id,
                 generation_id,
                 &result.outputs,
+                comfy_outputs,
+                comfy_output_node_ids,
                 tx,
             )
             .await?;
@@ -1117,6 +1381,29 @@ async fn try_handle_attempt_result(
         }
     }
     Ok(())
+}
+
+async fn discard_worker_outputs(
+    outbound: &mpsc::Sender<RemoteMessage>,
+    outputs: &[AttemptOutput],
+    reason: &str,
+) {
+    for output in outputs {
+        if output.delivery_token.is_empty() {
+            continue;
+        }
+        let discard = RemoteMessage {
+            message: DiscardOutput {
+                artifact_id: String::new(),
+                delivery_token: output.delivery_token.clone(),
+                reason: reason.to_owned(),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        };
+        let _ = outbound.send(discard).await;
+    }
 }
 
 /// Settles a live Attempt `Failed`, applies ADR 0003's retry policy to its
@@ -1270,6 +1557,7 @@ async fn try_handle_lease_rejected(
 
 #[cfg(test)]
 mod tests {
+    use buffa::MessageField;
     use gpq_proto::gpq::worker::v1::SlotAdvertisement;
 
     use super::*;
@@ -1533,5 +1821,76 @@ mod tests {
     #[test]
     fn no_not_renewed_attempts_means_no_cancel_requests() {
         assert!(not_renewed_cancel_messages(&[]).is_empty());
+    }
+
+    fn raw_generation_row() -> crate::db::generations::GenerationRow {
+        let now = chrono::Utc::now();
+        crate::db::generations::GenerationRow {
+            id: uuid::Uuid::nil(),
+            state: "running".to_owned(),
+            modality: "comfy".to_owned(),
+            caller_kind: "durable".to_owned(),
+            target_kind: "comfy_prompt".to_owned(),
+            alias: String::new(),
+            version_sha256: ContentHash::digest(b"raw").to_hex(),
+            parameters: serde_json::json!({}),
+            priority: 0,
+            seed: None,
+            execution_timeout: sqlx::postgres::types::PgInterval::default(),
+            output_placement: "worker_local".to_owned(),
+            stream_tokens: false,
+            attempt_count: 1,
+            output_text: String::new(),
+            usage: None,
+            latest_progress: None,
+            failure_kind: None,
+            failure_message: String::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn raw_attempt_output(pointer: &str) -> AttemptOutput {
+        AttemptOutput {
+            manifest: MessageField::some(ProtoArtifactManifest {
+                digest_sha256: ContentHash::digest(b"").to_hex(),
+                kind: EnumValue::Known(ProtoMediaKind::MEDIA_KIND_BINARY),
+                mime_type: "application/octet-stream".to_owned(),
+                ..Default::default()
+            }),
+            placement: EnumValue::Known(ProtoArtifactPlacement::ARTIFACT_PLACEMENT_WORKER_LOCAL),
+            delivery_token: "token".to_owned(),
+            comfy_output_pointers: vec![pointer.to_owned()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn raw_result_accepts_a_complete_empty_outputs_object() {
+        let result = AttemptResult {
+            comfy_outputs_json: br"{}".to_vec(),
+            ..Default::default()
+        };
+        assert!(validate_comfy_result(&raw_generation_row(), &result).is_ok());
+    }
+
+    #[test]
+    fn raw_result_rejects_missing_and_duplicate_pointer_coverage() {
+        let outputs = serde_json::json!({"9": {"images": [{"filename": "x.png"}]}});
+        let missing = AttemptResult {
+            comfy_outputs_json: serde_json::to_vec(&outputs).unwrap_or_default(),
+            ..Default::default()
+        };
+        assert!(validate_comfy_result(&raw_generation_row(), &missing).is_err());
+
+        let duplicate = AttemptResult {
+            comfy_outputs_json: serde_json::to_vec(&outputs).unwrap_or_default(),
+            outputs: vec![
+                raw_attempt_output("/9/images/0"),
+                raw_attempt_output("/9/images/0"),
+            ],
+            ..Default::default()
+        };
+        assert!(validate_comfy_result(&raw_generation_row(), &duplicate).is_err());
     }
 }

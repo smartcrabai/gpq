@@ -78,6 +78,11 @@ pub struct PoolConfig {
     /// rejected rather than silently trusted.
     #[serde(default)]
     pub expected_hashes: BTreeMap<String, String>,
+    /// Operator-declared exact versions for `ComfyUI` custom-node packages.
+    /// These override backend-reported versions and fill gaps when the backend
+    /// cannot expose one.
+    #[serde(default)]
+    pub custom_node_versions: BTreeMap<String, String>,
 }
 
 fn duration_secs<'de, D>(deserializer: D) -> Result<Duration, D::Error>
@@ -101,7 +106,8 @@ impl WorkerConfig {
     /// TOML for this schema, or fails validation (empty/duplicate pool keys,
     /// overlapping device selectors, a non-absolute executable, a zero
     /// startup timeout, an invalid backend URL, an invalid mlx-dspark model
-    /// path, or a malformed expected model hash).
+    /// path, a malformed expected model hash, or an empty custom-node package
+    /// name or version).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading worker config {}", path.display()))?;
@@ -205,6 +211,18 @@ impl PoolConfig {
             ensure!(
                 is_hex_sha256(hash),
                 "pool `{}` expected hash for `{path}` must be 64 hex characters, got `{hash}`",
+                self.key
+            );
+        }
+        for (package, version) in &self.custom_node_versions {
+            ensure!(
+                !package.trim().is_empty(),
+                "pool `{}` custom node package name must not be empty",
+                self.key
+            );
+            ensure!(
+                !version.trim().is_empty(),
+                "pool `{}` custom node version for `{package}` must not be empty",
                 self.key
             );
         }
@@ -336,6 +354,26 @@ CUDA_VISIBLE_DEVICES = "1"
         assert!(state.is_dir());
         assert!(pool_a.is_dir());
         assert!(pool_b.is_dir());
+    }
+
+    #[test]
+    fn parses_custom_node_versions() {
+        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let state = root.path().join("state");
+        let pool_a = root.path().join("gpu0");
+        let pool_b = root.path().join("gpu1");
+        let contents = sample_toml(&state, &pool_a, &pool_b).replace(
+            "base_url = \"http://127.0.0.1:8082\"",
+            "base_url = \"http://127.0.0.1:8082\"\n\n[pools.custom_node_versions]\nSomePack = \"1.2.3\"",
+        );
+        let (_dir, path) = write_config(&contents);
+
+        let config = WorkerConfig::load(&path)
+            .unwrap_or_else(|err| panic!("expected custom node versions to load: {err}"));
+        assert_eq!(
+            config.pools[1].custom_node_versions.get("SomePack"),
+            Some(&"1.2.3".to_owned())
+        );
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Generation admission (ADR 0002, ADR 0003, ADR 0006, ADR 0008, ADR 0012).
 //!
 //! Admission resolves a Model or Workflow alias to its pinned immutable
-//! Version, derives the modality and resolves the execution timeout, enforces
-//! Tenant policy, and inserts the new Generation `Queued`. It never leases or
-//! executes anything itself — [`crate::scheduler`] picks queued work up
-//! separately, woken by [`crate::state::AppState::scheduler`].
+//! Version, or hashes a raw `ComfyUI` prompt, then derives the modality and
+//! resolves the execution timeout, enforces Tenant policy, and inserts the new
+//! Generation `Queued`. It never leases or executes anything itself —
+//! [`crate::scheduler`] picks queued work up separately, woken by
+//! [`crate::state::AppState::scheduler`].
 
 use std::time::Duration;
 
@@ -19,20 +20,27 @@ use uuid::Uuid;
 use crate::db::generations::{self, GenerationRow, NewGeneration};
 use crate::state::AppState;
 
-/// Which catalog a requested alias names (ADR 0012).
+/// Which execution target a request names (ADR 0012).
 #[derive(Debug, Clone)]
-pub enum AliasTarget {
+pub enum AdmissionTarget {
     /// An LLM Model alias.
     Model(String),
     /// A `ComfyUI` Workflow alias.
     Workflow(String),
+    /// A raw `ComfyUI` Server API prompt.
+    ComfyPrompt {
+        /// Optional client-visible prompt id.
+        prompt_id: Option<Uuid>,
+        /// Optional client correlation id.
+        client_id: Option<String>,
+    },
 }
 
 /// A request to admit one new Generation.
 #[derive(Debug, Clone)]
 pub struct AdmissionRequest {
-    /// The Model or Workflow alias to resolve.
-    pub alias_target: AliasTarget,
+    /// The Model, Workflow alias, or raw `ComfyUI` target.
+    pub target: AdmissionTarget,
     /// Opaque backend-shaped payload (ADR 0007).
     pub parameters: serde_json::Value,
     /// Input Artifacts the Attempt must read before execution.
@@ -67,6 +75,9 @@ pub enum AdmissionError {
     /// The request itself is unusable, independent of Worker availability.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// The requested Comfy prompt id already belongs to this Tenant.
+    #[error("Comfy prompt id already exists")]
+    PromptIdConflict,
     /// The Tenant already has `max_queued_generations` nonterminal Generations.
     #[error("tenant queue capacity exceeded")]
     CapacityExceeded,
@@ -99,9 +110,10 @@ fn idempotency_digest(request: &AdmissionRequest) -> Vec<u8> {
         stream_tokens: bool,
     }
 
-    let (alias_kind, alias) = match &request.alias_target {
-        AliasTarget::Model(alias) => ("model", alias.as_str()),
-        AliasTarget::Workflow(alias) => ("workflow", alias.as_str()),
+    let (alias_kind, alias) = match &request.target {
+        AdmissionTarget::Model(alias) => ("model", alias.as_str()),
+        AdmissionTarget::Workflow(alias) => ("workflow", alias.as_str()),
+        AdmissionTarget::ComfyPrompt { .. } => ("comfy_prompt", ""),
     };
     let payload = DigestPayload {
         alias_kind,
@@ -213,12 +225,12 @@ async fn validate_input_artifacts(
     Ok(())
 }
 
-/// Resolves a requested alias to its pinned Version, modality, execution
-/// limits, and scheduling [`Requirement`] (ADR 0012).
+/// Resolves a requested alias or raw prompt to its pinned Version, modality,
+/// execution limits, and scheduling [`Requirement`] (ADR 0012).
 async fn resolve_target(
     tx: &mut sqlx::PgConnection,
     tenant: TenantId,
-    alias_target: &AliasTarget,
+    request: &AdmissionRequest,
 ) -> Result<
     (
         ExecutionTarget,
@@ -228,8 +240,8 @@ async fn resolve_target(
     ),
     AdmissionError,
 > {
-    match alias_target {
-        AliasTarget::Model(alias) => {
+    match &request.target {
+        AdmissionTarget::Model(alias) => {
             let Some(resolved) = crate::db::catalog::resolve_model_alias(tx, tenant, alias)
                 .await
                 .map_err(internal)?
@@ -246,7 +258,7 @@ async fn resolve_target(
             );
             Ok((target, resolved.modality, resolved.limits, requirement))
         }
-        AliasTarget::Workflow(alias) => {
+        AdmissionTarget::Workflow(alias) => {
             let Some(resolved) = crate::db::catalog::resolve_workflow_alias(tx, tenant, alias)
                 .await
                 .map_err(internal)?
@@ -263,6 +275,20 @@ async fn resolve_target(
                 resolved.limits.estimated_vram_bytes,
             );
             Ok((target, resolved.modality, resolved.limits, requirement))
+        }
+        AdmissionTarget::ComfyPrompt { .. } => {
+            let canonical = serde_json::to_vec(&request.parameters).map_err(|error| {
+                AdmissionError::InvalidInput(format!(
+                    "raw ComfyUI prompt is not serializable: {error}"
+                ))
+            })?;
+            let version = gpq_domain::ContentHash::digest(&canonical);
+            Ok((
+                ExecutionTarget::ComfyPrompt { version },
+                gpq_domain::Modality::Comfy,
+                gpq_domain::ExecutionLimits::default(),
+                Requirement::for_comfy_prompt(tenant, version),
+            ))
         }
     }
 }
@@ -362,20 +388,47 @@ fn requires_missing_object_store(
 /// Returns [`AdmissionError::ObjectStoreUnavailable`] if `request.output_placement`
 /// needs object storage and this Remote has none configured (ADR 0008);
 /// [`AdmissionError::UnknownAlias`] if the Model or Workflow alias does not
-/// resolve to any Version; [`AdmissionError::CapacityExceeded`] if the
-/// Tenant already has `max_queued_generations` nonterminal Generations;
-/// [`AdmissionError::Unavailable`] if the request is synchronous and no
-/// capable Worker is online; [`AdmissionError::InvalidInput`] if an input
-/// Artifact reference is invalid, mismatched in direction, over the
-/// Tenant's size limit, or if `request.seed` does not fit a signed 64-bit
-/// column; and [`AdmissionError::Internal`] on a database failure, a
-/// dangling idempotency key referencing a missing Generation, or missing
+/// resolve to any Version; [`AdmissionError::PromptIdConflict`] if a raw
+/// `ComfyUI` prompt id already belongs to the Tenant;
+/// [`AdmissionError::CapacityExceeded`] if the Tenant already has
+/// `max_queued_generations` nonterminal Generations; [`AdmissionError::Unavailable`]
+/// if the request is synchronous and no capable Worker is online;
+/// [`AdmissionError::InvalidInput`] if an input Artifact reference is invalid,
+/// mismatched in direction, over the Tenant's size limit, `request.seed` does
+/// not fit a signed 64-bit column, or a raw prompt requests unsupported
+/// admission options; and [`AdmissionError::Internal`] on a database failure,
+/// a dangling idempotency key referencing a missing Generation, or missing
 /// Tenant settings.
+#[expect(
+    clippy::too_many_lines,
+    reason = "admission keeps validation, target resolution, and its atomic transaction together"
+)]
 pub async fn admit(
     state: &AppState,
     tenant: TenantId,
     request: AdmissionRequest,
 ) -> Result<GenerationRow, AdmissionError> {
+    let raw_metadata = match &request.target {
+        AdmissionTarget::ComfyPrompt {
+            prompt_id,
+            client_id,
+        } => Some((*prompt_id, client_id.as_deref())),
+        AdmissionTarget::Model(_) | AdmissionTarget::Workflow(_) => None,
+    };
+    if raw_metadata.is_some()
+        && (!request.input_artifact_ids.is_empty()
+            || request.output_placement != ArtifactPlacement::WorkerLocal
+            || request.priority.is_some()
+            || request.seed.is_some()
+            || request.execution_timeout.is_some()
+            || request.caller_kind != CallerKind::Durable
+            || request.stream_tokens
+            || request.idempotency_key.is_some())
+    {
+        return Err(AdmissionError::InvalidInput(
+            "raw ComfyUI prompts require durable worker-local admission".to_owned(),
+        ));
+    }
     if requires_missing_object_store(
         request.output_placement,
         state.artifacts.object_store_available(),
@@ -384,6 +437,13 @@ pub async fn admit(
     }
 
     let mut tx = state.db.begin_tenant(tenant).await.map_err(internal)?;
+    if raw_metadata.is_some() {
+        sqlx::query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE")
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+    }
 
     if let Some(key) = request.idempotency_key.as_deref()
         && let Some(row) = replay_idempotent(&mut tx, tenant, key, &request).await?
@@ -406,9 +466,7 @@ pub async fn admit(
 
     validate_input_artifacts(&mut tx, tenant, &request, &settings).await?;
 
-    let (target, modality, limits, requirement) =
-        resolve_target(&mut tx, tenant, &request.alias_target).await?;
-
+    let (target, modality, limits, requirement) = resolve_target(&mut tx, tenant, &request).await?;
     if request.caller_kind == CallerKind::Synchronous {
         ensure_synchronous_capacity(state, &mut tx, tenant, &requirement).await?;
     }
@@ -420,14 +478,26 @@ pub async fn admit(
         settings.execution_timeout_ceiling,
     );
     let priority = request.priority.unwrap_or(settings.default_priority);
-    let alias = match &request.alias_target {
-        AliasTarget::Model(alias) | AliasTarget::Workflow(alias) => alias.clone(),
+    let alias = match &request.target {
+        AdmissionTarget::Model(alias) | AdmissionTarget::Workflow(alias) => alias.clone(),
+        AdmissionTarget::ComfyPrompt { .. } => String::new(),
     };
+    let generation_id = gpq_domain::GenerationId::new();
+    let prompt_id = raw_metadata
+        .and_then(|(prompt_id, _)| prompt_id)
+        .unwrap_or_else(|| generation_id.as_uuid());
+    if raw_metadata.is_some()
+        && crate::db::comfy::prompt_id_exists(&mut tx, tenant, prompt_id)
+            .await
+            .map_err(internal)?
+    {
+        return Err(AdmissionError::PromptIdConflict);
+    }
 
     let row = generations::insert(
         &mut tx,
         NewGeneration {
-            id: gpq_domain::GenerationId::new(),
+            id: generation_id,
             tenant_id: tenant,
             modality,
             caller_kind: request.caller_kind,
@@ -449,6 +519,37 @@ pub async fn admit(
         generations::InsertGenerationError::Database(source) => internal(source),
     })?;
 
+    if let Some((_, client_id)) = raw_metadata {
+        let (number,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(number), -1) + 1 FROM comfy_prompts WHERE tenant_id = $1",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal)?;
+        crate::db::comfy::insert(
+            &mut tx,
+            tenant,
+            row.generation_id(),
+            prompt_id,
+            client_id,
+            number,
+        )
+        .await
+        .map_err(|error| {
+            if error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref()
+                == Some("23505")
+            {
+                AdmissionError::PromptIdConflict
+            } else {
+                internal(error)
+            }
+        })?;
+    }
+
     link_input_artifacts(
         &mut tx,
         tenant,
@@ -462,6 +563,9 @@ pub async fn admit(
     }
 
     tx.commit().await.map_err(internal)?;
+    if raw_metadata.is_some() {
+        state.events.notify_tenant(tenant, row.generation_id());
+    }
     state.scheduler.wake_tenant(tenant);
 
     Ok(row)
@@ -473,7 +577,7 @@ mod tests {
 
     fn sample_request(key: Option<&str>) -> AdmissionRequest {
         AdmissionRequest {
-            alias_target: AliasTarget::Model("llama-3".to_owned()),
+            target: AdmissionTarget::Model("llama-3".to_owned()),
             parameters: serde_json::json!({"temperature": 0.7}),
             input_artifact_ids: Vec::new(),
             output_placement: ArtifactPlacement::WorkerLocal,
@@ -567,6 +671,7 @@ mod tests {
             object_key: None,
             worker_id: None,
             delivery_token: None,
+            comfy_output_pointers: Vec::new(),
             committed_offset: 0,
         }
     }
@@ -597,7 +702,7 @@ mod tests {
         // not just its text, or a Model and Workflow request sharing a key
         // could replay across catalogs.
         let mut workflow_request = sample_request(Some("k"));
-        workflow_request.alias_target = AliasTarget::Workflow("llama-3".to_owned());
+        workflow_request.target = AdmissionTarget::Workflow("llama-3".to_owned());
         assert_ne!(
             idempotency_digest(&sample_request(Some("k"))),
             idempotency_digest(&workflow_request)

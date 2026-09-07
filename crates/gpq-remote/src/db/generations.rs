@@ -32,11 +32,12 @@ pub struct GenerationRow {
     pub modality: String,
     /// Persisted `CallerKind` name (ADR 0003).
     pub caller_kind: String,
-    /// `"model"` or `"workflow"` (ADR 0012).
+    /// `"model"`, `"workflow"`, or `"comfy_prompt"` (ADR 0012).
     pub target_kind: String,
-    /// The logical alias the caller requested.
+    /// The logical alias the caller requested, empty for a raw `ComfyUI` prompt.
     pub alias: String,
-    /// The Model or Workflow Version pinned at admission (ADR 0012).
+    /// The Model or Workflow Version, or raw prompt content hash, pinned at
+    /// admission (ADR 0012).
     pub version_sha256: String,
     /// Opaque backend-shaped payload (ADR 0007).
     pub parameters: Json,
@@ -77,6 +78,9 @@ pub enum GenerationRowError {
     /// `version_sha256` was not a valid hex-encoded SHA-256 digest.
     #[error(transparent)]
     Hash(#[from] ContentHashError),
+    /// `target_kind` held an unknown persisted target.
+    #[error("unknown target kind {0:?}")]
+    TargetKind(String),
     /// `priority` decoded but fell outside the accepted range.
     #[error(transparent)]
     Priority(#[from] PriorityOutOfRange),
@@ -132,19 +136,19 @@ impl GenerationRow {
         self.version_sha256.parse()
     }
 
-    /// Rebuilds the pinned `ExecutionTarget` from `target_kind` and `version_sha256`.
+    /// Rebuilds the pinned [`ExecutionTarget`] from its persisted kind and hash.
     ///
     /// # Errors
     ///
-    /// Returns [`GenerationRowError::Hash`] (via [`Self::version`]) if
-    /// `version_sha256` is not a valid hex-encoded SHA-256 digest.
+    /// Returns an error if the hash or target kind is malformed.
     pub fn target(&self) -> Result<ExecutionTarget, GenerationRowError> {
         let version = self.version()?;
-        Ok(if self.target_kind == "workflow" {
-            ExecutionTarget::Workflow { version }
-        } else {
-            ExecutionTarget::Model { version }
-        })
+        match self.target_kind.as_str() {
+            "model" => Ok(ExecutionTarget::Model { version }),
+            "workflow" => Ok(ExecutionTarget::Workflow { version }),
+            "comfy_prompt" => Ok(ExecutionTarget::ComfyPrompt { version }),
+            other => Err(GenerationRowError::TargetKind(other.to_owned())),
+        }
     }
 
     /// Parses the requested priority.
@@ -181,13 +185,14 @@ pub struct NewGeneration {
     pub id: GenerationId,
     /// Owning Tenant.
     pub tenant_id: TenantId,
-    /// Derived after alias resolution (ADR 0006).
+    /// Derived after target resolution (ADR 0006).
     pub modality: Modality,
     /// Whether the caller holds a connection open (ADR 0003).
     pub caller_kind: CallerKind,
-    /// The logical alias the caller requested.
+    /// The logical alias the caller requested, empty for a raw `ComfyUI` prompt.
     pub alias: String,
-    /// The pinned Model or Workflow Version (ADR 0012).
+    /// The pinned Model or Workflow target or raw `ComfyUI` prompt content hash
+    /// (ADR 0012).
     pub target: ExecutionTarget,
     /// Opaque backend-shaped payload (ADR 0007).
     pub parameters: Json,
@@ -231,6 +236,7 @@ pub async fn insert(
     let (target_kind, version) = match new.target {
         ExecutionTarget::Model { version } => ("model", version),
         ExecutionTarget::Workflow { version } => ("workflow", version),
+        ExecutionTarget::ComfyPrompt { version } => ("comfy_prompt", version),
     };
     let seed = match new.seed {
         Some(value) => {
@@ -697,9 +703,9 @@ pub async fn record_progress(
     update_progress(conn, tenant_id, id, progress).await
 }
 
-/// Interprets one raw (`target_kind`, `version_sha256`, model vram, workflow
-/// manifest) row as a [`Requirement`], shared by [`queued_candidates`] and
-/// [`requirement_of`].
+/// Interprets one raw (`target_kind`, `version_sha256`, model VRAM, workflow
+/// manifest, or raw prompt) row as a [`Requirement`], shared by
+/// [`queued_candidates`] and [`requirement_of`].
 fn parse_requirement(
     tenant_id: TenantId,
     generation_id: Uuid,
@@ -709,22 +715,27 @@ fn parse_requirement(
     workflow_manifest: Option<Json>,
 ) -> Result<Requirement, CandidateRowError> {
     let version: ContentHash = version_sha256.parse()?;
-    if target_kind == "workflow" {
-        let manifest_json =
-            workflow_manifest.ok_or(CandidateRowError::MissingWorkflowManifest(generation_id))?;
-        let manifest: WorkflowManifest =
-            serde_json::from_value(manifest_json).map_err(|source| {
-                CandidateRowError::Manifest {
-                    generation: generation_id,
-                    source,
-                }
-            })?;
-        Ok(Requirement::for_workflow(
-            tenant_id, version, &manifest, None,
-        ))
-    } else {
-        let vram_bytes = model_vram_bytes.and_then(|v| u64::try_from(v).ok());
-        Ok(Requirement::for_model(tenant_id, version, vram_bytes))
+    match target_kind {
+        "model" => {
+            let vram_bytes = model_vram_bytes.and_then(|v| u64::try_from(v).ok());
+            Ok(Requirement::for_model(tenant_id, version, vram_bytes))
+        }
+        "workflow" => {
+            let manifest_json = workflow_manifest
+                .ok_or(CandidateRowError::MissingWorkflowManifest(generation_id))?;
+            let manifest: WorkflowManifest =
+                serde_json::from_value(manifest_json).map_err(|source| {
+                    CandidateRowError::Manifest {
+                        generation: generation_id,
+                        source,
+                    }
+                })?;
+            Ok(Requirement::for_workflow(
+                tenant_id, version, &manifest, None,
+            ))
+        }
+        "comfy_prompt" => Ok(Requirement::for_comfy_prompt(tenant_id, version)),
+        other => Err(CandidateRowError::UnknownTargetKind(other.to_owned())),
     }
 }
 
@@ -750,6 +761,8 @@ enum CandidateRowError {
     Priority(#[from] PriorityOutOfRange),
     #[error("priority {0} is outside 0..=9")]
     PriorityRange(i16),
+    #[error("unknown target kind {0:?}")]
+    UnknownTargetKind(String),
     #[error("workflow target {0} is missing its manifest")]
     MissingWorkflowManifest(Uuid),
     #[error("workflow manifest for {generation} failed to parse: {source}")]

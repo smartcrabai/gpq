@@ -20,6 +20,7 @@ mod e2e_support;
 use std::time::Duration;
 
 use anyhow::Context;
+use buffa_types::google::protobuf::Struct;
 use e2e_support::fake_llama::FakeMode;
 use e2e_support::{Harness, harness, wait_until};
 use gpq_proto::gpq::v1 as pb;
@@ -391,6 +392,43 @@ fn native_submit_durable_lifecycle_and_workflow_alias_stays_queued() -> anyhow::
             still_queued.state == pb::GenerationState::GENERATION_STATE_QUEUED,
             "expected queued, got {:?}",
             still_queued.state
+        );
+        Ok(())
+    })
+}
+
+/// Native Catalog rejects a Workflow modality that the Comfy Workflow target
+/// cannot execute, before persisting an unexecutable Version (ADR 0006).
+#[test]
+fn native_catalog_rejects_unexecutable_workflow_modality() -> anyhow::Result<()> {
+    let h = harness();
+    e2e_support::block_on(async {
+        let graph: Struct = serde_json::from_value(json!({
+            "1": {"class_type": "SaveImage", "inputs": {}}
+        }))?;
+        let result = h
+            .catalog_client(&h.tenant1.master_key)
+            .register_workflow_version(pb::RegisterWorkflowVersionRequest {
+                graph: graph.into(),
+                manifest: pb::WorkflowManifest {
+                    output_node: "1".to_owned(),
+                    output_name: "IMAGE".to_owned(),
+                    artifact_kind: pb::MediaKind::MEDIA_KIND_IMAGE.into(),
+                    artifact_mime: "image/png".to_owned(),
+                    ..Default::default()
+                }
+                .into(),
+                modality: pb::Modality::MODALITY_LLM.into(),
+                ..Default::default()
+            })
+            .await;
+        let Err(error) = result else {
+            anyhow::bail!("LLM Workflow modality was accepted")
+        };
+        anyhow::ensure!(
+            error.code == connectrpc::ErrorCode::InvalidArgument,
+            "unexpected error code: {:?}",
+            error.code
         );
         Ok(())
     })

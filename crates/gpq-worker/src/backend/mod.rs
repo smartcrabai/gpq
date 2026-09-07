@@ -35,6 +35,9 @@ pub struct ExecutionRequest {
     pub model_sha256: Option<ContentHash>,
     /// Local path of the resolved Model Version, when applicable.
     pub model_path: Option<PathBuf>,
+    /// Opaque `ComfyUI` raw Server API prompt payload, when this Attempt runs
+    /// an unregistered prompt.
+    pub comfy_prompt: Option<serde_json::Value>,
     /// Opaque `ComfyUI` graph, when this Attempt runs a Workflow (ADR 0007).
     pub workflow_graph: Option<serde_json::Value>,
     /// The pinned Workflow Version's manifest, when applicable (ADR 0012).
@@ -65,7 +68,7 @@ pub struct InputArtifact {
 /// One event emitted by a `Backend` while executing an Attempt.
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
-    /// Fractional progress toward completion (`ComfyUI` graphs).
+    /// Fractional progress toward completion (`ComfyUI` executions).
     Progress {
         fraction: f64,
         stage: String,
@@ -78,6 +81,12 @@ pub enum ExecutionEvent {
     Output {
         path: PathBuf,
         manifest: ArtifactManifest,
+        comfy_output_pointers: Vec<String>,
+    },
+    /// Complete raw `ComfyUI` outputs metadata and output node ids.
+    ComfyOutputs {
+        outputs: serde_json::Value,
+        output_node_ids: Vec<String>,
     },
     /// Complete non-streamed text output (LLM).
     Text { text: String },
@@ -116,7 +125,8 @@ pub struct BackendCapabilities {
     pub resident_model: Option<ContentHash>,
     /// Accelerator memory, when the backend reports it (optional, ADR 0005).
     pub accelerator_memory_bytes: Option<u64>,
-    /// Installed `ComfyUI` custom-node package name to exact version.
+    /// Installed `ComfyUI` custom-node package name to the discovered or
+    /// operator-declared version; `"unknown"` means unavailable.
     pub custom_nodes: BTreeMap<String, String>,
     /// Required-endpoint probe name to whether it succeeded (ADR 0005:
     /// compatibility comes from probes, not version allowlists).

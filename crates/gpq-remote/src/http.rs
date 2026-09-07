@@ -1,9 +1,10 @@
 //! Assembles the single Axum router that serves every public surface on one
 //! port.
 //!
-//! ADR 0004: OpenAI-compatible routes, one-shot Artifact download, and health
-//! checks are Axum; Native Generation/Catalog/Tenant use Connect, and Worker
-//! enrollment/Session/transfer use gRPC — but `connectrpc`'s content-type
+//! ADR 0004: OpenAI-compatible routes, ComfyUI-compatible HTTP/WebSocket
+//! routes, one-shot Artifact download, and health checks are Axum; Native
+//! Generation/Catalog/Tenant use Connect, and Worker enrollment/Session/transfer
+//! use gRPC — but `connectrpc`'s content-type
 //! negotiation lets all of them share this one `axum::serve` listener (ADR
 //! 0019: plaintext h2c/HTTP-1.1 behind an ingress that terminates TLS).
 
@@ -37,6 +38,7 @@ pub fn router(state: AppState) -> axum::Router {
     health
         .merge(crate::tenant_console::router())
         .merge(crate::openai::router(state.clone()))
+        .merge(crate::comfy::router(state.clone()))
         .merge(crate::artifacts::download_router(state))
         .merge(worker_and_native_rpc)
         .layer(tower_http::trace::TraceLayer::new_for_http())

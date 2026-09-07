@@ -43,13 +43,14 @@ enum ArtifactState {
   ARTIFACT_STATE_LOST = 6;
 }
 
-// Derived after alias resolution; never supplied by callers (ADR 0006).
+// Derived after target resolution; never supplied by callers (ADR 0006).
 enum Modality {
   MODALITY_UNSPECIFIED = 0;
   MODALITY_LLM = 1;
   MODALITY_IMAGE = 2;
   MODALITY_VIDEO = 3;
   MODALITY_MUSIC = 4;
+  MODALITY_COMFY = 5;
 }
 
 // Runtime kind occupying a Device Pool (ADR 0005).

@@ -76,6 +76,15 @@ fn invalid(err: impl std::fmt::Display) -> ConnectError {
     ConnectError::new(ErrorCode::InvalidArgument, err.to_string())
 }
 
+/// Validates the modality of a registered `ComfyUI` Workflow Version.
+fn validate_workflow_modality(modality: Modality) -> Result<(), String> {
+    match modality {
+        Modality::Image | Modality::Video | Modality::Music => Ok(()),
+        Modality::Llm => Err("Workflow versions must use image, video, or music modality".into()),
+        Modality::Comfy => Err("raw ComfyUI prompts must be submitted through /prompt".to_owned()),
+    }
+}
+
 /// Validates a Workflow manifest before registration: it must name an output
 /// node, an output name, and a MIME type, and every custom node it requires
 /// must carry an exact version (ADR 0007, ADR 0018 - no version ranges, no
@@ -94,7 +103,7 @@ fn validate_manifest(manifest: &gpq_domain::WorkflowManifest) -> Result<(), Stri
         if package.trim().is_empty() {
             return Err("manifest.required_custom_nodes has an empty package name".to_owned());
         }
-        if version.trim().is_empty() {
+        if version.trim().is_empty() || version.trim() == "unknown" {
             return Err(format!("custom node {package:?} has no exact version"));
         }
     }
@@ -216,6 +225,7 @@ impl CatalogService for CatalogApi {
         let request = request.to_owned_message();
         let modality = crate::native::modality_from_proto(request.modality)
             .ok_or_else(|| invalid("modality must be set"))?;
+        validate_workflow_modality(modality).map_err(invalid)?;
         let graph_struct = request.graph.into_option().unwrap_or_default();
         let graph = serde_json::to_value(&graph_struct)
             .map_err(|err| invalid(format!("invalid graph: {err}")))?;
@@ -648,6 +658,13 @@ mod tests {
     }
 
     #[test]
+    fn workflow_modality_rejects_llm_and_raw_comfy() {
+        assert!(validate_workflow_modality(gpq_domain::Modality::Llm).is_err());
+        assert!(validate_workflow_modality(gpq_domain::Modality::Comfy).is_err());
+        assert!(validate_workflow_modality(gpq_domain::Modality::Image).is_ok());
+    }
+
+    #[test]
     fn missing_output_node_is_rejected() {
         let mut manifest = valid_manifest();
         manifest.output_node.clear();
@@ -667,6 +684,15 @@ mod tests {
         manifest
             .required_custom_nodes
             .insert("other_pkg".to_owned(), String::new());
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn custom_node_with_unknown_version_is_rejected() {
+        let mut manifest = valid_manifest();
+        manifest
+            .required_custom_nodes
+            .insert("other_pkg".to_owned(), "unknown".to_owned());
         assert!(validate_manifest(&manifest).is_err());
     }
 

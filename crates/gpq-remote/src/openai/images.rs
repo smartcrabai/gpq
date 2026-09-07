@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 
 use super::sse::CancelOnDrop;
 use super::{ApiError, TenantAuth};
-use crate::admission::{AdmissionRequest, AliasTarget};
+use crate::admission::{AdmissionRequest, AdmissionTarget};
 use crate::state::AppState;
 
 const MAX_IMAGES_PER_REQUEST: u32 = 10;
@@ -200,7 +200,7 @@ pub async fn create_image(
         .map_err(|error| ApiError::invalid_request(format!("invalid request body: {error}")))?;
     let (count, size) = validate(&request)?;
     let admission_request = AdmissionRequest {
-        alias_target: AliasTarget::Workflow(request.model.clone()),
+        target: AdmissionTarget::Workflow(request.model.clone()),
         parameters: workflow_parameters(&request, count, size),
         input_artifact_ids: Vec::new(),
         output_placement: ArtifactPlacement::WorkerLocal,

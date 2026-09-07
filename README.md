@@ -21,6 +21,11 @@ All surfaces share one listener:
   - `GET /v1/models`
   - `POST /v1/chat/completions`
   - `POST /v1/responses`
+- ComfyUI Server API-compatible HTTP/WebSocket:
+  - `POST /prompt`, `GET /prompt`
+  - `GET /history`, `GET /history/{prompt_id}`
+  - `GET /view?filename=...&type=output`
+  - `GET /ws?clientId=...`
 - Native Connect services:
   - `gpq.v1.GenerationService`
   - `gpq.v1.CatalogService`
@@ -258,6 +263,12 @@ model_paths = []
 
 [pools.env]
 CUDA_VISIBLE_DEVICES = "1"
+
+# Optional: declare exact versions for ComfyUI custom-node packages.
+# Configured values override ComfyUI's reported version and fill gaps when
+# /system_stats does not expose one.
+#[pools.custom_node_versions]
+#"ComfyUI-Impact-Pack" = "7.1.0"
 ```
 
 Backend arguments are passed directly to the executable; no shell interprets them. The configured `base_url` must match the backend's listen address.
@@ -351,6 +362,25 @@ GPQ_IMAGE_WORKFLOW='example-image-workflow' \
 ```
 
 Chat streaming uses the standard `"stream": true` request field. `POST /v1/responses` accepts the corresponding OpenAI Responses API shape. OpenAI image content parts may use `http:`, `https:`, or `data:` URLs; Remote rejects private and otherwise unsafe network targets. Image-generation streaming and `/v1/images/edits` are not supported.
+
+## ComfyUI Server API usage
+
+Submit an unregistered API-format graph with the Tenant Master Key. The response is durable; retrieve completed metadata from `/history/{prompt_id}` and each output once from `/view`.
+
+```sh
+curl 'https://gpq.example.com/prompt' \
+  -H 'Authorization: Bearer <tenant-master-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "client_id": "cli-example",
+    "prompt": {
+      "1": {"class_type": "EmptyImage", "inputs": {"width": 512, "height": 512, "batch_size": 1, "color": 0}},
+      "3": {"class_type": "SaveImage", "inputs": {"filename_prefix": "gpq/example", "images": ["1", 0]}}
+    }
+  }'
+```
+
+Use `GET /ws?clientId=<client_id>` for progress and terminal events. Raw prompts preserve graph numbers and support mixed image, video, audio, and custom-node file outputs. Output downloads are one-shot and return `410 Gone` after consumption.
 
 ## Native API
 

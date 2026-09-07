@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use buffa::MessageField;
+use buffa::{EnumValue, MessageField};
 use buffa_types::google::protobuf::Timestamp;
 use chrono::{DateTime, Utc};
 use gpq_domain::{
@@ -464,6 +464,34 @@ fn classify_lease(lease: &LeaseAssignment) -> LeaseAcceptance {
             };
         }
     };
+    let raw_payload = !lease.comfy_prompt_json.is_empty();
+    let raw_fields_valid = raw_payload
+        && modality == Modality::Comfy
+        && !lease.comfy_prompt_sha256.is_empty()
+        && lease.model_sha256.is_empty()
+        && lease.workflow_sha256.is_empty()
+        && lease.workflow_graph.as_option().is_none()
+        && lease.workflow_manifest.as_option().is_none()
+        && lease.parameters.as_option().is_none()
+        && lease.inputs.is_empty()
+        && lease.seed == 0
+        && !lease.stream_tokens
+        && lease.output_upload_url.is_empty()
+        && lease.output_object_key.is_empty()
+        && matches!(
+            lease.output_placement,
+            EnumValue::Known(
+                gpq_proto::gpq::v1::ArtifactPlacement::ARTIFACT_PLACEMENT_WORKER_LOCAL
+            )
+        );
+    if (raw_payload || !lease.comfy_prompt_sha256.is_empty() || modality == Modality::Comfy)
+        && !raw_fields_valid
+    {
+        return LeaseAcceptance::Rejected {
+            kind: FailureKind::Internal,
+            message: "raw ComfyUI lease envelope is invalid".to_owned(),
+        };
+    }
     let resident_model = if lease.model_sha256.is_empty() {
         None
     } else {

@@ -30,7 +30,7 @@ use gpq_proto::gpq::v1::{
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
-use crate::admission::{AdmissionError, AdmissionRequest, AliasTarget};
+use crate::admission::{AdmissionError, AdmissionRequest, AdmissionTarget};
 use crate::db::artifacts::ArtifactRow;
 use crate::db::generations::GenerationRow;
 use crate::events::GenerationEvent;
@@ -101,6 +101,9 @@ fn admission_error(err: AdmissionError) -> ConnectError {
         AdmissionError::UnknownAlias => ConnectError::new(ErrorCode::NotFound, "alias not found"),
         AdmissionError::InvalidInput(message) => {
             ConnectError::new(ErrorCode::InvalidArgument, message)
+        }
+        AdmissionError::PromptIdConflict => {
+            ConnectError::new(ErrorCode::AlreadyExists, "Comfy prompt id already exists")
         }
         AdmissionError::CapacityExceeded => ConnectError::new(
             ErrorCode::ResourceExhausted,
@@ -422,10 +425,9 @@ impl GenerationService for GenerationApi {
                 .and_then(|value| value.to_str().ok()),
         )?;
         let request = request.to_owned_message();
-
-        let alias_target = match request.target {
-            Some(submit_request::Target::ModelAlias(alias)) => AliasTarget::Model(alias),
-            Some(submit_request::Target::WorkflowAlias(alias)) => AliasTarget::Workflow(alias),
+        let target = match request.target {
+            Some(submit_request::Target::ModelAlias(alias)) => AdmissionTarget::Model(alias),
+            Some(submit_request::Target::WorkflowAlias(alias)) => AdmissionTarget::Workflow(alias),
             None => {
                 return Err(invalid(
                     "exactly one of model_alias or workflow_alias is required",
@@ -455,7 +457,7 @@ impl GenerationService for GenerationApi {
         let execution_timeout = crate::native::duration_from_proto(request.execution_timeout);
 
         let admission_request = AdmissionRequest {
-            alias_target,
+            target,
             parameters,
             input_artifact_ids,
             output_placement,

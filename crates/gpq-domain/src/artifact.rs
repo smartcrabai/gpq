@@ -35,6 +35,25 @@ state_enum! {
     }
 }
 
+impl MediaKind {
+    /// Classifies a MIME essence without retaining parameters.
+    #[must_use]
+    pub fn from_mime(mime: &str) -> Self {
+        let essence = mime.split(';').next().unwrap_or(mime).trim();
+        if essence.starts_with("image/") {
+            Self::Image
+        } else if essence.starts_with("video/") {
+            Self::Video
+        } else if essence.starts_with("audio/") {
+            Self::Audio
+        } else if essence.starts_with("text/") {
+            Self::Text
+        } else {
+            Self::Binary
+        }
+    }
+}
+
 state_enum! {
     /// Where an Artifact's bytes live.
     ///
@@ -207,5 +226,18 @@ mod tests {
                 Ok(*placement)
             );
         }
+    }
+
+    #[test]
+    fn mime_classification_ignores_parameters_and_preserves_media_family() {
+        assert_eq!(
+            MediaKind::from_mime("video/mp4; codecs=h264"),
+            MediaKind::Video
+        );
+        assert_eq!(MediaKind::from_mime("audio/flac"), MediaKind::Audio);
+        assert_eq!(
+            MediaKind::from_mime("application/octet-stream"),
+            MediaKind::Binary
+        );
     }
 }

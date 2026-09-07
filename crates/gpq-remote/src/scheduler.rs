@@ -413,7 +413,7 @@ async fn build_lease_assignment(
     // stay unset rather than default-constructed, or the Worker would try to
     // revalidate an empty manifest (ADR 0007 keeps the two targets distinct).
     let resolved_workflow = match target {
-        ExecutionTarget::Model { .. } => None,
+        ExecutionTarget::Model { .. } | ExecutionTarget::ComfyPrompt { .. } => None,
         ExecutionTarget::Workflow { version } => {
             let Some(resolved) =
                 crate::db::catalog::get_workflow_version_row(conn, tenant, version).await?
@@ -429,10 +429,22 @@ async fn build_lease_assignment(
     let (model_sha256, workflow_sha256, workflow_graph, workflow_manifest) =
         lease_target_fields(target, resolved_workflow)?;
 
-    let parameters: buffa_types::google::protobuf::Struct =
-        serde_json::from_value(generation.parameters.clone()).map_err(|error| {
-            anyhow::anyhow!("generation parameters is not a JSON object: {error}")
-        })?;
+    let (parameters, comfy_prompt_json, comfy_prompt_sha256) = match target {
+        ExecutionTarget::ComfyPrompt { version } => {
+            let bytes = serde_json::to_vec(&generation.parameters)?;
+            if bytes.len() > 2 * 1024 * 1024 {
+                anyhow::bail!("raw ComfyUI prompt exceeds the 2 MiB limit");
+            }
+            (MessageField::none(), bytes, version.to_hex())
+        }
+        ExecutionTarget::Model { .. } | ExecutionTarget::Workflow { .. } => {
+            let parameters: buffa_types::google::protobuf::Struct =
+                serde_json::from_value(generation.parameters.clone()).map_err(|error| {
+                    anyhow::anyhow!("generation parameters is not a JSON object: {error}")
+                })?;
+            (parameters.into(), Vec::new(), String::new())
+        }
+    };
 
     let mut inputs = Vec::new();
     for row in crate::db::artifacts::list_inputs(conn, tenant, generation.generation_id()).await? {
@@ -482,7 +494,7 @@ async fn build_lease_assignment(
         workflow_sha256,
         workflow_graph: workflow_graph.map_or_else(MessageField::none, MessageField::some),
         workflow_manifest: workflow_manifest.map_or_else(MessageField::none, MessageField::some),
-        parameters: parameters.into(),
+        parameters,
         inputs,
         output_placement: proto_artifact_placement(output_placement).into(),
         output_upload_url,
@@ -492,6 +504,8 @@ async fn build_lease_assignment(
         lease_expires_at: buffa_types::google::protobuf::Timestamp::from(attempt.lease_expires_at)
             .into(),
         stream_tokens: generation.stream_tokens,
+        comfy_prompt_json,
+        comfy_prompt_sha256,
         ..Default::default()
     })
 }
@@ -520,6 +534,12 @@ fn lease_target_fields(
 )> {
     match target {
         ExecutionTarget::Model { version } => Ok((version.to_hex(), String::new(), None, None)),
+        ExecutionTarget::ComfyPrompt { .. } => {
+            if resolved_workflow.is_some() {
+                anyhow::bail!("raw ComfyUI prompt unexpectedly carried a workflow version");
+            }
+            Ok((String::new(), String::new(), None, None))
+        }
         ExecutionTarget::Workflow { version } => {
             let Some((graph_value, manifest, limits)) = resolved_workflow else {
                 anyhow::bail!(
@@ -550,6 +570,7 @@ fn proto_modality(modality: gpq_domain::Modality) -> pb::Modality {
         gpq_domain::Modality::Image => pb::Modality::Image,
         gpq_domain::Modality::Video => pb::Modality::Video,
         gpq_domain::Modality::Music => pb::Modality::Music,
+        gpq_domain::Modality::Comfy => pb::Modality::Comfy,
     }
 }
 
@@ -627,6 +648,10 @@ mod tests {
         assert_eq!(
             proto_modality(gpq_domain::Modality::Music),
             pb::Modality::Music
+        );
+        assert_eq!(
+            proto_modality(gpq_domain::Modality::Comfy),
+            pb::Modality::Comfy
         );
     }
 
@@ -728,6 +753,7 @@ mod tests {
             custom_nodes: std::collections::BTreeMap::new(),
             resident_model: None,
             accelerator_memory_bytes: None,
+            supports_comfy_prompt: false,
             incapable_versions: std::collections::BTreeSet::new(),
         }
     }

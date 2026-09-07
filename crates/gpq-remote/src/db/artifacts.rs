@@ -79,6 +79,8 @@ pub struct ArtifactRow {
     pub worker_id: Option<WorkerId>,
     /// Opaque token authenticating a resumable Worker-local delivery.
     pub delivery_token: Option<String>,
+    /// RFC6901 pointers into raw `ComfyUI` history outputs, when applicable.
+    pub comfy_output_pointers: Vec<String>,
     /// Bytes already accepted by a resumable transfer.
     pub committed_offset: u64,
 }
@@ -113,6 +115,7 @@ impl FromRow<'_, PgRow> for ArtifactRow {
         let worker_id: Option<Uuid> = row.try_get("worker_id")?;
         let delivery_token: Option<String> = row.try_get("delivery_token")?;
         let committed_offset: i64 = row.try_get("committed_offset")?;
+        let comfy_output_pointers: Vec<String> = row.try_get("comfy_output_pointers")?;
 
         Ok(Self {
             id: ArtifactId::from_uuid(id),
@@ -128,6 +131,7 @@ impl FromRow<'_, PgRow> for ArtifactRow {
             object_key,
             worker_id: worker_id.map(WorkerId::from_uuid),
             delivery_token,
+            comfy_output_pointers,
             committed_offset: decode_u64(committed_offset)?,
         })
     }
@@ -242,6 +246,7 @@ pub async fn record_output(
     placement: ArtifactPlacement,
     object_key: Option<&str>,
     delivery_token: Option<&str>,
+    comfy_output_pointers: &[String],
 ) -> sqlx::Result<ArtifactRow> {
     let id = ArtifactId::new();
     let size_bytes = i64::try_from(manifest.size_bytes)
@@ -251,11 +256,11 @@ pub async fn record_output(
         "INSERT INTO artifacts (
             tenant_id, id, generation_id, attempt_id, direction, state, placement,
             size_bytes, digest_sha256, kind, mime_type, object_key, worker_id, delivery_token,
-            available_at, expires_at
+            comfy_output_pointers, available_at, expires_at
         ) VALUES (
             $1, $2, $3, $4, 'output', 'available', $5,
-            $6, $7, $8, $9, $10, $11, $12,
-            now(), now() + make_interval(secs => $13)
+            $6, $7, $8, $9, $10, $11, $12, $13,
+            now(), now() + make_interval(secs => $14)
         )
         RETURNING *",
     )
@@ -271,6 +276,7 @@ pub async fn record_output(
     .bind(object_key)
     .bind(worker.map(|w| w.as_uuid()))
     .bind(delivery_token)
+    .bind(comfy_output_pointers)
     .bind(ttl_seconds)
     .fetch_one(conn)
     .await

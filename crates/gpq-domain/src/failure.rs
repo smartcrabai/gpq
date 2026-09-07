@@ -18,7 +18,7 @@ state_enum! {
         InvalidInput => "invalid_input",
         /// The backend cannot do what the Generation asks for.
         UnsupportedCapability => "unsupported_capability",
-        /// The pinned Model Version is not present on the executing Worker.
+        /// A required model is unavailable to the executing backend.
         ModelUnavailable => "model_unavailable",
         /// The runtime ran out of accelerator memory for this candidate.
         OutOfMemory => "out_of_memory",
@@ -57,8 +57,8 @@ impl FailureKind {
 
     /// Whether the failure invalidates the executing Slot's claimed capability.
     ///
-    /// A runtime OOM proves the Slot cannot host this Model or Workflow, so that
-    /// Slot is marked incapable and the retry must look elsewhere (ADR 0003).
+    /// A runtime OOM proves the Slot cannot host this target, so that Slot is
+    /// marked incapable and the retry must look elsewhere (ADR 0003).
     #[must_use]
     pub const fn invalidates_slot_capability(&self) -> bool {
         matches!(self, Self::OutOfMemory)

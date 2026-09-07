@@ -22,7 +22,7 @@
 //!   `POST /interrupt` before reporting `execution_interrupted` (ADR 0003).
 //! - Anything else runs to completion: `execution_start`, `executing`, a
 //!   handful of `progress` frames, `executed` naming a real served image,
-//!   and `execution_success`.
+//!   and the official `executing`/`node: null` completion marker.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -50,6 +50,11 @@ pub const IMAGE_BYTES: &[u8] = &[
     b'D', 0xAE, 0x42, 0x60, 0x82,
 ];
 
+/// Bytes returned for the raw video fixture.
+pub const VIDEO_BYTES: &[u8] = b"fake-video-bytes";
+/// Bytes returned for the raw audio fixture.
+pub const AUDIO_BYTES: &[u8] = b"fake-audio-bytes";
+
 /// The checkpoint filename a `CheckpointLoaderSimple` node must name to pass
 /// `/prompt` validation; anything else fails the way real `ComfyUI` rejects
 /// an unresolved checkpoint (ADR 0012).
@@ -63,6 +68,11 @@ pub const OUTPUT_NAME: &str = "images";
 /// A graph node `class_type` this fake treats as "accept `/prompt`, then
 /// fail execution with an out-of-memory `execution_error`" (ADR 0003).
 pub const OOM_NODE_CLASS: &str = "OOMTrigger";
+
+/// Raw fixture filenames used by the mixed-output fake.
+pub const RAW_IMAGE_FILENAME: &str = "raw-image.png";
+pub const RAW_VIDEO_FILENAME: &str = "raw-video.mp4";
+pub const RAW_AUDIO_FILENAME: &str = "raw-audio.flac";
 /// A graph node `class_type` this fake treats as "accept `/prompt`, start
 /// executing, then wait indefinitely for `POST /interrupt`" (ADR 0003).
 pub const HANG_NODE_CLASS: &str = "HangUntilInterrupted";
@@ -143,11 +153,13 @@ enum Scenario {
     Success,
     Oom,
     Hang,
+    Raw,
 }
 
 struct PromptRecord {
     client_id: String,
     scenario: Scenario,
+    graph: Value,
     interrupt: Arc<Notify>,
 }
 
@@ -236,13 +248,20 @@ impl FakeComfy {
         lock(&self.inner).ws_clients.remove(client_id);
     }
 
-    fn register_prompt(&self, prompt_id: String, client_id: String, scenario: Scenario) {
+    fn register_prompt(
+        &self,
+        prompt_id: String,
+        client_id: String,
+        scenario: Scenario,
+        graph: Value,
+    ) {
         let notify = Arc::new(Notify::new());
         lock(&self.inner).prompts.insert(
             prompt_id,
             PromptRecord {
                 client_id,
                 scenario,
+                graph,
                 interrupt: notify,
             },
         );
@@ -261,6 +280,24 @@ impl FakeComfy {
         entry["outputs"][node] = output;
     }
 
+    fn record_raw_history(
+        &self,
+        prompt_id: &str,
+        graph: &Value,
+        outputs: &Value,
+        output_node_ids: &[String],
+        client_id: &str,
+    ) {
+        let mut inner = lock(&self.inner);
+        inner.history.insert(
+            prompt_id.to_owned(),
+            json!({
+                "prompt": [0, client_id, graph, {}, output_node_ids],
+                "outputs": outputs,
+            }),
+        );
+    }
+
     fn history_snapshot(&self, prompt_id: &str) -> Option<Value> {
         lock(&self.inner).history.get(prompt_id).cloned()
     }
@@ -274,18 +311,19 @@ impl FakeComfy {
             .map(|record| record.interrupt.clone())
     }
 
-    fn prompt_context(&self, prompt_id: &str) -> Option<(String, Scenario, Arc<Notify>)> {
+    fn prompt_context(&self, prompt_id: &str) -> Option<(String, Scenario, Value, Arc<Notify>)> {
         lock(&self.inner).prompts.get(prompt_id).map(|record| {
             (
                 record.client_id.clone(),
                 record.scenario,
+                record.graph.clone(),
                 record.interrupt.clone(),
             )
         })
     }
 
     fn spawn_driver(&self, prompt_id: String) {
-        let Some((client_id, scenario, interrupt)) = self.prompt_context(&prompt_id) else {
+        let Some((client_id, scenario, graph, interrupt)) = self.prompt_context(&prompt_id) else {
             return;
         };
         let state = self.clone();
@@ -300,6 +338,30 @@ impl FakeComfy {
                 event("executing", &json!({"prompt_id": prompt_id, "node": "1"})),
             );
             match scenario {
+                Scenario::Raw => {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    let outputs = json!({
+                        "node/one~two": {
+                            "images": [
+                                {"filename": RAW_IMAGE_FILENAME, "subfolder": "", "type": "output", "label": "image"},
+                                {"filename": RAW_VIDEO_FILENAME, "subfolder": "", "type": "output", "label": "video"}
+                            ]
+                        },
+                        "audio/key~name": {
+                            "audio/custom": [
+                                {"filename": "raw-audio.flac", "subfolder": "nested", "type": "output", "label": "audio"},
+                                {"filename": RAW_IMAGE_FILENAME, "subfolder": "", "type": "output", "label": "duplicate"}
+                            ]
+                        }
+                    });
+                    let node_ids = vec!["node/one~two".to_owned(), "audio/key~name".to_owned()];
+                    state.send_to_client(
+                        &client_id,
+                        event("execution_success", &json!({"prompt_id": prompt_id})),
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    state.record_raw_history(&prompt_id, &graph, &outputs, &node_ids, &client_id);
+                }
                 Scenario::Success => {
                     for step in 1..=PROGRESS_STEPS {
                         tokio::time::sleep(STEP_DELAY).await;
@@ -322,7 +384,7 @@ impl FakeComfy {
                     );
                     state.send_to_client(
                         &client_id,
-                        event("execution_success", &json!({"prompt_id": prompt_id})),
+                        event("executing", &json!({"prompt_id": prompt_id, "node": null})),
                     );
                 }
                 Scenario::Oom => {
@@ -369,24 +431,26 @@ async fn system_stats() -> Json<Value> {
     }))
 }
 
-/// Every node class this fake understands, all reported with the core
-/// `"nodes"` `python_module` so none of them is ever derived as an
-/// installed custom-node package (ADR 0007, ADR 0018): every
-/// `required_custom_nodes` entry this suite exercises is genuinely absent.
+/// Every node class this fake understands, including one operator-configured
+/// custom-node package used by the positive capability test (ADR 0007, ADR
+/// 0018).
 async fn object_info() -> Json<Value> {
     let classes = [
-        "CheckpointLoaderSimple",
-        "SaveImage",
-        OOM_NODE_CLASS,
-        HANG_NODE_CLASS,
+        ("CheckpointLoaderSimple", "nodes"),
+        ("SaveImage", "nodes"),
+        (OOM_NODE_CLASS, "nodes"),
+        (HANG_NODE_CLASS, "nodes"),
+        ("CustomSomePack", "custom_nodes.SomePack.nodes"),
     ];
     let mut map = Map::new();
-    for class_type in classes {
-        map.insert(class_type.to_owned(), json!({"python_module": "nodes"}));
+    for (class_type, python_module) in classes {
+        map.insert(
+            class_type.to_owned(),
+            json!({"python_module": python_module}),
+        );
     }
     Json(Value::Object(map))
 }
-
 async fn history_probe() -> Json<Value> {
     Json(json!({}))
 }
@@ -395,16 +459,25 @@ async fn history_by_id(
     State(state): State<FakeComfy>,
     Path(prompt_id): Path<String>,
 ) -> Json<Value> {
-    let entry = state
-        .history_snapshot(&prompt_id)
-        .unwrap_or_else(|| json!({"outputs": {}}));
+    let Some(entry) = state.history_snapshot(&prompt_id) else {
+        return Json(json!({}));
+    };
     let mut body = Map::new();
     body.insert(prompt_id, entry);
     Json(Value::Object(body))
 }
 
-async fn view() -> Response {
-    ([(header::CONTENT_TYPE, "image/png")], IMAGE_BYTES).into_response()
+async fn view(Query(params): Query<HashMap<String, String>>) -> Response {
+    let filename = params
+        .get("filename")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let (mime, bytes): (&str, &[u8]) = match filename {
+        RAW_VIDEO_FILENAME => ("video/mp4", VIDEO_BYTES),
+        RAW_AUDIO_FILENAME => ("audio/flac", AUDIO_BYTES),
+        _ => ("image/png", IMAGE_BYTES),
+    };
+    ([(header::CONTENT_TYPE, mime)], bytes).into_response()
 }
 
 fn checkpoint_name(graph: &Map<String, Value>) -> Option<String> {
@@ -477,7 +550,15 @@ async fn prompt(State(state): State<FakeComfy>, Json(body): Json<Value>) -> Resp
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let scenario = if has_node_class(graph, OOM_NODE_CLASS) {
+    let scenario = if obj.contains_key("extra_data") {
+        if has_node_class(graph, OOM_NODE_CLASS) {
+            Scenario::Oom
+        } else if has_node_class(graph, HANG_NODE_CLASS) {
+            Scenario::Hang
+        } else {
+            Scenario::Raw
+        }
+    } else if has_node_class(graph, OOM_NODE_CLASS) {
         Scenario::Oom
     } else if has_node_class(graph, HANG_NODE_CLASS) {
         Scenario::Hang
@@ -485,7 +566,8 @@ async fn prompt(State(state): State<FakeComfy>, Json(body): Json<Value>) -> Resp
         Scenario::Success
     };
     let prompt_id = Uuid::now_v7().to_string();
-    state.register_prompt(prompt_id.clone(), client_id, scenario);
+    let graph_value = Value::Object(graph.clone());
+    state.register_prompt(prompt_id.clone(), client_id, scenario, graph_value);
     state.spawn_driver(prompt_id.clone());
     Json(json!({"prompt_id": prompt_id, "number": 0, "node_errors": {}})).into_response()
 }

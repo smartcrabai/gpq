@@ -1,7 +1,8 @@
 //! GPU-utilization-first scheduling order (ADR 0002).
 //!
-//! Selection excludes Generations incompatible with the Tenant, the exact Model
-//! and Workflow Versions, or available Slot capacity. It then chooses overdue
+//! Selection excludes Generations incompatible with the Tenant, exact Model or
+//! Workflow Versions, raw `ComfyUI` prompt hashes, or available Slot capacity. It
+//! then chooses overdue
 //! work by oldest `created_at`; otherwise it favors the Slot's resident Model
 //! and compatible batches, then higher priority, then older submission time.
 //! Running Attempts are never preempted, so this module only ever picks from
@@ -174,6 +175,7 @@ mod tests {
                     custom_nodes: BTreeMap::new(),
                     resident_model: Some(hash(b"a")),
                     accelerator_memory_bytes: None,
+                    supports_comfy_prompt: false,
                     incapable_versions: BTreeSet::new(),
                 },
                 now: DateTime::from_timestamp_secs(1_700_000_000).unwrap_or_else(Utc::now),

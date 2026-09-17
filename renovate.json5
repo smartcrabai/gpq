@@ -3,6 +3,14 @@
     "config:best-practices"
   ],
   dependencyDashboard: false,
+  // Scan the central source file for Renovate only in the terraforms repository
+  // (additive, so the default patterns are still kept; this path does not
+  // exist in the distribution target repositories).
+  "github-actions": {
+    managerFilePatterns: [
+      "/(^|/)environments/shared/cruise/workflow\\.yml$/"
+    ],
+  },
   minimumReleaseAge: "3 days",
   lockFileMaintenance: {
     minimumReleaseAge: null,
@@ -22,23 +30,31 @@
       groupSlug: "all-minor-patch-digest-updates",
     },
     {
+      matchUpdateTypes: [
+        "major"
+      ],
+      prBodyNotes: [
+        "<!-- renovate-major-update -->"
+      ],
+    },
+    {
       matchManagers: [
         "github-actions"
       ],
       minimumReleaseAge: "7 days"
     },
     {
-      matchPackageNames: [
-        "buffa",
-        "buffa-types"
+      // digest / pinDigest は releaseTimestamp を持たない。minimumReleaseAge を
+      // 課すと minimumReleaseAgeBehaviour の既定値 "timestamp-required" により
+      // 無条件で stabilityStatus=yellow となり、renovate/stability-days が
+      // 恒久的に pending のままマージ不能になる(時間経過では解消しない)。
+      // digest は同一タグの追従であり「リリースからN日」の概念自体が成立しないため除外する。
+      // github-actions ルールを上書きするため、必ず最後に置くこと。
+      matchUpdateTypes: [
+        "digest",
+        "pinDigest"
       ],
-      allowedVersions: "<0.9.0"
-    },
-    {
-      matchPackageNames: [
-        "testcontainers"
-      ],
-      allowedVersions: "<0.28.0"
+      minimumReleaseAge: null,
     }
   ]
 }

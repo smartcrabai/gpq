@@ -118,6 +118,11 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_System_Threading",
 ] }
 
+# 0.15.0 on crates.io still declares testcontainers ^0.27, while the workspace
+# uses 0.28. Use the upstream compatibility fix until it is published.
+[patch.crates-io]
+testcontainers-modules = { git = "https://github.com/testcontainers/testcontainers-rs-modules-community.git", rev = "d69e3a09397532accea9d9e907fecc280b1513a8" }
+
 [workspace.lints.clippy]
 allow_attributes = "deny"
 dbg_macro = "deny"

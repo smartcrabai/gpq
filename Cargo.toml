@@ -43,7 +43,6 @@ connectrpc = { version = "0.9.0", features = [
   "client",
   "json",
   "server",
-  "streaming",
 ] }
 connectrpc-build = "0.9.0"
 futures = "0.3.31"

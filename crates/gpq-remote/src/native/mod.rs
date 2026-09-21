@@ -18,7 +18,7 @@ pub use tenant::TenantApi;
 
 use std::time::Duration;
 
-use buffa::{EnumValue, MessageField};
+use buffa::{EnumValue, Inline, MessageField};
 use buffa_types::google::protobuf::{Duration as ProtoDuration, Timestamp as ProtoTimestamp};
 use chrono::{DateTime, Utc};
 use connectrpc::{ConnectError, ErrorCode, RequestContext};
@@ -213,19 +213,25 @@ pub(crate) fn backend_kind_to_proto(kind: gpq_domain::BackendKind) -> EnumValue<
 }
 
 /// Converts a `std::time::Duration` to a set wire `Duration` field.
-pub(crate) fn duration_to_proto(duration: Duration) -> MessageField<ProtoDuration> {
+pub(crate) fn duration_to_proto(
+    duration: Duration,
+) -> MessageField<ProtoDuration, Inline<ProtoDuration>> {
     MessageField::some(duration.into())
 }
 
 /// Converts a wire `Duration` field to a `std::time::Duration`. `None` when
 /// unset or when the wire value cannot be represented as a (non-negative)
 /// `std::time::Duration`.
-pub(crate) fn duration_from_proto(field: MessageField<ProtoDuration>) -> Option<Duration> {
+pub(crate) fn duration_from_proto(
+    field: MessageField<ProtoDuration, Inline<ProtoDuration>>,
+) -> Option<Duration> {
     Duration::try_from(field.into_option()?).ok()
 }
 
 /// Converts a `chrono::DateTime<Utc>` to a set wire `Timestamp` field.
-pub(crate) fn timestamp_to_proto(instant: DateTime<Utc>) -> MessageField<ProtoTimestamp> {
+pub(crate) fn timestamp_to_proto(
+    instant: DateTime<Utc>,
+) -> MessageField<ProtoTimestamp, Inline<ProtoTimestamp>> {
     MessageField::some(instant.into())
 }
 

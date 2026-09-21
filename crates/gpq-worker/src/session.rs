@@ -21,6 +21,7 @@ use std::sync::Arc;
 use buffa::{EnumValue, MessageField};
 use buffa_types::google::protobuf::Timestamp;
 use chrono::{DateTime, Utc};
+use connectrpc::stream_iter;
 use gpq_domain::{
     AttemptId, ContentHash, FailureKind, HEARTBEAT_INTERVAL, LEASE_TTL, Modality,
     OUTPUT_ARTIFACT_TTL,
@@ -686,7 +687,7 @@ async fn deliver_artifact(request: DeliverRequest, ctx: &SessionCtx) {
             }
         }
     }
-    if let Err(err) = ctx.transfer.deliver_artifact(requests).await {
+    if let Err(err) = ctx.transfer.deliver_artifact(stream_iter(requests)).await {
         tracing::warn!(error = %err, artifact_id = %request.artifact_id, "delivering local artifact to remote failed");
     }
 }

@@ -307,7 +307,8 @@ async fn run_inbound_pump(
             worker_message::Message::AttemptFailure(failure) => {
                 log_on_err(
                     "AttemptFailure",
-                    try_handle_attempt_failure(state, tenant_id, *failure),
+                    // Box the large future so it does not inflate the dispatch loop.
+                    Box::pin(try_handle_attempt_failure(state, tenant_id, *failure)),
                 )
                 .await;
             }

@@ -13,7 +13,7 @@
 
 use std::str::FromStr;
 
-use buffa::MessageField;
+use buffa::{Inline, MessageField};
 use buffa_types::google::protobuf::Timestamp as ProtoTimestamp;
 use chrono::{DateTime, Utc};
 use connectrpc::{ConnectError, ErrorCode, Response, ServiceRequest, ServiceResult, ServiceStream};
@@ -279,7 +279,7 @@ async fn generation_row_to_proto(
 /// Artifact's download path (ADR 0006, ADR 0008).
 fn domain_event_to_proto(
     event: GenerationEvent,
-    emitted_at: MessageField<ProtoTimestamp>,
+    emitted_at: MessageField<ProtoTimestamp, Inline<ProtoTimestamp>>,
 ) -> Option<WireGenerationEvent> {
     let wire_event = match event {
         GenerationEvent::State {

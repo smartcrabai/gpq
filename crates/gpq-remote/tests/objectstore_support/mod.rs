@@ -11,8 +11,8 @@
 use anyhow::Context;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
-use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::minio::MinIO;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -21,6 +21,11 @@ use tokio::sync::Mutex as TokioMutex;
 /// the expiry timestamp without waiting for it, long enough that a slow CI
 /// run never legitimately outlives it mid-test.
 pub const PRESIGN_TTL_SECS: u64 = 120;
+
+// The official minio/minio image is no longer distributed; use the community
+// mirror noted in testcontainers-rs-modules-community#418.
+const MINIO_IMAGE: &str = "pgsty/minio";
+const MINIO_TAG: &str = "RELEASE.2026-08-04T00-00-00Z";
 
 const MINIO_ROOT_USER: &str = "minioadmin";
 const MINIO_ROOT_PASSWORD: &str = "minioadmin";
@@ -48,6 +53,8 @@ impl ObjectStoreFixture {
     /// port cannot be read, or the bucket cannot be created.
     pub async fn start() -> anyhow::Result<Self> {
         let container = MinIO::default()
+            .with_name(MINIO_IMAGE)
+            .with_tag(MINIO_TAG)
             .start()
             .await
             .context("starting the MinIO testcontainer")?;

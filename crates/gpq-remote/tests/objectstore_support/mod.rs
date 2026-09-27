@@ -11,8 +11,8 @@
 use anyhow::Context;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
-use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::minio::MinIO;
 use tokio::sync::Mutex as TokioMutex;
 

@@ -1,4 +1,4 @@
-//! Command-line entry point for `gpq-remote`.
+//! Command-line entry point for `gpq remote`.
 //!
 //! ADR 0016: schema migration and network-facing serving are separate
 //! subcommands using separate `PostgreSQL` credentials. ADR 0009: Tenant and
@@ -6,6 +6,7 @@
 //! from the always-on `serve` process. ADR 0019: `serve` speaks plaintext
 //! HTTP/1.1 and h2c; TLS terminates at an ingress in front of it.
 
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ use crate::state::AppState;
 
 /// GPU Generation Queue coordinator.
 #[derive(Parser)]
-#[command(name = "gpq-remote", about = "GPU Generation Queue coordinator")]
+#[command(name = "gpq remote", about = "GPU Generation Queue coordinator")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -36,7 +37,7 @@ enum Command {
     /// schema-owner connection string rather than the forced-RLS role
     /// `serve` uses.
     Migrate,
-    /// Serves OpenAI-compatible, ComfyUI-compatible, Native, and Worker traffic.
+    /// Serves Native, Catalog, Tenant, and Worker traffic.
     Serve,
     /// Tenant lifecycle and credential administration (ADR 0009).
     Tenant {
@@ -114,7 +115,7 @@ enum WorkerCommand {
     },
 }
 
-/// Parses CLI arguments and dispatches to the selected subcommand.
+/// Parses `args` (program name first) and dispatches to the selected subcommand.
 ///
 /// # Errors
 ///
@@ -127,10 +128,13 @@ enum WorkerCommand {
 /// bound, or the HTTP server itself errors; `tenant`/`worker` when required
 /// environment configuration is missing, the database is unreachable, or
 /// the underlying Tenant/Worker/credential operation fails.
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run_cli(args: Vec<OsString>) -> anyhow::Result<()> {
     let _telemetry =
         crate::telemetry::init("gpq-remote").context("failed to initialize telemetry")?;
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(err) => err.exit(),
+    };
     match cli.command {
         Command::Migrate => run_migrate().await,
         Command::Serve => run_serve().await,
@@ -172,7 +176,7 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// off mid-transaction. `abort` remains the fallback if it does not.
 const BACKGROUND_TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Serves OpenAI-compatible, ComfyUI-compatible, Native, and Worker traffic
+/// Serves Native, Catalog, Tenant, and Worker traffic
 /// until a shutdown signal arrives.
 async fn run_serve() -> anyhow::Result<()> {
     let config = Arc::new(RemoteConfig::from_env()?);
@@ -197,13 +201,6 @@ async fn run_serve() -> anyhow::Result<()> {
         scheduler: crate::scheduler::SchedulerHandle::inert(),
         shutdown: shutdown.clone(),
     };
-
-    // ADR 0003: cancel every nonterminal synchronous OpenAI Generation before
-    // accepting Worker sessions, so a lost client connection cannot leave
-    // invisible work running across a restart.
-    crate::expiry::cancel_synchronous_on_startup(&bootstrap)
-        .await
-        .context("failed to cancel nonterminal synchronous Generations on startup")?;
 
     let (scheduler, scheduler_task) = crate::scheduler::spawn(bootstrap.clone());
     let state = AppState {

@@ -1,11 +1,16 @@
 //! Persistence for Artifacts (ADR 0008).
 //!
 //! Every row mirrors the `artifacts` table from `migrations/0001_initial.sql`
+//! (and the `content` column added by `migrations/0008_native_cutover.sql`)
 //! and is scoped by `tenant_id` under Postgres RLS (ADR 0011). Mutations that
 //! change `state` go through [`set_state`], which enforces
 //! [`gpq_domain::ArtifactState::can_transition_to`] before writing, or through
 //! the dedicated [`begin_delivery`] compare-and-swap for the one legal edge
 //! the one-shot download route drives directly.
+//!
+//! Queries spell out their column lists rather than `SELECT *`: `content` holds
+//! the bytes of a `remote_local` input and is only ever read in bounded slices
+//! by [`remote_local_chunk`], never as part of an [`ArtifactRow`].
 
 use chrono::{DateTime, Utc};
 use gpq_domain::{
@@ -56,11 +61,11 @@ impl std::str::FromStr for ArtifactDirection {
     }
 }
 
-/// One persisted Artifact row. `tenant_id`, `generation_id`, `attempt_id`,
-/// and the row's timestamps are RLS/query-scoping concerns the caller
-/// already knows before fetching a row (it supplied `tenant`/`generation`/
-/// `attempt` to find it), so they are not carried here — only the fields
-/// actual callers read after the fetch are.
+/// One persisted Artifact row, without its bytes. `tenant_id`, `generation_id`,
+/// `attempt_id`, and the row's timestamps are RLS/query-scoping concerns the
+/// caller already knows before fetching a row (it supplied `tenant`/
+/// `generation`/`attempt` to find it), so they are not carried here — only the
+/// fields actual callers read after the fetch are.
 #[derive(Clone, Debug)]
 pub struct ArtifactRow {
     /// Primary key.
@@ -79,8 +84,6 @@ pub struct ArtifactRow {
     pub worker_id: Option<WorkerId>,
     /// Opaque token authenticating a resumable Worker-local delivery.
     pub delivery_token: Option<String>,
-    /// RFC6901 pointers into raw `ComfyUI` history outputs, when applicable.
-    pub comfy_output_pointers: Vec<String>,
     /// Bytes already accepted by a resumable transfer.
     pub committed_offset: u64,
 }
@@ -115,7 +118,6 @@ impl FromRow<'_, PgRow> for ArtifactRow {
         let worker_id: Option<Uuid> = row.try_get("worker_id")?;
         let delivery_token: Option<String> = row.try_get("delivery_token")?;
         let committed_offset: i64 = row.try_get("committed_offset")?;
-        let comfy_output_pointers: Vec<String> = row.try_get("comfy_output_pointers")?;
 
         Ok(Self {
             id: ArtifactId::from_uuid(id),
@@ -131,7 +133,6 @@ impl FromRow<'_, PgRow> for ArtifactRow {
             object_key,
             worker_id: worker_id.map(WorkerId::from_uuid),
             delivery_token,
-            comfy_output_pointers,
             committed_offset: decode_u64(committed_offset)?,
         })
     }
@@ -155,10 +156,9 @@ pub enum ArtifactStoreError {
 }
 
 /// Creates a `pending` input Artifact row ahead of its transfer. `object_key`
-/// is required when `placement` is `ObjectStore` and ignored otherwise; the
-/// caller chooses the key (it need not relate to the returned [`ArtifactId`],
-/// which this function generates). The row is linked to a Generation later,
-/// when one is submitted referencing it.
+/// is required when `placement` is `ObjectStore` and ignored otherwise. The
+/// row receives a one-hour database-clock TTL and is linked to a Generation
+/// only after the requested input is ready.
 ///
 /// # Errors
 /// Returns [`sqlx::Error::Decode`] if `manifest.size_bytes` overflows
@@ -176,9 +176,10 @@ pub async fn create_input(
     sqlx::query_as::<_, ArtifactRow>(
         "INSERT INTO artifacts (
             tenant_id, id, direction, state, placement,
-            size_bytes, digest_sha256, kind, mime_type, object_key
-        ) VALUES ($1, $2, 'input', 'pending', $3, $4, $5, $6, $7, $8)
-        RETURNING *",
+            size_bytes, digest_sha256, kind, mime_type, object_key, expires_at
+        ) VALUES ($1, $2, 'input', 'pending', $3, $4, $5, $6, $7, $8, now() + interval '1 hour')
+        RETURNING id, direction, state, placement, size_bytes, digest_sha256, kind,
+                  mime_type, object_key, worker_id, delivery_token, committed_offset",
     )
     .bind(tenant.as_uuid())
     .bind(id.as_uuid())
@@ -191,28 +192,124 @@ pub async fn create_input(
     .fetch_one(conn)
     .await
 }
+/// Reads a bounded `remote_local` input chunk only while the assigned Worker
+/// still owns an unexpired live Attempt linked to this Artifact.
+///
+/// # Errors
+/// Returns [`sqlx::Error::Decode`] if `offset + 1` or either PostgreSQL `int4`
+/// position/length conversion overflows; returns [`sqlx::Error`] if the query
+/// fails. Missing, unavailable, or unauthorized chunks return `None`.
+pub async fn remote_local_chunk(
+    conn: &mut PgConnection,
+    tenant: TenantId,
+    attempt: AttemptId,
+    worker: WorkerId,
+    id: ArtifactId,
+    offset: u64,
+    max_len: u64,
+) -> sqlx::Result<Option<Vec<u8>>> {
+    let offset = offset
+        .checked_add(1)
+        .ok_or_else(|| sqlx::Error::Decode("remote-local input offset overflow".into()))?;
+    let offset =
+        i32::try_from(offset).map_err(|err| sqlx::Error::Decode(err.to_string().into()))?;
+    let max_len =
+        i32::try_from(max_len).map_err(|err| sqlx::Error::Decode(err.to_string().into()))?;
+    // PostgreSQL bytea substring uses one-based int4 positions and lengths.
+    // Recheck authorization with database time for every chunk.
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT substring(a.content FROM $5 FOR $6) FROM artifacts a
+         WHERE a.tenant_id = $1 AND a.id = $2 AND a.direction = 'input'
+           AND a.placement = 'remote_local' AND a.state = 'available'
+           AND a.content IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM attempts t
+               WHERE t.tenant_id = a.tenant_id AND t.id = $3
+                 AND t.generation_id = a.generation_id AND t.worker_id = $4
+                 AND t.state IN ('leased', 'running')
+                 AND t.lease_expires_at > statement_timestamp()
+                 AND EXISTS (
+                     SELECT 1 FROM workers w
+                     WHERE w.tenant_id = t.tenant_id AND w.id = t.worker_id
+                       AND w.revoked_at IS NULL
+                 )
+           )",
+    )
+    .bind(tenant.as_uuid())
+    .bind(id.as_uuid())
+    .bind(attempt.as_uuid())
+    .bind(worker.as_uuid())
+    .bind(offset)
+    .bind(max_len)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.map(|(bytes,)| bytes))
+}
 
-/// Creates an already-`available` input Artifact for bytes relayed inline
-/// through a connected request (ADR 0008: synchronous `OpenAI` image relay).
-/// The bytes themselves are never persisted; only the manifest is recorded.
+/// Fetches an input Artifact if it belongs to the Generation of a live,
+/// unexpired Attempt held by `worker`; stale, settled, expired, or unowned
+/// attempts are intentionally indistinguishable from a missing artifact.
+///
+/// # Errors
+/// Returns [`sqlx::Error`] if the query fails. Stale, settled, expired, or
+/// unowned attempts, and artifacts that do not match the query, return `None`.
+pub async fn attempt_input(
+    conn: &mut PgConnection,
+    tenant: TenantId,
+    attempt: AttemptId,
+    worker: WorkerId,
+    artifact: ArtifactId,
+) -> sqlx::Result<Option<ArtifactRow>> {
+    sqlx::query_as::<_, ArtifactRow>(
+        "SELECT a.id, a.direction, a.state, a.placement, a.size_bytes, a.digest_sha256, a.kind,
+                a.mime_type, a.object_key, a.worker_id, a.delivery_token, a.committed_offset
+         FROM artifacts a
+         WHERE a.tenant_id = $1 AND a.id = $2 AND a.direction = 'input'
+           AND EXISTS (
+               SELECT 1 FROM attempts t
+               WHERE t.tenant_id = a.tenant_id AND t.id = $3
+                 AND t.generation_id = a.generation_id AND t.worker_id = $4
+                 AND t.state IN ('leased', 'running')
+                 AND t.lease_expires_at > statement_timestamp()
+                 AND EXISTS (
+                     SELECT 1 FROM workers w
+                     WHERE w.tenant_id = t.tenant_id AND w.id = t.worker_id
+                       AND w.revoked_at IS NULL
+                 )
+           )",
+    )
+    .bind(tenant.as_uuid())
+    .bind(artifact.as_uuid())
+    .bind(attempt.as_uuid())
+    .bind(worker.as_uuid())
+    .fetch_optional(conn)
+    .await
+}
+
+/// Creates a `pending` input Artifact whose bytes Remote stores itself
+/// (`remote_local` placement). The bytes arrive via
+/// [`set_remote_local_content`]; the row expires one hour after creation if
+/// they never do.
 ///
 /// # Errors
 /// Returns [`sqlx::Error::Decode`] if `manifest.size_bytes` overflows
 /// `i64`, or [`sqlx::Error`] if the insert fails (e.g. connection loss).
-pub async fn create_inline_input(
+pub async fn create_remote_local_input(
     conn: &mut PgConnection,
     tenant: TenantId,
     manifest: &ArtifactManifest,
-) -> sqlx::Result<ArtifactRow> {
+) -> sqlx::Result<(ArtifactRow, DateTime<Utc>)> {
     let id = ArtifactId::new();
     let size_bytes = i64::try_from(manifest.size_bytes)
         .map_err(|err| sqlx::Error::Decode(err.to_string().into()))?;
-    sqlx::query_as::<_, ArtifactRow>(
+    // The expiry is stamped by the database clock, the single time source for
+    // Artifact TTLs, and returned so callers never recompute it locally.
+    let (expires_at,): (DateTime<Utc>,) = sqlx::query_as(
         "INSERT INTO artifacts (
             tenant_id, id, direction, state, placement,
-            size_bytes, digest_sha256, kind, mime_type, available_at
-        ) VALUES ($1, $2, 'input', 'available', 'inline_relay', $3, $4, $5, $6, now())
-        RETURNING *",
+            size_bytes, digest_sha256, kind, mime_type, expires_at
+        ) VALUES ($1, $2, 'input', 'pending', 'remote_local', $3, $4, $5, $6, now() + interval '1 hour')
+        RETURNING expires_at",
     )
     .bind(tenant.as_uuid())
     .bind(id.as_uuid())
@@ -220,8 +317,54 @@ pub async fn create_inline_input(
     .bind(manifest.digest.to_string())
     .bind(manifest.kind.as_str())
     .bind(&manifest.mime_type)
-    .fetch_one(conn)
-    .await
+    .fetch_one(&mut *conn)
+    .await?;
+    let row = get(conn, tenant, id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+    Ok((row, expires_at))
+}
+
+/// Stores the verified bytes of a pending `remote_local` input and marks it
+/// `available`, expiring one hour from now unless a Generation claims it first.
+/// The caller verifies size and SHA-256 against the stored manifest before
+/// calling; this function only enforces the state guard.
+///
+/// # Errors
+/// Returns [`ArtifactStoreError::NotFound`] if no Artifact exists for
+/// `tenant`/`id`, [`ArtifactStoreError::Conflict`] if the row is no longer a
+/// pending `remote_local` input or has already expired, or
+/// [`ArtifactStoreError::Sql`] on any other database failure.
+pub async fn set_remote_local_content(
+    conn: &mut PgConnection,
+    tenant: TenantId,
+    id: ArtifactId,
+    bytes: &[u8],
+) -> Result<ArtifactRow, ArtifactStoreError> {
+    let result = sqlx::query(
+        "UPDATE artifacts SET
+            content = $1,
+            state = 'available',
+            available_at = now(),
+            expires_at = now() + interval '1 hour'
+         WHERE tenant_id = $2 AND id = $3
+           AND direction = 'input' AND placement = 'remote_local'
+           AND state = 'pending' AND expires_at > statement_timestamp()",
+    )
+    .bind(bytes)
+    .bind(tenant.as_uuid())
+    .bind(id.as_uuid())
+    .execute(&mut *conn)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(match get(conn, tenant, id).await? {
+            None => ArtifactStoreError::NotFound,
+            Some(_) => ArtifactStoreError::Conflict,
+        });
+    }
+    get(conn, tenant, id)
+        .await?
+        .ok_or(ArtifactStoreError::NotFound)
 }
 
 /// Records a completed output Artifact as `available`, expiring one hour
@@ -246,7 +389,6 @@ pub async fn record_output(
     placement: ArtifactPlacement,
     object_key: Option<&str>,
     delivery_token: Option<&str>,
-    comfy_output_pointers: &[String],
 ) -> sqlx::Result<ArtifactRow> {
     let id = ArtifactId::new();
     let size_bytes = i64::try_from(manifest.size_bytes)
@@ -256,13 +398,14 @@ pub async fn record_output(
         "INSERT INTO artifacts (
             tenant_id, id, generation_id, attempt_id, direction, state, placement,
             size_bytes, digest_sha256, kind, mime_type, object_key, worker_id, delivery_token,
-            comfy_output_pointers, available_at, expires_at
+            available_at, expires_at
         ) VALUES (
             $1, $2, $3, $4, 'output', 'available', $5,
-            $6, $7, $8, $9, $10, $11, $12, $13,
-            now(), now() + make_interval(secs => $14)
+            $6, $7, $8, $9, $10, $11, $12,
+            now(), now() + make_interval(secs => $13)
         )
-        RETURNING *",
+        RETURNING id, direction, state, placement, size_bytes, digest_sha256, kind,
+                  mime_type, object_key, worker_id, delivery_token, committed_offset",
     )
     .bind(tenant.as_uuid())
     .bind(id.as_uuid())
@@ -276,7 +419,6 @@ pub async fn record_output(
     .bind(object_key)
     .bind(worker.map(|w| w.as_uuid()))
     .bind(delivery_token)
-    .bind(comfy_output_pointers)
     .bind(ttl_seconds)
     .fetch_one(conn)
     .await
@@ -292,11 +434,15 @@ pub async fn get(
     tenant: TenantId,
     id: ArtifactId,
 ) -> sqlx::Result<Option<ArtifactRow>> {
-    sqlx::query_as::<_, ArtifactRow>("SELECT * FROM artifacts WHERE tenant_id = $1 AND id = $2")
-        .bind(tenant.as_uuid())
-        .bind(id.as_uuid())
-        .fetch_optional(conn)
-        .await
+    sqlx::query_as::<_, ArtifactRow>(
+        "SELECT id, direction, state, placement, size_bytes, digest_sha256, kind,
+                mime_type, object_key, worker_id, delivery_token, committed_offset
+         FROM artifacts WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(id.as_uuid())
+    .fetch_optional(conn)
+    .await
 }
 
 /// Lists just the output Artifacts attached to a Generation, oldest first —
@@ -311,7 +457,9 @@ pub async fn list_outputs(
     generation: GenerationId,
 ) -> sqlx::Result<Vec<ArtifactRow>> {
     sqlx::query_as::<_, ArtifactRow>(
-        "SELECT * FROM artifacts
+        "SELECT id, direction, state, placement, size_bytes, digest_sha256, kind,
+                mime_type, object_key, worker_id, delivery_token, committed_offset
+         FROM artifacts
          WHERE tenant_id = $1 AND generation_id = $2 AND direction = 'output'
          ORDER BY created_at",
     )
@@ -332,7 +480,9 @@ pub async fn list_inputs(
     generation: GenerationId,
 ) -> sqlx::Result<Vec<ArtifactRow>> {
     sqlx::query_as::<_, ArtifactRow>(
-        "SELECT * FROM artifacts
+        "SELECT id, direction, state, placement, size_bytes, digest_sha256, kind,
+                mime_type, object_key, worker_id, delivery_token, committed_offset
+         FROM artifacts
          WHERE tenant_id = $1 AND generation_id = $2 AND direction = 'input'
          ORDER BY created_at",
     )
@@ -345,7 +495,8 @@ pub async fn list_inputs(
 /// Atomically transitions an Artifact's state, rejecting the update outright
 /// when [`ArtifactState::can_transition_to`] disallows it and rejecting it at
 /// the database when the state changed concurrently (compare-and-set on the
-/// previous state).
+/// previous state). Entering a terminal state also drops any stored
+/// `remote_local` bytes.
 ///
 /// # Errors
 /// Returns [`ArtifactStoreError::NotFound`] if no Artifact exists for
@@ -374,7 +525,8 @@ pub async fn set_state(
         "UPDATE artifacts SET
             state = $1,
             available_at = CASE WHEN $2 THEN now() ELSE available_at END,
-            terminated_at = CASE WHEN $3 THEN now() ELSE terminated_at END
+            terminated_at = CASE WHEN $3 THEN now() ELSE terminated_at END,
+            content = CASE WHEN $3 THEN NULL ELSE content END
          WHERE tenant_id = $4 AND id = $5 AND state = $6",
     )
     .bind(to.as_str())
@@ -394,28 +546,49 @@ pub async fn set_state(
         .ok_or(ArtifactStoreError::NotFound)
 }
 
-/// Compare-and-swaps an Artifact from `available` to `delivering`. Returns
-/// `false` (rather than an error) when it was not `available` — the caller
-/// distinguishes "already delivering" from "terminal" by re-reading the row.
+/// Compare-and-swaps an unexpired, available output Artifact to `delivering`.
+/// Expiry is checked against the database clock rather than the periodic sweep.
 ///
 /// # Errors
-/// Returns [`sqlx::Error`] if the update fails (e.g. connection lost).
-/// Losing the `available` → `delivering` race is not an error: it returns
-/// `Ok(false)`, and the caller must re-read the row to tell "already
-/// delivering" apart from a terminal state.
+/// Returns [`sqlx::Error`] if the update fails (e.g. connection loss).
 pub async fn begin_delivery(
     conn: &mut PgConnection,
     tenant: TenantId,
     id: ArtifactId,
 ) -> sqlx::Result<bool> {
     let result = sqlx::query(
-        "UPDATE artifacts SET state = 'delivering' WHERE tenant_id = $1 AND id = $2 AND state = 'available'",
+        "UPDATE artifacts SET state = 'delivering'
+         WHERE tenant_id = $1 AND id = $2 AND state = 'available'
+           AND expires_at > statement_timestamp()",
     )
     .bind(tenant.as_uuid())
     .bind(id.as_uuid())
     .execute(conn)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Whether a failed acquisition was due to a database TTL that elapsed before
+/// the periodic sweep.
+///
+/// # Errors
+/// Returns [`sqlx::Error`] if the query fails.
+pub async fn delivery_expired(
+    conn: &mut PgConnection,
+    tenant: TenantId,
+    id: ArtifactId,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM artifacts
+            WHERE tenant_id = $1 AND id = $2 AND state = 'available'
+              AND (expires_at IS NULL OR expires_at <= statement_timestamp())
+        )",
+    )
+    .bind(tenant.as_uuid())
+    .bind(id.as_uuid())
+    .fetch_one(conn)
+    .await
 }
 
 /// Records how many bytes of a `delivering` Artifact have been accepted, so
@@ -488,7 +661,8 @@ pub async fn mark_lost(
 /// Deletes every input Artifact attached to a Generation, returning the
 /// deleted rows so the caller can clean up their underlying bytes. Called at
 /// the Generation's terminal transition (ADR 0008: "Inputs are deleted when
-/// the Generation terminates").
+/// the Generation terminates"). A `remote_local` input's bytes are removed
+/// with its row.
 ///
 /// # Errors
 /// Returns [`sqlx::Error`] if the delete fails or a deleted row cannot be
@@ -501,7 +675,8 @@ pub async fn delete_inputs_for_generation(
     sqlx::query_as::<_, ArtifactRow>(
         "DELETE FROM artifacts
          WHERE tenant_id = $1 AND generation_id = $2 AND direction = 'input'
-         RETURNING *",
+         RETURNING id, direction, state, placement, size_bytes, digest_sha256, kind,
+                   mime_type, object_key, worker_id, delivery_token, committed_offset",
     )
     .bind(tenant.as_uuid())
     .bind(generation.as_uuid())
@@ -511,7 +686,8 @@ pub async fn delete_inputs_for_generation(
 
 /// Expires every past-due `pending` or `available` Artifact, returning the
 /// expired rows so the caller can delete their underlying bytes (ADR 0008
-/// keeps the database record but not the bytes).
+/// keeps the database record but not the bytes). Expired rows also drop any
+/// stored `remote_local` content.
 ///
 /// `delivering` rows are deliberately excluded from this sweep: a
 /// Worker-local delivery in progress owns its own terminal transition, and
@@ -538,10 +714,11 @@ pub async fn expire_due(
     now: DateTime<Utc>,
 ) -> sqlx::Result<Vec<ArtifactRow>> {
     sqlx::query_as::<_, ArtifactRow>(
-        "UPDATE artifacts SET state = 'expired', terminated_at = $1
+        "UPDATE artifacts SET state = 'expired', terminated_at = $1, content = NULL
          WHERE state IN ('pending', 'available')
            AND expires_at IS NOT NULL AND expires_at <= $1
-         RETURNING *",
+         RETURNING id, direction, state, placement, size_bytes, digest_sha256, kind,
+                   mime_type, object_key, worker_id, delivery_token, committed_offset",
     )
     .bind(now)
     .fetch_all(conn)

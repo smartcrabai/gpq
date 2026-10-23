@@ -1,4 +1,4 @@
-//! Runtime configuration for `gpq-remote serve`, loaded from environment
+//! Runtime configuration for `gpq remote serve`, loaded from environment
 //! variables.
 //!
 //! ADR 0016: `serve` receives only the forced-RLS application credential —

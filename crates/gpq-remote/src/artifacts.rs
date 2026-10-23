@@ -1,11 +1,11 @@
-//! Artifact object storage, in-memory relay buffers, and the one-shot output
-//! download route (ADR 0006, ADR 0008).
+//! Artifact object storage, Worker-local delivery channels, and the Artifact
+//! HTTP routes (ADR 0006, ADR 0008).
 //!
 //! Object storage is optional: without `RemoteConfig::object_store`,
 //! [`ArtifactService::object_store_available`] is `false` and every S3-backed
-//! method returns a descriptive error instead of touching a client, but
-//! readiness, text-only work, synchronous `OpenAI` image relay, and
-//! Worker-local outputs are unaffected (ADR 0008).
+//! method returns a descriptive error instead of touching a client. Inputs with
+//! `remote_local` placement are stored by Remote itself through the `PUT` route
+//! served by [`router`], so they work without object storage (ADR 0008).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -32,15 +32,6 @@ use crate::db::artifacts as db_artifacts;
 use crate::db::artifacts::{ArtifactDirection, ArtifactRow};
 use crate::registry::SendOutcome;
 use crate::state::AppState;
-
-/// Hard ceiling on how many bytes of a single Artifact this process buffers
-/// in memory (inline-relay inputs, and the resumable Worker-local delivery
-/// channel's internal accounting). It mirrors the `tenants.max_output_artifact_bytes`
-/// default from the initial migration as a defensive limit: the real
-/// Tenant-configured limit is enforced at admission, before bytes ever reach
-/// here; this only stops a single buffered Artifact from exhausting Remote's
-/// memory (ADR 0008).
-pub const LOCAL_BUFFER_CEILING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// How many chunks a live Worker-local delivery may have in flight before the
 /// producing Worker's stream is backpressured.
@@ -72,7 +63,7 @@ const DELIVERY_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum DeliveryChunk {
     /// Raw bytes at the next expected offset.
     Data(Vec<u8>),
-    /// The Worker finished sending; the caller already validated the digest.
+    /// The Worker finished sending this delivery attempt.
     Complete,
     /// A retryable Worker or transport failure.
     Failed(String),
@@ -81,7 +72,7 @@ pub enum DeliveryChunk {
     Rejected(String),
 }
 
-/// Artifact object storage, in-memory relay buffers, and download routing.
+/// Artifact object storage and Worker-local delivery channels.
 #[derive(Clone)]
 pub struct ArtifactService {
     inner: Arc<Inner>,
@@ -91,26 +82,11 @@ struct Inner {
     client: Option<aws_sdk_s3::Client>,
     bucket: String,
     presign_ttl: Duration,
-    local: Mutex<HashMap<ArtifactId, Vec<u8>>>,
     deliveries: Mutex<HashMap<ArtifactId, mpsc::Sender<DeliveryChunk>>>,
 }
 
 fn as_u64(len: usize) -> u64 {
     u64::try_from(len).unwrap_or(u64::MAX)
-}
-
-/// Grows a buffered length by `additional` bytes, rejecting overflow and
-/// growth past `ceiling`. Kept pure and separate from [`ArtifactService::put_local`]
-/// so the bound-enforcement logic is cheaply unit-testable without allocating
-/// a real multi-gigabyte buffer.
-fn checked_grow(current: u64, additional: u64, ceiling: u64) -> anyhow::Result<u64> {
-    let new_len = current
-        .checked_add(additional)
-        .context("buffer length overflow")?;
-    if new_len > ceiling {
-        bail!("growing to {new_len} bytes exceeds the {ceiling}-byte buffering ceiling");
-    }
-    Ok(new_len)
 }
 
 impl ArtifactService {
@@ -147,7 +123,6 @@ impl ArtifactService {
                 client,
                 bucket,
                 presign_ttl,
-                local: Mutex::new(HashMap::new()),
                 deliveries: Mutex::new(HashMap::new()),
             }),
         }
@@ -198,6 +173,42 @@ impl ArtifactService {
         let ttl =
             chrono::Duration::from_std(self.inner.presign_ttl).unwrap_or(chrono::Duration::zero());
         Ok((url, Utc::now() + ttl))
+    }
+    /// Checks object-store input readiness without downloading its contents.
+    /// The presigned PUT fixes the declared content length; a matching HEAD
+    /// result proves the upload completed before admission claims the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if object storage is unavailable or its HEAD request
+    /// fails for a reason other than the object not existing.
+    pub async fn input_is_ready(
+        &self,
+        key: &str,
+        manifest: &gpq_domain::ArtifactManifest,
+    ) -> anyhow::Result<bool> {
+        let client = self.client()?;
+        let head = match client
+            .head_object()
+            .bucket(self.inner.bucket.as_str())
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(head) => head,
+            Err(error)
+                if error
+                    .raw_response()
+                    .is_some_and(|response| response.status().as_u16() == 404) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(head
+            .content_length()
+            .and_then(|length| u64::try_from(length).ok())
+            == Some(manifest.size_bytes))
     }
 
     /// Presigns a `PUT` with no pinned size or content type, for an output
@@ -337,13 +348,6 @@ impl ArtifactService {
         }
     }
 
-    fn lock_local(&self) -> std::sync::MutexGuard<'_, HashMap<ArtifactId, Vec<u8>>> {
-        self.inner
-            .local
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn lock_deliveries(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<ArtifactId, mpsc::Sender<DeliveryChunk>>> {
@@ -351,58 +355,6 @@ impl ArtifactService {
             .deliveries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Appends `chunk` at `offset` to an Artifact's in-memory buffer (inline
-    /// relay input bytes or a small worker-local transfer), returning the
-    /// buffer's new length. Rejects an out-of-order `offset` and rejects
-    /// growth past [`LOCAL_BUFFER_CEILING_BYTES`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `offset` does not equal the buffer's current
-    /// length (an out-of-order chunk), or if appending `chunk` would
-    /// overflow a `u64` length or grow the buffer past
-    /// [`LOCAL_BUFFER_CEILING_BYTES`].
-    pub fn put_local(
-        &self,
-        artifact: ArtifactId,
-        offset: u64,
-        chunk: &[u8],
-    ) -> anyhow::Result<u64> {
-        let mut local = self.lock_local();
-        let buffer = local.entry(artifact).or_default();
-        let current = as_u64(buffer.len());
-        if offset != current {
-            bail!(
-                "out-of-order chunk for artifact {artifact}: expected offset {current}, got {offset}"
-            );
-        }
-        let new_len = checked_grow(current, as_u64(chunk.len()), LOCAL_BUFFER_CEILING_BYTES)
-            .with_context(|| format!("artifact {artifact} cannot buffer this chunk"))?;
-        buffer.extend_from_slice(chunk);
-        Ok(new_len)
-    }
-
-    /// Removes and returns an Artifact's buffered bytes, if any.
-    #[must_use]
-    pub fn take_local(&self, artifact: ArtifactId) -> Option<Vec<u8>> {
-        self.lock_local().remove(&artifact)
-    }
-
-    /// Returns an Artifact's currently buffered length, without consuming it.
-    #[must_use]
-    pub fn len_local(&self, artifact: ArtifactId) -> Option<u64> {
-        self.lock_local()
-            .get(&artifact)
-            .map(|buffer| as_u64(buffer.len()))
-    }
-
-    /// Drops an Artifact's buffered bytes without returning them, e.g. once
-    /// they are known to be unneeded (Generation terminated, download
-    /// abandoned).
-    pub fn discard_local(&self, artifact: ArtifactId) {
-        self.lock_local().remove(&artifact);
     }
 
     /// Registers interest in a Worker-local delivery, replacing any previous
@@ -499,20 +451,23 @@ pub fn classify_download(row: Option<&ArtifactRow>, worker_online: bool) -> Down
                 }
             }
             ArtifactPlacement::ObjectStore => DownloadOutcome::Redirect,
-            // Outputs never use inline relay (ADR 0008 limits that placement
-            // to synchronous input bytes); treat it defensively as gone.
-            ArtifactPlacement::InlineRelay => DownloadOutcome::Gone,
+            // remote_local is an input-only placement (schema constraint), so no
+            // output can carry it.
+            ArtifactPlacement::RemoteLocal => DownloadOutcome::NotFound,
         },
     }
 }
 
-/// Serves the one-shot output download route, `GET /v1/artifacts/{artifact_id}`
-/// (ADR 0006 keeps Artifact download on Axum alongside `OpenAI`, `ComfyUI`,
-/// and health routes).
+/// Serves Artifact bytes over HTTP (ADR 0006 keeps Artifact routes on Axum
+/// alongside the health and native routes): `GET` for one-shot outputs, and
+/// `PUT` for pending `remote_local` inputs.
 #[must_use = "the router is inert until mounted onto the application"]
-pub fn download_router(state: AppState) -> axum::Router {
+pub fn router(state: AppState) -> axum::Router {
     axum::Router::new()
-        .route("/v1/artifacts/{artifact_id}", get(download_artifact))
+        .route(
+            "/v1/artifacts/{artifact_id}",
+            get(download_artifact).put(upload_artifact),
+        )
         .with_state(state)
 }
 
@@ -533,6 +488,134 @@ async fn download_artifact(
         }
     };
     download_for_tenant(&state, tenant, ArtifactId::from_uuid(artifact_id)).await
+}
+
+/// Absolute upload URL for a `remote_local` input Artifact. It is the same path
+/// as the Artifact's download route, which accepts `PUT` with the Tenant Master
+/// Key while the input is pending.
+///
+/// # Errors
+///
+/// Returns an error if `base` cannot be joined with the Artifact's path.
+pub fn remote_local_upload_url(base: &Url, artifact: ArtifactId) -> anyhow::Result<Url> {
+    base.join(&download_path(artifact))
+        .context("public_base_url could not be joined with the artifact upload path")
+}
+
+async fn upload_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(artifact_id): Path<Uuid>,
+    body: Body,
+) -> Response {
+    let Some(token) = crate::auth::bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let tenant = match state.db.authenticate_master_key(token).await {
+        Ok(Some(tenant)) => tenant,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(err) => {
+            tracing::error!(%err, "master key authentication failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    upload_for_tenant(&state, tenant, ArtifactId::from_uuid(artifact_id), body).await
+}
+
+/// Stores the bytes of a pending `remote_local` input after the caller has
+/// authenticated. The body is read up to the smaller of the input's declared
+/// size and the Tenant's `max_input_artifact_bytes`, then checked against the
+/// manifest; a mismatch leaves the Artifact `pending`.
+async fn upload_for_tenant(
+    state: &AppState,
+    tenant: TenantId,
+    artifact: ArtifactId,
+    body: Body,
+) -> Response {
+    let mut conn = match state.db.begin_tenant(tenant).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::error!(%err, "failed to open tenant-scoped transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let settings = match crate::db::tenants::load_settings(&mut conn, tenant).await {
+        Ok(settings) => settings,
+        Err(err) => {
+            tracing::error!(%err, "failed to load tenant settings");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let row = match db_artifacts::get(&mut conn, tenant, artifact).await {
+        Ok(row) => row,
+        Err(err) => {
+            tracing::error!(%err, "artifact lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    drop(conn);
+
+    let Some(row) = row else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if row.direction != ArtifactDirection::Input || row.placement != ArtifactPlacement::RemoteLocal
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if row.state != ArtifactState::Pending {
+        return StatusCode::CONFLICT.into_response();
+    }
+
+    let limit = row
+        .manifest
+        .size_bytes
+        .min(settings.max_input_artifact_bytes);
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let bytes = match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::debug!(%err, %artifact, "artifact upload exceeded its limit or was unreadable");
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+    };
+    if let Err(mismatch) = verify_remote_local_upload(&row.manifest, &bytes) {
+        return (StatusCode::BAD_REQUEST, mismatch.to_string()).into_response();
+    }
+
+    let mut conn = match state.db.begin_tenant(tenant).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::error!(%err, "failed to open tenant-scoped transaction for upload");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    match db_artifacts::set_remote_local_content(&mut conn, tenant, artifact, &bytes).await {
+        Ok(_) => {}
+        Err(db_artifacts::ArtifactStoreError::NotFound) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(db_artifacts::ArtifactStoreError::Conflict) => {
+            return StatusCode::CONFLICT.into_response();
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to store remote-local artifact bytes");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    if let Err(err) = conn.commit().await {
+        tracing::error!(%err, "failed to commit remote-local artifact upload");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Checks uploaded bytes against an input's manifest: exact length first, then
+/// SHA-256 (ADR 0008).
+fn verify_remote_local_upload(
+    manifest: &gpq_domain::ArtifactManifest,
+    bytes: &[u8],
+) -> Result<(), gpq_domain::ManifestMismatch> {
+    manifest.verify(as_u64(bytes.len()), gpq_domain::ContentHash::digest(bytes))
 }
 
 /// Serves one artifact after the caller has already been authenticated.
@@ -589,7 +672,14 @@ async fn redirect_to_object_store(
 ) -> Response {
     match db_artifacts::begin_delivery(&mut conn, tenant, artifact).await {
         Ok(true) => {}
-        Ok(false) => return StatusCode::CONFLICT.into_response(),
+        Ok(false) => match db_artifacts::delivery_expired(&mut conn, tenant, artifact).await {
+            Ok(true) => return StatusCode::GONE.into_response(),
+            Ok(false) => return StatusCode::CONFLICT.into_response(),
+            Err(err) => {
+                tracing::error!(%err, "artifact expiry check failed after acquisition race");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        },
         Err(err) => {
             tracing::error!(%err, "begin_delivery failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -634,7 +724,14 @@ async fn deliver_worker_local(
     };
     match db_artifacts::begin_delivery(&mut conn, tenant, artifact).await {
         Ok(true) => {}
-        Ok(false) => return StatusCode::CONFLICT.into_response(),
+        Ok(false) => match db_artifacts::delivery_expired(&mut conn, tenant, artifact).await {
+            Ok(true) => return StatusCode::GONE.into_response(),
+            Ok(false) => return StatusCode::CONFLICT.into_response(),
+            Err(err) => {
+                tracing::error!(%err, "artifact expiry check failed after acquisition race");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        },
         Err(err) => {
             tracing::error!(%err, "begin_delivery failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -646,7 +743,9 @@ async fn deliver_worker_local(
     }
 
     let delivery_token = row.delivery_token.clone().unwrap_or_default();
-    let (body_tx, body_rx) =
+    let size_bytes = row.manifest.size_bytes;
+    let digest = row.manifest.digest;
+    let (body_tx, mut body_rx) =
         mpsc::channel::<Result<Bytes, std::io::Error>>(DELIVERY_CHANNEL_CAPACITY);
     tokio::spawn(stream_worker_local(
         state.clone(),
@@ -655,8 +754,31 @@ async fn deliver_worker_local(
         worker,
         delivery_token,
         row.committed_offset,
+        size_bytes,
+        digest,
         body_tx,
     ));
+
+    if size_bytes == 0 {
+        let mut verified = false;
+        while let Some(item) = body_rx.recv().await {
+            match item {
+                Ok(bytes) if bytes.is_empty() => verified = true,
+                _ => return StatusCode::BAD_GATEWAY.into_response(),
+            }
+        }
+        if !verified {
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        let mut response = StatusCode::OK.into_response();
+        if let Ok(value) = header::HeaderValue::from_str(&row.manifest.mime_type) {
+            response.headers_mut().insert(header::CONTENT_TYPE, value);
+        }
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, 0.into());
+        return response;
+    }
 
     let mut response = Response::new(Body::from_stream(ReceiverStream::new(body_rx)));
     if let Ok(value) = header::HeaderValue::from_str(&row.manifest.mime_type) {
@@ -664,48 +786,8 @@ async fn deliver_worker_local(
     }
     response
         .headers_mut()
-        .insert(header::CONTENT_LENGTH, row.manifest.size_bytes.into());
+        .insert(header::CONTENT_LENGTH, size_bytes.into());
     response
-}
-
-/// Consumes one Worker-local output into memory for a synchronous API response.
-/// Uses the same one-shot, resumable, integrity-checked delivery path as the
-/// public Artifact download route while bounding the buffered response.
-///
-/// # Errors
-/// Returns an error when delivery cannot start or finish, exceeds `limit`, or
-/// produces a byte count different from the recorded manifest.
-pub(crate) async fn consume_worker_local_output(
-    state: &AppState,
-    tenant: TenantId,
-    row: ArtifactRow,
-    limit: usize,
-) -> anyhow::Result<Bytes> {
-    let artifact = row.id;
-    let expected_size = row.manifest.size_bytes;
-    if expected_size > u64::try_from(limit).unwrap_or(u64::MAX) {
-        bail!("artifact {artifact} exceeds the inline response limit");
-    }
-    let conn = state
-        .db
-        .begin_tenant(tenant)
-        .await
-        .context("failed to begin artifact delivery transaction")?;
-    let response = deliver_worker_local(state, conn, tenant, artifact, row).await;
-    let status = response.status();
-    if !status.is_success() {
-        bail!("artifact {artifact} delivery returned HTTP {status}");
-    }
-    let bytes = axum::body::to_bytes(response.into_body(), limit)
-        .await
-        .with_context(|| format!("failed to buffer artifact {artifact}"))?;
-    if as_u64(bytes.len()) != expected_size {
-        bail!(
-            "artifact {artifact} delivered {} bytes, expected {expected_size}",
-            bytes.len()
-        );
-    }
-    Ok(bytes)
 }
 
 fn deliver_request(artifact: ArtifactId, delivery_token: &str, offset: u64) -> RemoteMessage {
@@ -901,10 +983,14 @@ async fn fail_delivery(
 }
 
 /// Relays [`DeliveryChunk`]s from the producing Worker to the downloading
-/// HTTP client until the transfer completes, fails terminally, or the
-/// Worker goes quiet for [`DELIVERY_CHUNK_TIMEOUT`]. See
-/// [`request_worker_delivery`] for why this is split out of
-/// [`stream_worker_local`]; behavior is unchanged.
+/// HTTP client until the transfer completes, fails terminally, or the Worker
+/// goes quiet for [`DELIVERY_CHUNK_TIMEOUT`]. The final bounded chunk is held
+/// until full-manifest verification so a late error cannot follow a complete
+/// HTTP body.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each part of the chunk-drain state is independently mutable or immutable"
+)]
 #[expect(
     clippy::too_many_lines,
     reason = "the delivery state machine is clearer as one match than as smaller one-use helpers"
@@ -913,6 +999,10 @@ async fn drain_worker_chunks(
     ctx: &DeliveryContext<'_>,
     offset: &mut u64,
     attempts: &mut u32,
+    hasher: &mut gpq_domain::Hasher,
+    pending: &mut Option<Bytes>,
+    expected_size: u64,
+    expected_digest: gpq_domain::ContentHash,
     rx: &mut mpsc::Receiver<DeliveryChunk>,
     tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> ChunkDrainOutcome {
@@ -932,8 +1022,37 @@ async fn drain_worker_chunks(
         };
         match chunk {
             Some(DeliveryChunk::Data(bytes)) => {
-                *offset += as_u64(bytes.len());
-                if tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+                let Some(next_offset) = (*offset).checked_add(as_u64(bytes.len())) else {
+                    fail_delivery(
+                        ctx,
+                        tx,
+                        "artifact delivery offset overflowed",
+                        "artifact delivery offset overflowed".to_owned(),
+                    )
+                    .await;
+                    return ChunkDrainOutcome::Done;
+                };
+                if bytes.len() > gpq_domain::TRANSFER_CHUNK_BYTES || next_offset > expected_size {
+                    fail_delivery(
+                        ctx,
+                        tx,
+                        "worker sent an oversized artifact chunk",
+                        "worker sent an oversized artifact chunk".to_owned(),
+                    )
+                    .await;
+                    return ChunkDrainOutcome::Done;
+                }
+                if bytes.is_empty() {
+                    continue;
+                }
+                hasher.update(&bytes);
+                *offset = next_offset;
+                let bytes = Bytes::from(bytes);
+                if *offset == expected_size && !bytes.is_empty() {
+                    *pending = Some(bytes);
+                    continue;
+                }
+                if tx.send(Ok(bytes)).await.is_err() {
                     discard_and_expire(
                         ctx.state,
                         ctx.tenant,
@@ -957,6 +1076,52 @@ async fn drain_worker_chunks(
                 }
             }
             Some(DeliveryChunk::Complete) => {
+                if *offset != expected_size || std::mem::take(hasher).finish() != expected_digest {
+                    fail_delivery(
+                        ctx,
+                        tx,
+                        "worker-local artifact did not match its full manifest",
+                        "artifact failed full-stream integrity verification".to_owned(),
+                    )
+                    .await;
+                    return ChunkDrainOutcome::Done;
+                }
+                if expected_size == 0 && tx.send(Ok(Bytes::new())).await.is_err() {
+                    discard_and_expire(
+                        ctx.state,
+                        ctx.tenant,
+                        ctx.artifact,
+                        ctx.worker,
+                        ctx.delivery_token,
+                        "client disconnected",
+                    )
+                    .await;
+                    return ChunkDrainOutcome::Done;
+                }
+                if let Some(bytes) = pending.take() {
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        discard_and_expire(
+                            ctx.state,
+                            ctx.tenant,
+                            ctx.artifact,
+                            ctx.worker,
+                            ctx.delivery_token,
+                            "client disconnected",
+                        )
+                        .await;
+                        return ChunkDrainOutcome::Done;
+                    }
+                    if !persist_delivery_offset(ctx, *offset).await {
+                        fail_delivery(
+                            ctx,
+                            tx,
+                            "failed to persist delivery progress",
+                            "failed to persist artifact delivery progress".to_owned(),
+                        )
+                        .await;
+                        return ChunkDrainOutcome::Done;
+                    }
+                }
                 ctx.state.artifacts.end_delivery(ctx.artifact);
                 if let Ok(mut conn) = ctx.state.db.begin_tenant(ctx.tenant).await {
                     if let Err(err) =
@@ -1031,6 +1196,10 @@ async fn drain_worker_chunks(
 /// that produces no chunk within [`DELIVERY_CHUNK_TIMEOUT`] is torn down
 /// deterministically instead of leaking the task and stranding the
 /// Artifact `delivering` forever.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stream carries its owner, resume position, integrity manifest, and response sender"
+)]
 async fn stream_worker_local(
     state: AppState,
     tenant: TenantId,
@@ -1038,6 +1207,8 @@ async fn stream_worker_local(
     worker: WorkerId,
     delivery_token: String,
     start_offset: u64,
+    expected_size: u64,
+    expected_digest: gpq_domain::ContentHash,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) {
     let ctx = DeliveryContext {
@@ -1049,6 +1220,8 @@ async fn stream_worker_local(
     };
     let mut offset = start_offset;
     let mut attempts = 0u32;
+    let mut hasher = gpq_domain::Hasher::new();
+    let mut pending = None;
     loop {
         let mut rx = state.artifacts.subscribe_delivery(artifact);
 
@@ -1057,7 +1230,18 @@ async fn stream_worker_local(
             return;
         }
 
-        let drained = drain_worker_chunks(&ctx, &mut offset, &mut attempts, &mut rx, &tx).await;
+        let drained = drain_worker_chunks(
+            &ctx,
+            &mut offset,
+            &mut attempts,
+            &mut hasher,
+            &mut pending,
+            expected_size,
+            expected_digest,
+            &mut rx,
+            &tx,
+        )
+        .await;
         if matches!(drained, ChunkDrainOutcome::Done) {
             return;
         }
@@ -1132,7 +1316,6 @@ mod tests {
             object_key: (placement == ArtifactPlacement::ObjectStore).then(|| "key".to_owned()),
             worker_id: (placement == ArtifactPlacement::WorkerLocal).then(WorkerId::new),
             delivery_token: None,
-            comfy_output_pointers: Vec::new(),
             committed_offset: 0,
         }
     }
@@ -1143,7 +1326,6 @@ mod tests {
                 client: None,
                 bucket: String::new(),
                 presign_ttl: Duration::from_mins(15),
-                local: Mutex::new(HashMap::new()),
                 deliveries: Mutex::new(HashMap::new()),
             }),
         }
@@ -1227,45 +1409,16 @@ mod tests {
     }
 
     #[test]
-    fn put_local_rejects_offset_gaps() {
-        let service = service_without_object_store();
-        let artifact = ArtifactId::new();
-        assert_eq!(service.put_local(artifact, 0, b"ab").unwrap_or(0), 2);
-        assert!(service.put_local(artifact, 5, b"cd").is_err());
-        assert_eq!(service.put_local(artifact, 2, b"cd").unwrap_or(0), 4);
-        assert_eq!(service.take_local(artifact), Some(b"abcd".to_vec()));
-    }
-
-    #[test]
-    fn checked_grow_rejects_overflow_and_ceiling_breach() {
-        assert_eq!(checked_grow(2, 3, 10).unwrap_or(0), 5);
-        assert!(checked_grow(8, 3, 10).is_err());
-        assert!(checked_grow(u64::MAX, 1, u64::MAX).is_err());
-    }
-
-    #[test]
-    fn discard_local_drops_buffered_bytes() {
-        let service = service_without_object_store();
-        let artifact = ArtifactId::new();
-        let _ = service.put_local(artifact, 0, b"abc");
-        service.discard_local(artifact);
-        assert_eq!(service.len_local(artifact), None);
-        assert_eq!(service.take_local(artifact), None);
-    }
-
-    #[test]
-    fn len_local_reports_length_without_consuming_the_buffer() {
-        // Mirrors `WorkerTransferService::fetch_artifact`'s flow: `len_local`
-        // is checked before `take_local` consumes the buffer for the
-        // response, so it must not itself remove the bytes (ADR 0008).
-        let service = service_without_object_store();
-        let artifact = ArtifactId::new();
-        let _ = service.put_local(artifact, 0, b"hello");
-        assert_eq!(service.len_local(artifact), Some(5));
-        assert_eq!(service.len_local(artifact), Some(5));
-        assert_eq!(service.take_local(artifact), Some(b"hello".to_vec()));
-        assert_eq!(service.len_local(artifact), None);
-        assert_eq!(service.take_local(artifact), None);
+    fn remote_local_upload_must_match_manifest_length_and_digest() {
+        assert_eq!(verify_remote_local_upload(&manifest(), b"abc"), Ok(()));
+        assert!(matches!(
+            verify_remote_local_upload(&manifest(), b"ab"),
+            Err(gpq_domain::ManifestMismatch::Size { .. })
+        ));
+        assert!(matches!(
+            verify_remote_local_upload(&manifest(), b"abd"),
+            Err(gpq_domain::ManifestMismatch::Digest { .. })
+        ));
     }
 
     #[test]
@@ -1324,7 +1477,6 @@ mod tests {
                 client: None,
                 bucket: String::new(),
                 presign_ttl: Duration::from_mins(15),
-                local: Mutex::new(HashMap::new()),
                 deliveries: Mutex::new(HashMap::new()),
             }),
         };

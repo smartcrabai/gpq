@@ -1,23 +1,14 @@
-//! Worker configuration (ADR 0005).
-//!
-//! A Worker TOML file defines each Device Pool's executable, argument vector,
-//! environment, state directory, and startup timeout with no shell command
-//! strings and no dynamic reload: [`WorkerConfig::load`] is the only load
-//! path, run once at process startup.
+//! Worker configuration and trust-boundary validation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, bail, ensure};
-use gpq_domain::BackendKind;
-use serde::{Deserialize, Deserializer};
+use anyhow::{Context, ensure};
+use gpq_domain::{ModelAssetRole, ModelFamily, SamplingPreset};
+use serde::{Deserialize, Deserializer, Serialize};
 
-/// Environment variables used by common accelerator vendors to select which
-/// physical devices a process may use. Two Pools naming the same device under
-/// the same key would violate the non-overlapping Device Pool invariant of
-/// ADR 0005.
 const DEVICE_SELECTOR_ENV_KEYS: &[&str] = &[
     "CUDA_VISIBLE_DEVICES",
     "HIP_VISIBLE_DEVICES",
@@ -25,89 +16,129 @@ const DEVICE_SELECTOR_ENV_KEYS: &[&str] = &[
     "GPU_DEVICE_ORDINAL",
 ];
 
-/// Top-level Worker TOML configuration: one Worker per host (ADR 0005).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStorage {
+    /// Use the operating system's credential store (the default).
+    #[default]
+    Platform,
+    /// Store the credential in an owner-only file below `state_dir`.
+    File,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerConfig {
-    /// This Worker's stable name, used in enrollment and credential storage.
     pub name: String,
-    /// Outbound-only address of `gpq-remote`'s Worker gRPC endpoint (ADR 0004).
     pub remote_url: url::Url,
-    /// Root directory for Worker-local state: credential fallback storage and
-    /// the model hash cache.
     pub state_dir: PathBuf,
-    /// Every Device Pool this Worker supervises. Never empty.
+    #[serde(default)]
+    pub credential_storage: CredentialStorage,
     pub pools: Vec<PoolConfig>,
 }
 
-/// One exclusively-owned Device Pool and the backend process it supervises
-/// (ADR 0005).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PoolConfig {
-    /// Stable identity for this Pool on this host; unique among `pools`.
     pub key: String,
-    /// Which managed runtime this Pool switches to exclusively.
-    pub backend: BackendKind,
-    /// Absolute path to the backend executable. No shell strings (ADR 0005).
-    pub executable: PathBuf,
-    /// Argument vector passed directly to the executable, never through a
-    /// shell.
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Extra environment variables for the managed process, including any
-    /// accelerator device selector.
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    /// Working/state directory for this Pool's backend process.
+    /// Native backend/device selector: `metal`, `vulkan0`, `cuda0`, or `cpu`.
+    pub backend: String,
+    /// Parent and infer child use this authenticated loopback control address.
+    pub listen: String,
     pub state_dir: PathBuf,
-    /// How long to wait for the backend to become ready before treating the
-    /// Pool as unready.
     #[serde(rename = "startup_timeout_secs", deserialize_with = "duration_secs")]
     pub startup_timeout: Duration,
-    /// Unauthenticated HTTP(S) URL on a loopback IP address where the backend
-    /// listens.
-    pub base_url: url::Url,
-    /// Execution Slot count; defaults to [`BackendKind::default_slots`] when
-    /// unset.
     #[serde(default)]
-    pub slots: Option<u32>,
-    /// Model paths this Pool expects to find on disk; paths may name files or
-    /// directories.
+    pub runtime: RuntimeConfig,
     #[serde(default)]
-    pub model_paths: Vec<PathBuf>,
-    /// Expected SHA-256 hash per model path (ADR 0005); a mismatch is
-    /// rejected rather than silently trusted.
+    pub shape: ShapeLimits,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
+    #[serde(default)]
+    pub extra_image_loras: Vec<PathBuf>,
+    /// Optional configured SHA-256 per asset path; assets are always hashed
+    /// locally and compared with this value when supplied.
     #[serde(default)]
     pub expected_hashes: BTreeMap<String, String>,
-    /// Operator-declared exact versions for `ComfyUI` custom-node packages.
-    /// These override backend-reported versions and fill gaps when the backend
-    /// cannot expose one.
     #[serde(default)]
-    pub custom_node_versions: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModelConfig {
+    pub family: ModelFamily,
+    /// Files keyed by `ModelAssetRole`. Runtime-required roles are validated
+    /// for the selected family before any native process is started.
+    pub assets: BTreeMap<ModelAssetRole, PathBuf>,
+    #[serde(default)]
+    pub default_loras: Vec<ConfiguredLora>,
+    pub sampling: Option<SamplingPreset>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ConfiguredLora {
+    pub path: PathBuf,
+    pub scale: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    pub params_backend: Option<String>,
+    pub max_vram: Option<String>,
+    pub threads: u32,
+    pub vae_tiling: bool,
+    pub model_args: Vec<String>,
+    pub module_backends: BTreeMap<String, String>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            params_backend: None,
+            max_vram: None,
+            threads: u32::try_from(
+                std::thread::available_parallelism()
+                    .map_or(1, |parallelism| parallelism.get().min(1024)),
+            )
+            .unwrap_or(1),
+            vae_tiling: false,
+            model_args: Vec::new(),
+            module_backends: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ShapeLimits {
+    #[serde(rename = "max_image_pixels")]
+    pub image_pixels: u64,
+    #[serde(rename = "max_video_pixels")]
+    pub video_pixels: u64,
+    #[serde(rename = "max_video_frames")]
+    pub video_frames: u32,
+    #[serde(rename = "max_steps")]
+    pub steps: u32,
+}
+
+impl Default for ShapeLimits {
+    fn default() -> Self {
+        Self {
+            image_pixels: 16_777_216,
+            video_pixels: 64_000_000,
+            video_frames: 97,
+            steps: 100,
+        }
+    }
 }
 
 fn duration_secs<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let secs = u64::deserialize(deserializer)?;
-    Ok(Duration::from_secs(secs))
+    Ok(Duration::from_secs(u64::deserialize(deserializer)?))
 }
 
 impl WorkerConfig {
-    /// Loads and validates a Worker TOML configuration file.
-    ///
-    /// This is the only supported way to obtain a `WorkerConfig`: there is no
-    /// dynamic reload, and no field is ever sourced from a shell command
-    /// string (ADR 0005).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file cannot be read, does not parse as valid
-    /// TOML for this schema, or fails validation (empty/duplicate pool keys,
-    /// overlapping device selectors, a non-absolute executable, a zero
-    /// startup timeout, an invalid backend URL, an invalid mlx-dspark model
-    /// path, a malformed expected model hash, or an empty custom-node package
-    /// name or version).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading worker config {}", path.display()))?;
@@ -119,36 +150,54 @@ impl WorkerConfig {
 
     fn validate(&self) -> anyhow::Result<()> {
         ensure!(
+            !self.name.trim().is_empty(),
+            "worker name must not be empty"
+        );
+        #[cfg(not(unix))]
+        ensure!(
+            self.credential_storage != CredentialStorage::File,
+            "credential_storage = \"file\" is supported only on Unix"
+        );
+        ensure!(
             !self.pools.is_empty(),
             "worker config must declare at least one pool"
         );
-
         let mut seen_keys = BTreeSet::new();
+        let mut seen_listeners = BTreeSet::new();
         for pool in &self.pools {
             ensure!(
                 seen_keys.insert(pool.key.as_str()),
                 "duplicate pool key `{}`",
                 pool.key
             );
+            pool.validate()?;
+            let listener: SocketAddr = pool.listen.parse().with_context(|| {
+                format!("pool `{}` listen must be an IP:port address", pool.key)
+            })?;
+            ensure!(
+                listener.port() != 0,
+                "pool `{}` listen port must be nonzero",
+                pool.key
+            );
+            ensure!(
+                seen_listeners.insert(listener),
+                "pool `{}` duplicates a native listener",
+                pool.key
+            );
         }
-
         check_device_overlap(&self.pools)?;
         ensure_state_dir(&self.state_dir)?;
-        for pool in &self.pools {
-            pool.validate()?;
-        }
         Ok(())
     }
 }
 
 impl PoolConfig {
     fn validate(&self) -> anyhow::Result<()> {
-        ensure!(!self.key.is_empty(), "pool key must not be empty");
+        ensure!(!self.key.trim().is_empty(), "pool key must not be empty");
         ensure!(
-            self.executable.is_absolute(),
-            "pool `{}` executable must be an absolute path, got `{}`",
-            self.key,
-            self.executable.display()
+            valid_device_selector(&self.backend),
+            "pool `{}` backend must name a supported native device",
+            self.key
         );
         ensure!(
             self.startup_timeout > Duration::ZERO,
@@ -156,88 +205,207 @@ impl PoolConfig {
             self.key
         );
         ensure!(
-            self.base_url.username().is_empty() && self.base_url.password().is_none(),
-            "pool `{}` base_url must not contain credentials",
+            self.runtime.threads > 0 && self.runtime.threads <= 1024,
+            "pool `{}` runtime.threads must be within 1..=1024",
             self.key
         );
-        ensure!(
-            matches!(self.base_url.scheme(), "http" | "https"),
-            "pool `{}` base_url must use http or https",
-            self.key
-        );
-        ensure!(
-            self.base_url.query().is_none() && self.base_url.fragment().is_none(),
-            "pool `{}` base_url must not contain a query or fragment",
-            self.key
-        );
-        let host = self
-            .base_url
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("pool `{}` base_url must have a host", self.key))?;
-        let host_ip: IpAddr = host.parse().map_err(|_| {
-            anyhow::anyhow!(
-                "pool `{}` base_url host must be a loopback IP address, got `{host}`",
-                self.key
-            )
-        })?;
-        ensure!(
-            host_ip.is_loopback(),
-            "pool `{}` base_url host must be a loopback IP address, got `{host}`",
-            self.key
-        );
-        if self.backend == BackendKind::MlxDspark {
+        if let Some(params_backend) = &self.runtime.params_backend {
             ensure!(
-                self.model_paths.len() == 1,
-                "pool `{}` mlx_dspark backend requires exactly one local model path",
+                valid_params_backend(params_backend),
+                "pool `{}` runtime.params_backend is invalid",
+                self.key
+            );
+        }
+        if let Some(max_vram) = &self.runtime.max_vram {
+            ensure!(
+                valid_vram_assignment(max_vram),
+                "pool `{}` runtime.max_vram must be a positive scalar GiB budget or device-to-GiB assignments",
+                self.key
+            );
+        }
+        for argument in &self.runtime.model_args {
+            ensure!(
+                !argument.is_empty() && !argument.contains('\0') && !argument.contains(','),
+                "pool `{}` runtime.model_args entries must be nonempty and cannot contain NUL or comma",
+                self.key
+            );
+        }
+        for (module, backend) in &self.runtime.module_backends {
+            ensure!(
+                matches!(module.as_str(), "diffusion" | "te" | "clip_vision" | "vae"),
+                "pool `{}` runtime.module_backends contains unknown module `{module}`",
                 self.key
             );
             ensure!(
-                self.model_paths[0].is_absolute(),
-                "pool `{}` mlx_dspark model path must be absolute, got `{}`",
-                self.key,
-                self.model_paths[0].display()
-            );
-            let model_root = std::fs::canonicalize(&self.model_paths[0])
-                .unwrap_or_else(|_| self.model_paths[0].clone());
-            let state_root =
-                std::fs::canonicalize(&self.state_dir).unwrap_or_else(|_| self.state_dir.clone());
-            ensure!(
-                !state_root.starts_with(&model_root),
-                "pool `{}` mlx_dspark state_dir must not be inside its model path",
+                valid_device_selector(backend),
+                "pool `{}` module `{module}` has unsupported backend `{backend}`",
                 self.key
             );
+        }
+        for name in self.env.keys() {
+            ensure!(
+                DEVICE_SELECTOR_ENV_KEYS.contains(&name.as_str()) || name == "VK_DRIVER_FILES",
+                "pool `{}` env may contain only recognized accelerator device selectors or VK_DRIVER_FILES, not `{name}`",
+                self.key
+            );
+        }
+        ensure!(
+            self.shape.image_pixels > 0,
+            "pool `{}` max_image_pixels must be positive",
+            self.key
+        );
+        ensure!(
+            self.shape.video_pixels > 0,
+            "pool `{}` max_video_pixels must be positive",
+            self.key
+        );
+        ensure!(
+            self.shape.video_frames >= 1,
+            "pool `{}` max_video_frames must be positive",
+            self.key
+        );
+        ensure!(
+            self.shape.steps >= 1,
+            "pool `{}` max_steps must be positive",
+            self.key
+        );
+        ensure_state_dir(&self.state_dir)?;
+
+        let mut model_hashes = BTreeSet::new();
+        for model in &self.models {
+            validate_model(self, model)?;
+            // A single immutable manifest may be advertised only once.
+            let canonical =
+                serde_json::to_vec(model).context("serializing configured model manifest")?;
+            ensure!(
+                model_hashes.insert(gpq_domain::ContentHash::digest(&canonical)),
+                "pool `{}` contains a duplicate model manifest",
+                self.key
+            );
+        }
+        for path in &self.extra_image_loras {
+            ensure_asset_path(&self.key, "extra image LoRA", path)?;
         }
         for (path, hash) in &self.expected_hashes {
             ensure!(
                 is_hex_sha256(hash),
-                "pool `{}` expected hash for `{path}` must be 64 hex characters, got `{hash}`",
+                "pool `{}` expected hash for `{path}` must be 64 hex characters",
                 self.key
             );
         }
-        for (package, version) in &self.custom_node_versions {
-            ensure!(
-                !package.trim().is_empty(),
-                "pool `{}` custom node package name must not be empty",
-                self.key
-            );
-            ensure!(
-                !version.trim().is_empty(),
-                "pool `{}` custom node version for `{package}` must not be empty",
-                self.key
-            );
-        }
-        ensure_state_dir(&self.state_dir)?;
         Ok(())
     }
 }
 
-fn is_hex_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+fn validate_model(pool: &PoolConfig, model: &ModelConfig) -> anyhow::Result<()> {
+    let mut required = BTreeSet::from([
+        ModelAssetRole::Diffusion,
+        ModelAssetRole::TextEncoder,
+        ModelAssetRole::Vae,
+    ]);
+    match model.family {
+        ModelFamily::QwenImage21 => {
+            required.insert(ModelAssetRole::VisionEncoder);
+        }
+        ModelFamily::MinimaxH3 => {
+            required.insert(ModelAssetRole::AudioVae);
+        }
+    }
+    ensure!(
+        required.iter().all(|role| model.assets.contains_key(role)),
+        "pool `{}` model {:?} is missing required asset roles",
+        pool.key,
+        model.family
+    );
+    for (role, path) in &model.assets {
+        ensure_asset_path(&pool.key, &format!("{role:?} model asset"), path)?;
+    }
+    let extra_roles: Vec<_> = model
+        .assets
+        .keys()
+        .filter(|role| !required.contains(role))
+        .collect();
+    ensure!(
+        extra_roles.is_empty(),
+        "pool `{}` model {:?} declares unsupported asset roles {extra_roles:?}",
+        pool.key,
+        model.family
+    );
+    for lora in &model.default_loras {
+        ensure!(
+            lora.scale.is_finite(),
+            "pool `{}` default LoRA scale must be finite",
+            pool.key
+        );
+        ensure_asset_path(&pool.key, "default LoRA", &lora.path)?;
+    }
+    if let Some(sampling) = &model.sampling {
+        sampling
+            .resolve(None, None, None)
+            .with_context(|| format!("pool `{}` sampling preset is invalid", pool.key))?;
+    }
+    Ok(())
 }
 
-/// Rejects two Pools that claim the same physical device through a known
-/// accelerator device-selector environment variable (ADR 0005: Device Pools
-/// are non-overlapping).
+fn ensure_asset_path(pool: &str, label: &str, path: &Path) -> anyhow::Result<()> {
+    ensure!(
+        path.is_absolute(),
+        "pool `{pool}` {label} path must be absolute: {}",
+        path.display()
+    );
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("pool `{pool}` {label} {} is unavailable", path.display()))?;
+    ensure!(
+        metadata.is_file(),
+        "pool `{pool}` {label} {} is not a regular file",
+        path.display()
+    );
+    Ok(())
+}
+
+fn is_hex_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+fn valid_device_selector(value: &str) -> bool {
+    if value == "cpu" {
+        return true;
+    }
+    ["metal", "vulkan", "cuda"].iter().any(|prefix| {
+        value.strip_prefix(prefix).is_some_and(|suffix| {
+            suffix.is_empty() || suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    })
+}
+
+fn valid_params_backend(value: &str) -> bool {
+    if value == "disk" {
+        return true;
+    }
+    !value.is_empty()
+        && value.split(',').all(|assignment| {
+            let (module, device) = assignment.split_once('=').unwrap_or(("", assignment));
+            (module.is_empty()
+                || matches!(
+                    module,
+                    "all" | "default" | "*" | "diffusion" | "te" | "clip_vision" | "vae"
+                ))
+                && valid_device_selector(device)
+        })
+}
+
+fn valid_vram_assignment(value: &str) -> bool {
+    if value.parse::<u32>().is_ok_and(|amount| amount > 0) {
+        return true;
+    }
+    !value.trim().is_empty()
+        && value.split(',').all(|assignment| {
+            let Some((device, gibibytes)) = assignment.split_once('=') else {
+                return false;
+            };
+            valid_device_selector(device) && gibibytes.parse::<u32>().is_ok_and(|amount| amount > 0)
+        })
+}
+
 fn check_device_overlap(pools: &[PoolConfig]) -> anyhow::Result<()> {
     for key in DEVICE_SELECTOR_ENV_KEYS {
         let mut claimed: BTreeMap<&str, &str> = BTreeMap::new();
@@ -245,9 +413,13 @@ fn check_device_overlap(pools: &[PoolConfig]) -> anyhow::Result<()> {
             let Some(value) = pool.env.get(*key) else {
                 continue;
             };
-            for device in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            for device in value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
                 if let Some(other) = claimed.insert(device, pool.key.as_str()) {
-                    bail!(
+                    anyhow::bail!(
                         "pools `{other}` and `{}` both claim device `{device}` via {key}",
                         pool.key
                     );
@@ -255,10 +427,67 @@ fn check_device_overlap(pools: &[PoolConfig]) -> anyhow::Result<()> {
             }
         }
     }
+
+    for (index, left) in pools.iter().enumerate() {
+        let left_devices = native_device_claims(left);
+        for right in &pools[index + 1..] {
+            let right_devices = native_device_claims(right);
+            for left_device in &left_devices {
+                for right_device in &right_devices {
+                    if normalize_device(left_device) == normalize_device(right_device)
+                        && !cuda_pools_are_partitioned(left, right, left_device)
+                    {
+                        anyhow::bail!(
+                            "pools `{}` and `{}` both claim native device `{left_device}`",
+                            left.key,
+                            right.key
+                        );
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
-/// Creates `path` if missing and, on Unix, restricts it to owner-only access.
+fn native_device_claims(pool: &PoolConfig) -> Vec<String> {
+    let mut devices = vec![pool.backend.clone()];
+    devices.extend(pool.runtime.module_backends.values().cloned());
+    if let Some(params_backend) = &pool.runtime.params_backend
+        && params_backend != "disk"
+    {
+        devices.extend(params_backend.split(',').map(|assignment| {
+            assignment
+                .split_once('=')
+                .map_or(assignment, |(_, device)| device)
+                .to_owned()
+        }));
+    }
+    devices.retain(|device| device != "cpu");
+    devices
+}
+
+fn normalize_device(device: &str) -> String {
+    match device {
+        "metal" => "metal0".to_owned(),
+        "vulkan" => "vulkan0".to_owned(),
+        "cuda" => "cuda0".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn cuda_pools_are_partitioned(left: &PoolConfig, right: &PoolConfig, device: &str) -> bool {
+    if !normalize_device(device).starts_with("cuda") {
+        return false;
+    }
+    DEVICE_SELECTOR_ENV_KEYS.iter().any(|key| {
+        left.env
+            .get(*key)
+            .zip(right.env.get(*key))
+            .is_some_and(|(left, right)| left != right)
+    })
+}
+
 fn ensure_state_dir(path: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(path)
         .with_context(|| format!("creating state dir {}", path.display()))?;
@@ -273,312 +502,87 @@ fn ensure_state_dir(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::time::Duration;
 
-    use super::{WorkerConfig, is_hex_sha256};
+    use super::{
+        PoolConfig, RuntimeConfig, ShapeLimits, check_device_overlap, is_hex_sha256,
+        valid_device_selector, valid_params_backend, valid_vram_assignment,
+    };
 
-    /// A minimal but complete two-pool configuration, parameterized over
-    /// temp directories so `validate()`'s filesystem checks pass.
-    fn sample_toml(
-        state_dir: &std::path::Path,
-        pool_a: &std::path::Path,
-        pool_b: &std::path::Path,
-    ) -> String {
-        format!(
-            r#"
-name = "worker-1"
-remote_url = "https://remote.example.internal"
-state_dir = "{state}"
-
-[[pools]]
-key = "gpu0"
-backend = "llama_cpp"
-executable = "/usr/bin/true"
-args = ["--model", "foo.gguf"]
-state_dir = "{a}"
-startup_timeout_secs = 30
-base_url = "http://127.0.0.1:8081"
-slots = 4
-model_paths = ["/models/foo.gguf"]
-
-[pools.env]
-CUDA_VISIBLE_DEVICES = "0"
-
-[pools.expected_hashes]
-"/models/foo.gguf" = "{hash}"
-
-[[pools]]
-key = "gpu1"
-backend = "comfyui"
-executable = "/usr/bin/true"
-state_dir = "{b}"
-startup_timeout_secs = 45
-base_url = "http://127.0.0.1:8082"
-
-[pools.env]
-CUDA_VISIBLE_DEVICES = "1"
-"#,
-            state = state_dir.display(),
-            a = pool_a.display(),
-            b = pool_b.display(),
-            hash = "a".repeat(64),
-        )
-    }
-
-    fn write_config(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let path = dir.path().join("worker.toml");
-        let mut file =
-            std::fs::File::create(&path).unwrap_or_else(|err| panic!("create config: {err}"));
-        file.write_all(contents.as_bytes())
-            .unwrap_or_else(|err| panic!("write config: {err}"));
-        (dir, path)
-    }
-
-    #[test]
-    fn parses_full_sample() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let state = root.path().join("state");
-        let pool_a = root.path().join("gpu0");
-        let pool_b = root.path().join("gpu1");
-        let (_dir, path) = write_config(&sample_toml(&state, &pool_a, &pool_b));
-
-        let Ok(config) = WorkerConfig::load(&path) else {
-            panic!("expected a valid config to load");
-        };
-        assert_eq!(config.name, "worker-1");
-        assert_eq!(config.pools.len(), 2);
-        assert_eq!(config.pools[0].key, "gpu0");
-        assert_eq!(config.pools[0].slots, Some(4));
-        assert_eq!(config.pools[1].slots, None);
-        assert!(state.is_dir());
-        assert!(pool_a.is_dir());
-        assert!(pool_b.is_dir());
-    }
-
-    #[test]
-    fn parses_custom_node_versions() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let state = root.path().join("state");
-        let pool_a = root.path().join("gpu0");
-        let pool_b = root.path().join("gpu1");
-        let contents = sample_toml(&state, &pool_a, &pool_b).replace(
-            "base_url = \"http://127.0.0.1:8082\"",
-            "base_url = \"http://127.0.0.1:8082\"\n\n[pools.custom_node_versions]\nSomePack = \"1.2.3\"",
-        );
-        let (_dir, path) = write_config(&contents);
-
-        let config = WorkerConfig::load(&path)
-            .unwrap_or_else(|err| panic!("expected custom node versions to load: {err}"));
-        assert_eq!(
-            config.pools[1].custom_node_versions.get("SomePack"),
-            Some(&"1.2.3".to_owned())
-        );
-    }
-
-    #[test]
-    fn parses_mlx_dspark_pool() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let state = root.path().join("state");
-        let pool_a = root.path().join("gpu0");
-        let pool_b = root.path().join("gpu1");
-        let contents = sample_toml(&state, &pool_a, &pool_b).replacen(
-            "backend = \"llama_cpp\"",
-            "backend = \"mlx_dspark\"",
-            1,
-        );
-        let (_dir, path) = write_config(&contents);
-
-        let config = WorkerConfig::load(&path)
-            .unwrap_or_else(|err| panic!("expected mlx_dspark config to load: {err}"));
-        assert_eq!(config.pools[0].backend, gpq_domain::BackendKind::MlxDspark);
-    }
-
-    #[test]
-    fn rejects_invalid_mlx_model_path_count_or_form() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let state = root.path().join("state");
-        let pool_a = root.path().join("gpu0");
-        let pool_b = root.path().join("gpu1");
-        for model_paths in [
-            "model_paths = []",
-            "model_paths = [\"/models/foo.gguf\", \"/models/bar.gguf\"]",
-            "model_paths = [\"models/foo.gguf\"]",
-        ] {
-            let contents = sample_toml(&state, &pool_a, &pool_b)
-                .replacen("backend = \"llama_cpp\"", "backend = \"mlx_dspark\"", 1)
-                .replacen("model_paths = [\"/models/foo.gguf\"]", model_paths, 1);
-            let (_dir, path) = write_config(&contents);
-            assert!(
-                WorkerConfig::load(&path).is_err(),
-                "invalid MLX model paths must be rejected: {model_paths}"
-            );
+    fn pool(key: &str, backend: &str, env: BTreeMap<String, String>) -> PoolConfig {
+        PoolConfig {
+            key: key.to_owned(),
+            backend: backend.to_owned(),
+            listen: "127.0.0.1:4001".to_owned(),
+            state_dir: PathBuf::from(format!("/tmp/{key}")),
+            startup_timeout: Duration::from_secs(10),
+            runtime: RuntimeConfig::default(),
+            shape: ShapeLimits::default(),
+            models: Vec::new(),
+            extra_image_loras: Vec::new(),
+            expected_hashes: BTreeMap::new(),
+            env,
         }
     }
 
     #[test]
-    fn rejects_non_loopback_backend_url() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let state = root.path().join("state");
-        let pool_a = root.path().join("gpu0");
-        let pool_b = root.path().join("gpu1");
-        let contents = sample_toml(&state, &pool_a, &pool_b).replacen(
-            "http://127.0.0.1:8081",
-            "http://192.0.2.1:8081",
-            1,
-        );
-        let (_dir, path) = write_config(&contents);
-        assert!(WorkerConfig::load(&path).is_err());
-    }
-
-    #[test]
-    fn rejects_backend_url_query_and_fragment() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let state = root.path().join("state");
-        let pool_a = root.path().join("gpu0");
-        let pool_b = root.path().join("gpu1");
-        for suffix in ["?x=1", "#backend"] {
-            let contents = sample_toml(&state, &pool_a, &pool_b).replacen(
-                "http://127.0.0.1:8081",
-                &format!("http://127.0.0.1:8081{suffix}"),
-                1,
-            );
-            let (_dir, path) = write_config(&contents);
-            assert!(
-                WorkerConfig::load(&path).is_err(),
-                "backend URL with {suffix} must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_mlx_state_dir_inside_model_path() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let model = root.path().join("model");
-        let state = model.join("state");
-        let pool_b = root.path().join("gpu1");
-        let contents = sample_toml(&root.path().join("worker-state"), &state, &pool_b)
-            .replacen("backend = \"llama_cpp\"", "backend = \"mlx_dspark\"", 1)
-            .replacen("/models/foo.gguf", &model.to_string_lossy(), 1);
-        let (_dir, path) = write_config(&contents);
-        assert!(WorkerConfig::load(&path).is_err());
-    }
-
-    #[test]
-    fn rejects_empty_pools() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let (_dir, path) = write_config(&format!(
-            r#"
-name = "worker-1"
-remote_url = "https://remote.example.internal"
-state_dir = "{state}"
-pools = []
-"#,
-            state = root.path().join("state").display(),
-        ));
-
-        let Err(err) = WorkerConfig::load(&path) else {
-            panic!("expected empty pools to be rejected");
-        };
-        assert!(err.to_string().contains("at least one pool"));
-    }
-
-    #[test]
-    fn rejects_duplicate_pool_keys() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let state = root.path().join("state");
-        let pool_a = root.path().join("gpu0");
-        let pool_b = root.path().join("gpu1");
-        let mut contents = sample_toml(&state, &pool_a, &pool_b);
-        contents = contents.replacen("key = \"gpu1\"", "key = \"gpu0\"", 1);
-        let (_dir, path) = write_config(&contents);
-
-        let Err(err) = WorkerConfig::load(&path) else {
-            panic!("expected duplicate pool keys to be rejected");
-        };
-        assert!(err.to_string().contains("duplicate pool key"));
-    }
-
-    #[test]
-    fn rejects_overlapping_device_selectors() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let state = root.path().join("state");
-        let pool_a = root.path().join("gpu0");
-        let pool_b = root.path().join("gpu1");
-        let mut contents = sample_toml(&state, &pool_a, &pool_b);
-        contents = contents.replacen(
-            "CUDA_VISIBLE_DEVICES = \"1\"",
-            "CUDA_VISIBLE_DEVICES = \"0\"",
-            1,
-        );
-        let (_dir, path) = write_config(&contents);
-
-        let Err(err) = WorkerConfig::load(&path) else {
-            panic!("expected overlapping device selectors to be rejected");
-        };
-        assert!(err.to_string().contains("both claim device"));
-    }
-
-    #[test]
-    fn rejects_relative_executable() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let state = root.path().join("state");
-        let pool_a = root.path().join("gpu0");
-        let pool_b = root.path().join("gpu1");
-        let contents = sample_toml(&state, &pool_a, &pool_b).replacen(
-            "executable = \"/usr/bin/true\"",
-            "executable = \"llama-server\"",
-            1,
-        );
-        let (_dir, path) = write_config(&contents);
-
-        let Err(err) = WorkerConfig::load(&path) else {
-            panic!("expected relative executable to be rejected");
-        };
-        assert!(err.to_string().contains("absolute path"));
-    }
-
-    #[test]
-    fn rejects_zero_startup_timeout() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let state = root.path().join("state");
-        let pool_a = root.path().join("gpu0");
-        let pool_b = root.path().join("gpu1");
-        let contents = sample_toml(&state, &pool_a, &pool_b).replacen(
-            "startup_timeout_secs = 30",
-            "startup_timeout_secs = 0",
-            1,
-        );
-        let (_dir, path) = write_config(&contents);
-
-        let Err(err) = WorkerConfig::load(&path) else {
-            panic!("expected zero startup timeout to be rejected");
-        };
-        assert!(err.to_string().contains("greater than zero"));
-    }
-
-    #[test]
-    fn rejects_malformed_expected_hash() {
-        let root = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let state = root.path().join("state");
-        let pool_a = root.path().join("gpu0");
-        let pool_b = root.path().join("gpu1");
-        let contents =
-            sample_toml(&state, &pool_a, &pool_b).replacen(&"a".repeat(64), "not-a-hash", 1);
-        let (_dir, path) = write_config(&contents);
-
-        let Err(err) = WorkerConfig::load(&path) else {
-            panic!("expected malformed hash to be rejected");
-        };
-        assert!(err.to_string().contains("64 hex characters"));
-    }
-
-    #[test]
-    fn hex_sha256_validation() {
+    fn sha256_config_validation() {
         assert!(is_hex_sha256(&"a".repeat(64)));
         assert!(!is_hex_sha256(&"a".repeat(63)));
-        assert!(!is_hex_sha256(
-            "not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-0123"
-        ));
+        assert!(!is_hex_sha256(&"z".repeat(64)));
+    }
+
+    #[test]
+    fn runtime_device_assignments_are_checked() {
+        assert!(valid_device_selector("metal"));
+        assert!(valid_device_selector("vulkan0"));
+        assert!(!valid_device_selector("vulkan-any"));
+        assert!(valid_params_backend("disk"));
+        assert!(valid_params_backend("diffusion=vulkan0,te=cpu"));
+        assert!(!valid_params_backend("diffusion=missing0"));
+        assert!(valid_vram_assignment("vulkan0=20,metal0=32"));
+        assert!(valid_vram_assignment("24"));
+        assert!(valid_vram_assignment("12"));
+        assert!(!valid_vram_assignment("0"));
+        assert!(!valid_vram_assignment("vulkan0=0"));
+    }
+
+    #[test]
+    fn native_device_pools_cannot_claim_the_same_device() {
+        assert!(
+            check_device_overlap(&[
+                pool("pool-a", "vulkan0", BTreeMap::new()),
+                pool("pool-b", "vulkan0", BTreeMap::new()),
+            ])
+            .is_err()
+        );
+        assert!(
+            check_device_overlap(&[
+                pool("pool-a", "metal", BTreeMap::new()),
+                pool("pool-b", "metal0", BTreeMap::new()),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cuda_device_index_is_scoped_by_distinct_visibility_selectors() {
+        assert!(
+            check_device_overlap(&[
+                pool(
+                    "pool-a",
+                    "cuda0",
+                    BTreeMap::from([("CUDA_VISIBLE_DEVICES".to_owned(), "0".to_owned())]),
+                ),
+                pool(
+                    "pool-b",
+                    "cuda0",
+                    BTreeMap::from([("CUDA_VISIBLE_DEVICES".to_owned(), "1".to_owned())]),
+                ),
+            ])
+            .is_ok()
+        );
     }
 }

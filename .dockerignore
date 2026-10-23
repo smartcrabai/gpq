@@ -1,0 +1,7 @@
+.git
+target/
+graphify-out/
+.env
+.env.*
+**/.env
+**/.env.*

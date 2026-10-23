@@ -7,13 +7,14 @@ name = "gpq-worker"
 repository.workspace = true
 version.workspace = true
 
-[[bin]]
-name = "gpq-worker"
-path = "src/main.rs"
-
 [package.metadata.dist]
-# ADR 0020: cargo-dist ships only the Worker binary.
-dist = true
+# ADR 0020: the Worker is a library of the single gpq executable (crates/gpq).
+dist = false
+
+[features]
+cuda = ["gpq-inference/cuda"]
+metal = ["gpq-inference/metal"]
+vulkan = ["gpq-inference/vulkan"]
 
 [dependencies]
 anyhow.workspace = true
@@ -25,6 +26,7 @@ clap.workspace = true
 connectrpc.workspace = true
 futures.workspace = true
 gpq-domain.workspace = true
+gpq-inference.workspace = true
 gpq-proto.workspace = true
 http.workspace = true
 rand.workspace = true

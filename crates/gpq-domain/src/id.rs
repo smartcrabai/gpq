@@ -105,14 +105,6 @@ typed_id! {
     /// A transient large binary input or output of a Generation.
     ArtifactId
 }
-typed_id! {
-    /// Exact model material identified by a content hash.
-    ModelVersionId
-}
-typed_id! {
-    /// An immutable Workflow graph and output contract.
-    WorkflowVersionId
-}
 
 #[cfg(test)]
 mod tests {
@@ -156,7 +148,5 @@ mod tests {
         assert_rejects_malformed::<DevicePoolId>();
         assert_rejects_malformed::<SlotId>();
         assert_rejects_malformed::<ArtifactId>();
-        assert_rejects_malformed::<ModelVersionId>();
-        assert_rejects_malformed::<WorkflowVersionId>();
     }
 }

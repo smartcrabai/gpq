@@ -1,0 +1,589 @@
+diff --git a/src/convert.cpp b/src/convert.cpp
+index b8a6212..1a5b3d6 100644
+--- a/src/convert.cpp
++++ b/src/convert.cpp
+@@ -511,7 +511,7 @@ static bool load_model_into_memory(ModelLoader& model_loader,
+         LOG_ERROR("failed to set LoRAs for convert");
+         return false;
+     }
+-    if (!manager.prepare_params(all_tensors)) {
++    if (!manager.prepare_params(all_tensors, {})) {
+         LOG_ERROR("failed to load model into memory for convert");
+         return false;
+     }
+diff --git a/src/core/compute_workspace.cpp b/src/core/compute_workspace.cpp
+index 54f0538..98a832d 100644
+--- a/src/core/compute_workspace.cpp
++++ b/src/core/compute_workspace.cpp
+@@ -39,6 +39,11 @@ namespace sd {
+         }
+         return false;
+     }
++    bool ComputeWorkspace::cpu_uses_vulkan_host_buffer() const {
++        const auto device = ggml_backend_get_device(backend_);
++        return sd_backend_is(backend_, "Vulkan") && device != nullptr &&
++               ggml_backend_dev_host_buffer_type(device) != nullptr;
++    }
+ 
+     ggml_backend_sched_t ComputeWorkspace::make_scheduler(size_t graph_size) {
+         std::vector<ggml_backend_t> backends{backend_};
+@@ -72,8 +77,10 @@ namespace sd {
+         if (measurement.buffers.empty()) {
+             return false;
+         }
+-        const bool grows = std::any_of(measurement.buffers.begin(), measurement.buffers.end(),
+-                                       [&](const BackendBufferSize& size) { return size.bytes > bytes(size.backend); });
++        const bool grows =
++            std::any_of(measurement.buffers.begin(), measurement.buffers.end(),
++                        [&](const BackendBufferSize& size) { return size.bytes > bytes(size.backend); }) ||
++            (cpu_uses_vulkan_host_buffer() && measurement.cpu_host_bytes > bytes(cpu_backend_));
+         if (measurement.scheduler != (scheduler_ != nullptr) || grows) {
+             release();
+         }
+@@ -81,8 +88,9 @@ namespace sd {
+     }
+ 
+     bool ComputeWorkspace::release_excess(const Measurement& measurement) {
+-        return std::any_of(measurement.buffers.begin(), measurement.buffers.end(),
+-                           [&](const BackendBufferSize& size) { return bytes(size.backend) > size.bytes; }) &&
++        return (std::any_of(measurement.buffers.begin(), measurement.buffers.end(),
++                            [&](const BackendBufferSize& size) { return bytes(size.backend) > size.bytes; }) ||
++                (cpu_uses_vulkan_host_buffer() && bytes(cpu_backend_) > measurement.cpu_host_bytes)) &&
+                release();
+     }
+ 
+@@ -140,7 +148,7 @@ namespace sd {
+         const std::function<ggml_backend_t(const ggml_tensor*)>& external_backend,
+         const AssignNodes& assign_nodes) {
+         if (!needs_scheduler(graph)) {
+-            return {{{backend_, direct_bytes}}, false};
++            return {{{backend_, direct_bytes}}, 0, false};
+         }
+         std::vector<const ggml_tensor*> tensors;
+         std::unordered_set<const ggml_tensor*> seen;
+@@ -209,6 +217,9 @@ namespace sd {
+             assign_nodes(scheduler, copy_graph);
+             std::vector<size_t> sizes(extra_backends_.size() + 2);
+             ggml_backend_sched_reserve_size(scheduler, copy_graph, sizes.data());
++            if (cpu_backend_ != nullptr && cpu_uses_vulkan_host_buffer()) {
++                result.cpu_host_bytes = sizes.back();
++            }
+             result.buffers.push_back({backend_, sizes[0]});
+             for (size_t i = 0; i < extra_backends_.size(); ++i) {
+                 result.buffers.push_back({extra_backends_[i], sizes[i + 1]});
+@@ -268,4 +279,13 @@ namespace sd {
+         }
+         return allocator_ != nullptr && backend == backend_ ? ggml_gallocr_get_buffer_size(allocator_, 0) : 0;
+     }
++
++    size_t ComputeWorkspace::budget_bytes(ggml_backend_t backend) const {
++        size_t bytes = this->bytes(backend);
++        if (backend == backend_ && cpu_uses_vulkan_host_buffer()) {
++            const size_t cpu_bytes = this->bytes(cpu_backend_);
++            bytes = cpu_bytes > SIZE_MAX - bytes ? SIZE_MAX : bytes + cpu_bytes;
++        }
++        return bytes;
++    }
+ }
+diff --git a/src/core/compute_workspace.h b/src/core/compute_workspace.h
+index fcf14b8..9bfb653 100644
+--- a/src/core/compute_workspace.h
++++ b/src/core/compute_workspace.h
+@@ -26,10 +26,12 @@ namespace sd {
+ 
+         ggml_backend_sched_t make_scheduler(size_t graph_size);
+         bool needs_scheduler(ggml_cgraph* graph) const;
++        bool cpu_uses_vulkan_host_buffer() const;
+ 
+     public:
+         struct Measurement {
+             std::vector<BackendBufferSize> buffers;
++            size_t cpu_host_bytes = 0;  // Budgeted on the primary device, tracked separately for growth checks.
+             bool scheduler = false;
+         };
+         using AssignNodes = std::function<void(ggml_backend_sched_t, ggml_cgraph*)>;
+@@ -57,6 +59,7 @@ namespace sd {
+         ggml_backend_sched_t scheduler() const { return scheduler_; }
+         ggml_backend_t cpu_backend() const { return cpu_backend_; }
+         size_t bytes(ggml_backend_t backend) const;
++        size_t budget_bytes(ggml_backend_t backend) const;
+         size_t reservation_count() const { return reservations_; }
+     };
+ }
+diff --git a/src/core/ggml_runner.cpp b/src/core/ggml_runner.cpp
+index 4c156ed..7d56eae 100644
+--- a/src/core/ggml_runner.cpp
++++ b/src/core/ggml_runner.cpp
+@@ -238,7 +238,7 @@ void GGMLRunner::pin_multi_device_nodes(ggml_backend_sched_t sched, ggml_cgraph*
+ 
+ size_t GGMLRunner::retained_runtime_buffer_bytes(ggml_backend_t backend) const {
+     backend      = backend == nullptr ? runtime_backend : backend;
+-    size_t bytes = workspace_.bytes(backend);
++    size_t bytes = workspace_.budget_bytes(backend);
+     if (backend == runtime_backend) {
+         const size_t cache_bytes = cache_.resident_bytes(ggml_backend_get_device(backend));
+         bytes                    = cache_bytes > SIZE_MAX - bytes ? SIZE_MAX : bytes + cache_bytes;
+@@ -720,14 +720,20 @@ ComputeWorkspace::Measurement GGMLRunner::measure(ggml_cgraph* graph, size_t dir
+ }
+ 
+ std::vector<DeviceMemoryRequest> GGMLRunner::memory_requests(
+-    const std::vector<BackendBufferSize>& sizes,
++    const sd::ComputeWorkspace::Measurement& measurement,
+     size_t pending_cache_bytes) const {
+     std::vector<DeviceMemoryRequest> requests;
+-    for (const auto& size : sizes) {
++    for (const auto& size : measurement.buffers) {
+         const size_t retained    = retained_runtime_buffer_bytes(size.backend);
+         const size_t reusable    = workspace_.bytes(size.backend);
+         const size_t cache_bytes = size.backend == runtime_backend ? pending_cache_bytes : 0;
+-        const size_t pending     = add_bytes(size.bytes > reusable ? size.bytes - reusable : 0, cache_bytes);
++        size_t pending            = add_bytes(size.bytes > reusable ? size.bytes - reusable : 0, cache_bytes);
++        if (size.backend == runtime_backend && measurement.cpu_host_bytes > 0) {
++            const size_t cpu_host_reusable = workspace_.bytes(workspace_.cpu_backend());
++            pending = add_bytes(pending, measurement.cpu_host_bytes > cpu_host_reusable
++                                             ? measurement.cpu_host_bytes - cpu_host_reusable
++                                             : 0);
++        }
+         size_t limit             = max_graph_vram_bytes;
+         if (is_multi_device()) {
+             size_t index = 0;
+@@ -840,7 +846,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
+     auto fits_monolithic = [&]() {
+         // Planning headroom absorbs allocation estimate drift; execution keeps the normal limits.
+         constexpr size_t planning_headroom = 128ULL * 1024ULL * 1024ULL;
+-        auto requests                      = memory_requests(full_measurement.buffers, cache_.pending_bytes(graph));
++        auto requests = memory_requests(full_measurement, cache_.pending_bytes(graph));
+         for (auto& request : requests) {
+             request.pending_allocation_bytes = add_bytes(request.pending_allocation_bytes, planning_headroom);
+         }
+@@ -931,15 +937,16 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
+         }
+         const size_t cut_bytes       = last ? 0 : cut_cache_.estimate_output_bytes(graph, segment);
+         const size_t new_cache_bytes = add_bytes(cut_bytes, cache_.pending_bytes(segment_graph));
+-        auto ensure_capacity         = [&]() {
++        std::vector<DeviceMemoryRequest> requests;
++        auto ensure_capacity = [&]() {
+             sync_runtime_residency();
+-            auto requests = memory_requests(measurement.buffers, new_cache_bytes);
++            requests = memory_requests(measurement, new_cache_bytes);
+             if (fits(requests, weights.params(index))) {
+                 return true;
+             }
+             if (workspace_.release_excess(measurement)) {
+                 sync_runtime_residency();
+-                requests = memory_requests(measurement.buffers, new_cache_bytes);
++                requests = memory_requests(measurement, new_cache_bytes);
+             }
+             const bool ready = weights.ensure_segment_capacity(index, requests);
+             if (!ready && manager != nullptr) {
+@@ -947,7 +954,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
+             }
+             return ready;
+         };
+-        if (!weights.segment_start(index, ensure_capacity)) {
++        if (!weights.segment_start(index, requests, ensure_capacity)) {
+             return fail_segment("weight preparation");
+         }
+         // Preparing weights can execute LoRA graphs and reclaim an idle workspace.
+@@ -977,7 +984,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
+             return fail_segment("allocated capacity check");
+         }
+         copy_data_to_backend_tensor(segment_graph, false);
+-        auto prefetch_requests = memory_requests(measurement.buffers, new_cache_bytes);
++        auto prefetch_requests = memory_requests(measurement, new_cache_bytes);
+         if (!prefetch_requests.empty()) {
+             weights.enqueue_next(index, prefetch_requests.front());
+         }
+diff --git a/src/core/ggml_runner.h b/src/core/ggml_runner.h
+index 02630c0..4b7e88d 100644
+--- a/src/core/ggml_runner.h
++++ b/src/core/ggml_runner.h
+@@ -142,8 +142,9 @@ private:
+     ggml_status last_compute_status_ = GGML_STATUS_SUCCESS;
+ 
+     sd::ComputeWorkspace::Measurement measure(ggml_cgraph* graph, size_t direct_bytes);
+-    std::vector<DeviceMemoryRequest> memory_requests(const std::vector<sd::BackendBufferSize>& sizes,
+-                                                     size_t pending_cache_bytes) const;
++    std::vector<DeviceMemoryRequest> memory_requests(
++        const sd::ComputeWorkspace::Measurement& measurement,
++        size_t pending_cache_bytes) const;
+     bool fits(const std::vector<DeviceMemoryRequest>& requests,
+               const std::vector<ggml_tensor*>& params) const;
+     bool execute_segment(ggml_cgraph* graph, int n_threads);
+diff --git a/src/core/segment_weight_pipeline.cpp b/src/core/segment_weight_pipeline.cpp
+index f769794..56d1581 100644
+--- a/src/core/segment_weight_pipeline.cpp
++++ b/src/core/segment_weight_pipeline.cpp
+@@ -101,7 +101,10 @@ namespace sd {
+         return true;
+     }
+ 
+-    bool SegmentWeightPipeline::segment_start(size_t segment_index, const std::function<bool()>& ensure_capacity) {
++    bool SegmentWeightPipeline::segment_start(
++        size_t segment_index,
++        const std::vector<DeviceMemoryRequest>& requests,
++        const std::function<bool()>& ensure_capacity) {
+         GGML_ASSERT(pinned_params_.empty());
+         activate(segment_index);
+         if (!ensure_capacity()) {
+@@ -111,7 +114,7 @@ namespace sd {
+         if (manager == nullptr) {
+             return segment_params_[segment_index].empty();
+         }
+-        if (!manager->prepare_params(segment_params_[segment_index])) {
++        if (!manager->prepare_params(segment_params_[segment_index], requests)) {
+             return false;
+         }
+         pinned_params_ = segment_params_[segment_index];
+diff --git a/src/core/segment_weight_pipeline.h b/src/core/segment_weight_pipeline.h
+index 598bf9f..61edcdb 100644
+--- a/src/core/segment_weight_pipeline.h
++++ b/src/core/segment_weight_pipeline.h
+@@ -51,7 +51,9 @@ namespace sd {
+         const std::vector<ggml_tensor*>& params(size_t index) const { return segment_params_[index]; }
+         bool ensure_segment_capacity(size_t segment_index,
+                                      const std::vector<DeviceMemoryRequest>& requests);
+-        bool segment_start(size_t segment_index, const std::function<bool()>& ensure_capacity);
++        bool segment_start(size_t segment_index,
++                           const std::vector<DeviceMemoryRequest>& requests,
++                           const std::function<bool()>& ensure_capacity);
+         void segment_end();
+         // Prefetch is best effort; segment_start falls back to synchronous loading.
+         void enqueue_next(size_t segment_index,
+diff --git a/src/device_residency_manager.h b/src/device_residency_manager.h
+index 0a2a889..1807ef6 100644
+--- a/src/device_residency_manager.h
++++ b/src/device_residency_manager.h
+@@ -49,7 +49,8 @@ struct DeviceResidencyManager {
+     virtual bool assign_compute_backend(const std::vector<ggml_tensor*>& tensors,
+                                         ggml_backend_t compute_backend)                                = 0;
+     virtual ggml_tensor* resolve_param_tensor(ggml_tensor* tensor) const { return nullptr; }
+-    virtual bool prepare_params(const std::vector<ggml_tensor*>& tensors)                 = 0;
++    virtual bool prepare_params(const std::vector<ggml_tensor*>& tensors,
++                                const std::vector<DeviceMemoryRequest>& requests) = 0;
+     virtual void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) = 0;
+     virtual void evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors)   = 0;
+     virtual WeightResidencyInfo inspect_compute_backend_params(
+diff --git a/src/model/adapter/lora.hpp b/src/model/adapter/lora.hpp
+index 1e5377c..f1d4516 100644
+--- a/src/model/adapter/lora.hpp
++++ b/src/model/adapter/lora.hpp
+@@ -2,7 +2,9 @@
+ #define __SD_MODEL_ADAPTER_LORA_HPP__
+ 
+ #include <cmath>
++#include <cstring>
+ #include <mutex>
++#include <vector>
+ #include "core/ggml_extend.h"
+ #include "core/ggml_extend_backend.h"
+ #include "core/ggml_runner.h"
+@@ -24,6 +26,9 @@ struct LoraModel : public GGMLRunner {
+     std::map<ggml_tensor*, ggml_tensor*> original_tensor_to_final_tensor;
+     std::set<std::string> applied_lora_tensors;
+     std::set<std::string> swapped_lora_up_tensors;
++    std::set<std::string> unsupported_cpy_model_tensors;
++    std::map<ggml_tensor*, ggml_tensor*> cpu_fallback_outputs;
++    std::vector<char> transfer_row_scratch;
+     std::set<std::string> skipped_incompatible_lora_tensors;
+     std::set<std::string> warned_incompatible_model_tensors;
+     std::string file_path;
+@@ -944,16 +949,76 @@ struct LoraModel : public GGMLRunner {
+         return out_diff;
+     }
+ 
++    bool is_vulkan_runtime_backend() const {
++        ggml_backend_dev_t device = ggml_backend_get_device(runtime_backend);
++        ggml_backend_reg_t reg    = device == nullptr ? nullptr : ggml_backend_dev_backend_reg(device);
++        const char* name          = reg == nullptr ? nullptr : ggml_backend_reg_name(reg);
++        return name != nullptr && std::strcmp(name, "Vulkan") == 0;
++    }
++
++    bool copy_tensor_rows(ggml_tensor* source, ggml_tensor* destination) {
++        if (source == nullptr || destination == nullptr || source->type != destination->type) {
++            return false;
++        }
++        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
++            if (source->ne[dim] != destination->ne[dim]) {
++                return false;
++            }
++        }
++
++        const int64_t block_size = ggml_blck_size(source->type);
++        const size_t inner_stride = ggml_type_size(source->type);
++        if (block_size <= 0 || source->ne[0] % block_size != 0 ||
++            destination->ne[0] % block_size != 0 ||
++            source->nb[0] != inner_stride || destination->nb[0] != inner_stride) {
++            return false;
++        }
++
++        ggml_backend_buffer_t source_buffer = source->view_src == nullptr ? source->buffer : source->view_src->buffer;
++        ggml_backend_buffer_t destination_buffer = destination->view_src == nullptr ? destination->buffer : destination->view_src->buffer;
++        if (source_buffer == nullptr || destination_buffer == nullptr ||
++            source->data == nullptr || destination->data == nullptr) {
++            return false;
++        }
++
++        const size_t row_size = ggml_row_size(source->type, source->ne[0]);
++        if (row_size == 0) {
++            return false;
++        }
++        transfer_row_scratch.resize(row_size);
++
++        // GGMLRunner synchronizes its workspace before read_outputs; flush Vulkan before the backend API transfers.
++        ggml_backend_synchronize(runtime_backend);
++        for (int64_t i3 = 0; i3 < source->ne[3]; ++i3) {
++            for (int64_t i2 = 0; i2 < source->ne[2]; ++i2) {
++                for (int64_t i1 = 0; i1 < source->ne[1]; ++i1) {
++                    const size_t source_offset = static_cast<size_t>(i1) * source->nb[1] +
++                                                 static_cast<size_t>(i2) * source->nb[2] +
++                                                 static_cast<size_t>(i3) * source->nb[3];
++                    const size_t destination_offset = static_cast<size_t>(i1) * destination->nb[1] +
++                                                      static_cast<size_t>(i2) * destination->nb[2] +
++                                                      static_cast<size_t>(i3) * destination->nb[3];
++                    ggml_backend_tensor_get(source, transfer_row_scratch.data(), source_offset, row_size);
++                    ggml_backend_tensor_set(destination, transfer_row_scratch.data(), destination_offset, row_size);
++                }
++            }
++        }
++        ggml_backend_synchronize(runtime_backend);
++        return true;
++    }
++
+     ggml_cgraph* build_lora_graph(const std::map<std::string, ggml_tensor*>& model_tensors,
+                                   const std::set<std::string>& model_tensor_names,
+-                                  SDVersion version) {
++                                  SDVersion version,
++                                  bool route_unsupported_cpy = true) {
+         size_t lora_graph_size = LORA_GRAPH_BASE_SIZE + lora_tensors.size() * 10;
+         ggml_cgraph* gf        = ggml_new_graph_custom(compute_ctx, lora_graph_size, false);
+ 
+         preprocess_lora_tensors(model_tensor_names);
+ 
+         original_tensor_to_final_tensor.clear();
+-        applied_lora_tensors.clear();
++        cpu_fallback_outputs.clear();
++        const bool vulkan_backend = is_vulkan_runtime_backend();
+ 
+         for (auto it : model_tensors) {
+             std::string model_tensor_name = it.first;
+@@ -972,15 +1037,30 @@ struct LoraModel : public GGMLRunner {
+             }
+ 
+             ggml_tensor* final_tensor;
++            bool used_cpu_fallback = false;
+             if (model_tensor->type != GGML_TYPE_F32 && model_tensor->type != GGML_TYPE_F16) {
+                 final_tensor = ggml_ext_cast_f32(compute_ctx, runtime_backend, model_tensor);
+                 final_tensor = ggml_add_inplace(compute_ctx, final_tensor, diff);
+-                final_tensor = ggml_cpy(compute_ctx, final_tensor, model_tensor);
++                ggml_tensor* copy_tensor = ggml_cpy(compute_ctx, final_tensor, model_tensor);
++                if (vulkan_backend && !ggml_backend_supports_op(runtime_backend, copy_tensor)) {
++                    unsupported_cpy_model_tensors.insert(model_tensor_name);
++                    if (route_unsupported_cpy) {
++                        ggml_tensor* cpu_target = ggml_dup_tensor(compute_ctx, model_tensor);
++                        final_tensor            = ggml_cpy(compute_ctx, copy_tensor->src[0], cpu_target);
++                        cpu_fallback_outputs[original_tensor] = final_tensor;
++                        used_cpu_fallback = true;
++                    } else {
++                        final_tensor = copy_tensor;
++                    }
++                } else {
++                    final_tensor = copy_tensor;
++                }
+             } else {
+                 final_tensor = ggml_add_inplace(compute_ctx, model_tensor, diff);
+             }
+             ggml_build_forward_expand(gf, final_tensor);
+-            if (!sd_backend_is_cpu(runtime_backend) && ggml_backend_buffer_is_host(original_tensor->buffer)) {
++            if (!used_cpu_fallback && !sd_backend_is_cpu(runtime_backend) &&
++                ggml_backend_buffer_is_host(original_tensor->buffer)) {
+                 original_tensor_to_final_tensor[original_tensor] = final_tensor;
+             }
+         }
+@@ -992,23 +1072,102 @@ struct LoraModel : public GGMLRunner {
+                SDVersion version,
+                int n_threads,
+                bool warn_unused = true) {
+-        auto get_graph = [&]() -> ggml_cgraph* {
+-            return build_lora_graph(model_tensors, model_tensor_names, version);
++        applied_lora_tensors.clear();
++        unsupported_cpy_model_tensors.clear();
++        const bool vulkan_backend = is_vulkan_runtime_backend();
++        if (vulkan_backend) {
++            reset_compute_ctx();
++            prepare_build_in_tensor_before();
++            ggml_cgraph* probe_graph = build_lora_graph(model_tensors, model_tensor_names, version, false);
++            prepare_build_in_tensor_after(probe_graph);
++            free_compute_ctx();
++            applied_lora_tensors.clear();
++            original_tensor_to_final_tensor.clear();
++            cpu_fallback_outputs.clear();
++        }
++
++        auto run_graph = [&](const std::map<std::string, ggml_tensor*>& tensors) {
++            auto get_graph = [&]() -> ggml_cgraph* {
++                return build_lora_graph(tensors, model_tensor_names, version);
++            };
++            auto read_outputs = [&]() {
++                for (const auto& item : cpu_fallback_outputs) {
++                    if (!copy_tensor_rows(item.second, item.first)) {
++                        LOG_ERROR("LoRA CPU CPY fallback could not copy output for tensor %s", item.first->name);
++                        return false;
++                    }
++                }
++                for (const auto& item : original_tensor_to_final_tensor) {
++                    if (!vulkan_backend) {
++                        ggml_backend_tensor_copy(item.second, item.first);
++                        continue;
++                    }
++                    ggml_tensor* source = item.second;
++                    ggml_tensor* destination = item.first;
++                    bool same_layout = source->view_src == nullptr && destination->view_src == nullptr &&
++                                       source->type == destination->type;
++                    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
++                        same_layout = same_layout && source->ne[dim] == destination->ne[dim] &&
++                                      source->nb[dim] == destination->nb[dim];
++                    }
++                    if (same_layout) {
++                        ggml_backend_tensor_copy(source, destination);
++                    } else if (!copy_tensor_rows(source, destination)) {
++                        LOG_ERROR("LoRA output copyback failed for tensor %s", destination->name);
++                        return false;
++                    }
++                }
++                return true;
++            };
++            std::set<std::string> completed_applied;
++            completed_applied.swap(applied_lora_tensors);
++            auto result = GGMLRunner::compute(get_graph, n_threads, false, true, read_outputs);
++            std::set<std::string> graph_applied;
++            graph_applied.swap(applied_lora_tensors);
++            original_tensor_to_final_tensor.clear();
++            cpu_fallback_outputs.clear();
++            applied_lora_tensors.swap(completed_applied);
++            if (result.has_value()) {
++                applied_lora_tensors.insert(graph_applied.begin(), graph_applied.end());
++            }
++            return result.has_value();
+         };
+-        auto read_outputs = [&]() {
+-            for (const auto& item : original_tensor_to_final_tensor) {
+-                ggml_backend_tensor_copy(item.second, item.first);
++
++        bool applied = true;
++        if (vulkan_backend && !unsupported_cpy_model_tensors.empty()) {
++            std::map<std::string, ggml_tensor*> supported_tensors;
++            for (const auto& item : model_tensors) {
++                if (unsupported_cpy_model_tensors.find(item.first) == unsupported_cpy_model_tensors.end()) {
++                    supported_tensors.insert(item);
++                }
+             }
+-            return true;
+-        };
+-        auto result = GGMLRunner::compute(get_graph, n_threads, false, true, read_outputs);
+-        if (!result.has_value()) {
++            if (!supported_tensors.empty()) {
++                applied = run_graph(supported_tensors);
++            }
++            for (const auto& name : unsupported_cpy_model_tensors) {
++                if (!applied) {
++                    break;
++                }
++                auto item = model_tensors.find(name);
++                if (item == model_tensors.end()) {
++                    LOG_ERROR("LoRA CPU CPY fallback could not find model tensor %s", name.c_str());
++                    applied = false;
++                    break;
++                }
++                std::map<std::string, ggml_tensor*> tensor{{item->first, item->second}};
++                applied = run_graph(tensor);
++            }
++        } else {
++            applied = run_graph(model_tensors);
++        }
++        if (!applied) {
+             LOG_ERROR("LoRA graph execution failed");
+         }
+         stat(!warn_unused);
+         original_tensor_to_final_tensor.clear();
++        cpu_fallback_outputs.clear();
+         runner_end();
+-        return result.has_value();
++        return applied;
+     }
+ 
+     bool apply(std::map<std::string, ggml_tensor*> model_tensors, SDVersion version, int n_threads, bool warn_unused = true) {
+diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+index 4562ebd..7d619bf 100644
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -626,7 +626,9 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
+     return true;
+ }
+ 
+-bool ModelManager::apply_loras_to_params(const std::vector<TensorState*>& states) {
++bool ModelManager::apply_loras_to_params(
++    const std::vector<TensorState*>& states,
++    const std::vector<DeviceMemoryRequest>& requests) {
+     if (loras_.empty() || applying_loras_)
+         return true;
+     applying_loras_ = true;
+@@ -695,6 +697,14 @@ bool ModelManager::apply_loras_to_params(const std::vector<TensorState*>& states
+                                                     borrowed_manager, lora_spec.file_id, lora_version_,
+                                                     target->residency_mode);
+ 
++            const auto memory_request = std::find_if(
++                requests.begin(), requests.end(),
++                [compute_backend](const DeviceMemoryRequest& request) {
++                    return request.compute_backend == compute_backend;
++                });
++            if (memory_request != requests.end()) {
++                lora->set_max_graph_vram_bytes(memory_request->max_backend_bytes);
++            }
+             LoraModel::filter_t lora_tensor_filter = nullptr;
+             if (!lora_spec.tensor_name_prefix_filter.empty()) {
+                 lora_tensor_filter = [&](const std::string& tensor_name) {
+@@ -1573,7 +1583,9 @@ size_t ModelManager::other_runtime_resident_bytes(uintptr_t owner_id,
+     return total_size;
+ }
+ 
+-bool ModelManager::prepare_params(const std::vector<ggml_tensor*>& tensors) {
++bool ModelManager::prepare_params(
++    const std::vector<ggml_tensor*>& tensors,
++    const std::vector<DeviceMemoryRequest>& requests) {
+     if (tensors.empty()) {
+         return true;
+     }
+@@ -1601,7 +1613,7 @@ bool ModelManager::prepare_params(const std::vector<ggml_tensor*>& tensors) {
+             state->last_use_epoch = use_epoch;
+         }
+     }
+-    if (!apply_loras_to_params(required_states)) {
++    if (!apply_loras_to_params(required_states, requests)) {
+         finish_compute_backend_usage(required_states);
+         std::unordered_set<TensorState*> failed(required_states.begin(), required_states.end());
+         invalidate_sources(failed);
+diff --git a/src/model_manager.h b/src/model_manager.h
+index fdb1108..1fce4a8 100644
+--- a/src/model_manager.h
++++ b/src/model_manager.h
+@@ -134,7 +134,8 @@ private:
+     bool validate_tensor(const TensorState& state) const;
+ 
+     bool load_tensors_to_params_backend(const std::vector<TensorState*>& states);
+-    bool apply_loras_to_params(const std::vector<TensorState*>& states);
++    bool apply_loras_to_params(const std::vector<TensorState*>& states,
++                               const std::vector<DeviceMemoryRequest>& requests);
+     bool mmap_params(const std::vector<TensorState*>& states,
+                      std::vector<ParamsStorageBlock*>& created_storage_blocks);
+     static std::vector<TensorStorage> find_tensor_sources(const TensorState& state, const String2TensorStorage& sources);
+@@ -270,7 +271,8 @@ public:
+ 
+     bool assign_compute_backend(const std::vector<ggml_tensor*>& tensors,
+                                 ggml_backend_t compute_backend) override;
+-    bool prepare_params(const std::vector<ggml_tensor*>& tensors) override;
++    bool prepare_params(const std::vector<ggml_tensor*>& tensors,
++                        const std::vector<DeviceMemoryRequest>& requests) override;
+     void set_workspace_reclaimer(uintptr_t owner_id, std::function<bool()> reclaim) override;
+     void remove_runtime_owner(uintptr_t owner_id) override;
+     bool fits_compute_backend_capacity(const DeviceMemoryRequest& request,

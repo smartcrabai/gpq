@@ -3,9 +3,7 @@
 //! Every method here authenticates the Tenant Master Key from the
 //! `Authorization: Bearer` header (ADR 0006, ADR 0009) before touching any
 //! Tenant-scoped data, and converts between the domain vocabulary
-//! (`gpq_domain`) and the wire vocabulary (`gpq_proto::gpq::v1`) - the two
-//! deliberately diverge (e.g. the domain splits a Workflow's execution
-//! limits out of its manifest; the wire message does not), so the
+//! (`gpq_domain`) and the wire vocabulary (`gpq_proto::gpq::v1`), so the
 //! conversions below are the single place that reconciles them.
 
 pub mod catalog;
@@ -54,26 +52,9 @@ pub(crate) fn authenticate(
 pub(crate) fn modality_to_proto(modality: gpq_domain::Modality) -> EnumValue<pb::Modality> {
     use gpq_domain::Modality as D;
     EnumValue::Known(match modality {
-        D::Llm => pb::Modality::MODALITY_LLM,
         D::Image => pb::Modality::MODALITY_IMAGE,
         D::Video => pb::Modality::MODALITY_VIDEO,
-        D::Music => pb::Modality::MODALITY_MUSIC,
-        D::Comfy => pb::Modality::MODALITY_COMFY,
     })
-}
-
-/// Converts a wire `Modality` to its domain enum. `None` for the zero value
-/// or an unrecognized wire value.
-pub(crate) fn modality_from_proto(value: EnumValue<pb::Modality>) -> Option<gpq_domain::Modality> {
-    use gpq_domain::Modality as D;
-    match value.as_known()? {
-        pb::Modality::MODALITY_LLM => Some(D::Llm),
-        pb::Modality::MODALITY_IMAGE => Some(D::Image),
-        pb::Modality::MODALITY_VIDEO => Some(D::Video),
-        pb::Modality::MODALITY_MUSIC => Some(D::Music),
-        pb::Modality::MODALITY_COMFY => Some(D::Comfy),
-        pb::Modality::MODALITY_UNSPECIFIED => None,
-    }
 }
 
 /// Converts a domain [`GenerationState`](gpq_domain::GenerationState) to its
@@ -167,7 +148,7 @@ pub(crate) fn artifact_placement_to_proto(
     EnumValue::Known(match placement {
         D::ObjectStore => pb::ArtifactPlacement::ARTIFACT_PLACEMENT_OBJECT_STORE,
         D::WorkerLocal => pb::ArtifactPlacement::ARTIFACT_PLACEMENT_WORKER_LOCAL,
-        D::InlineRelay => pb::ArtifactPlacement::ARTIFACT_PLACEMENT_INLINE_RELAY,
+        D::RemoteLocal => pb::ArtifactPlacement::ARTIFACT_PLACEMENT_REMOTE_LOCAL,
     })
 }
 
@@ -180,7 +161,7 @@ pub(crate) fn artifact_placement_from_proto(
     match value.as_known()? {
         pb::ArtifactPlacement::ARTIFACT_PLACEMENT_OBJECT_STORE => Some(D::ObjectStore),
         pb::ArtifactPlacement::ARTIFACT_PLACEMENT_WORKER_LOCAL => Some(D::WorkerLocal),
-        pb::ArtifactPlacement::ARTIFACT_PLACEMENT_INLINE_RELAY => Some(D::InlineRelay),
+        pb::ArtifactPlacement::ARTIFACT_PLACEMENT_REMOTE_LOCAL => Some(D::RemoteLocal),
         pb::ArtifactPlacement::ARTIFACT_PLACEMENT_UNSPECIFIED => None,
     }
 }
@@ -198,17 +179,6 @@ pub(crate) fn artifact_state_to_proto(
         D::Consumed => pb::ArtifactState::ARTIFACT_STATE_CONSUMED,
         D::Expired => pb::ArtifactState::ARTIFACT_STATE_EXPIRED,
         D::Lost => pb::ArtifactState::ARTIFACT_STATE_LOST,
-    })
-}
-
-/// Converts a domain [`BackendKind`](gpq_domain::BackendKind) to its wire
-/// enum.
-pub(crate) fn backend_kind_to_proto(kind: gpq_domain::BackendKind) -> EnumValue<pb::BackendKind> {
-    use gpq_domain::BackendKind as D;
-    EnumValue::Known(match kind {
-        D::LlamaCpp => pb::BackendKind::BACKEND_KIND_LLAMA_CPP,
-        D::MlxDspark => pb::BackendKind::BACKEND_KIND_MLX_DSPARK,
-        D::ComfyUi => pb::BackendKind::BACKEND_KIND_COMFYUI,
     })
 }
 
@@ -243,38 +213,20 @@ pub(crate) fn priority_from_wire(value: u32) -> Result<gpq_domain::Priority, Str
 
 #[cfg(test)]
 mod tests {
-    use buffa::EnumValue;
-    use gpq_domain::{
-        ArtifactPlacement, BackendKind, FailureKind, GenerationState, MediaKind, Modality,
-    };
+    use gpq_domain::{ArtifactPlacement, FailureKind, GenerationState, MediaKind, Modality};
 
     use super::*;
 
     #[test]
-    fn modality_round_trips_through_proto() {
-        for modality in [
-            Modality::Llm,
-            Modality::Image,
-            Modality::Video,
-            Modality::Music,
-            Modality::Comfy,
-        ] {
-            let proto = modality_to_proto(modality);
-            assert_eq!(modality_from_proto(proto), Some(modality));
-        }
-    }
-
-    #[test]
-    fn modality_unspecified_has_no_domain_value() {
+    fn modality_maps_to_proto_enum() {
         assert_eq!(
-            modality_from_proto(EnumValue::Known(pb::Modality::MODALITY_UNSPECIFIED)),
-            None
+            modality_to_proto(Modality::Image).as_known(),
+            Some(pb::Modality::MODALITY_IMAGE)
         );
-    }
-
-    #[test]
-    fn modality_unknown_wire_value_has_no_domain_value() {
-        assert_eq!(modality_from_proto(EnumValue::Unknown(99)), None);
+        assert_eq!(
+            modality_to_proto(Modality::Video).as_known(),
+            Some(pb::Modality::MODALITY_VIDEO)
+        );
     }
 
     #[test]
@@ -304,7 +256,7 @@ mod tests {
         for placement in [
             ArtifactPlacement::ObjectStore,
             ArtifactPlacement::WorkerLocal,
-            ArtifactPlacement::InlineRelay,
+            ArtifactPlacement::RemoteLocal,
         ] {
             let proto = artifact_placement_to_proto(placement);
             assert_eq!(artifact_placement_from_proto(proto), Some(placement));
@@ -331,20 +283,6 @@ mod tests {
             FailureKind::LeaseExpired,
         ] {
             let proto = failure_kind_to_proto(kind);
-            assert!(proto.is_known());
-            assert!(seen.insert(proto.to_i32()));
-        }
-    }
-
-    #[test]
-    fn backend_kind_maps_every_domain_variant() {
-        let mut seen = std::collections::BTreeSet::new();
-        for kind in [
-            BackendKind::LlamaCpp,
-            BackendKind::MlxDspark,
-            BackendKind::ComfyUi,
-        ] {
-            let proto = backend_kind_to_proto(kind);
             assert!(proto.is_known());
             assert!(seen.insert(proto.to_i32()));
         }

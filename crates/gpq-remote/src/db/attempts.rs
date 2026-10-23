@@ -89,8 +89,8 @@ impl AttemptRow {
 /// Failure to create a new Attempt.
 #[derive(Debug, thiserror::Error)]
 pub enum CreateAttemptError {
-    /// The Generation is not `Queued`, so it cannot be leased.
-    #[error("generation is not queued")]
+    /// The Generation is not `Queued` or this pool was rejected for it.
+    #[error("generation is not queued or pool is excluded for it")]
     NotQueued,
     /// The Generation already used every automatic retry (ADR 0003).
     #[error("generation already used the maximum of {max} attempts")]
@@ -115,13 +115,11 @@ pub enum CreateAttemptError {
 /// # Errors
 ///
 /// Returns [`CreateAttemptError::NotQueued`] if the Generation does not
-/// exist or is not `Queued` — the double-assignment guard: a concurrent
-/// caller that already leased this Generation (or one racing a state
-/// transition away from `Queued`) sees this instead of creating a second
-/// Attempt. Returns [`CreateAttemptError::MaxAttemptsReached`] if the
-/// Generation already has `MAX_ATTEMPTS` Attempts (ADR 0003). Returns
-/// [`CreateAttemptError::Database`] if the locking select or either write
-/// fails.
+/// exist, is not `Queued`, or `pool_id` has been rejected for this Generation.
+/// The Generation lock makes the latter check atomic with concurrent
+/// pre-execution rejections. Returns [`CreateAttemptError::MaxAttemptsReached`]
+/// if the Generation already has `MAX_ATTEMPTS` Attempts (ADR 0003). Returns
+/// [`CreateAttemptError::Database`] if a query or write fails.
 pub async fn create(
     conn: &mut PgConnection,
     tenant_id: TenantId,
@@ -148,6 +146,12 @@ pub async fn create(
         return Err(CreateAttemptError::NotQueued);
     };
     if generation.state != "queued" {
+        return Err(CreateAttemptError::NotQueued);
+    }
+    if crate::db::native_exclusions::excluded_pools(conn, tenant_id, generation_id)
+        .await?
+        .contains(&pool_id)
+    {
         return Err(CreateAttemptError::NotQueued);
     }
 
@@ -210,8 +214,11 @@ pub async fn heartbeat(
     let expiry = lease_expiry_from(now);
 
     let renewed: Vec<(Uuid,)> = sqlx::query_as(
-        "UPDATE attempts SET lease_expires_at = $4, last_heartbeat_at = $3 \
-         WHERE tenant_id = $1 AND worker_id = $2 AND id = ANY($5) AND state IN ('leased', 'running') \
+        "UPDATE attempts SET lease_expires_at = clock_timestamp() + ($4 - $3), \
+            last_heartbeat_at = clock_timestamp() \
+         WHERE tenant_id = $1 AND worker_id = $2 AND id = ANY($5) \
+            AND state IN ('leased', 'running') \
+            AND lease_expires_at > clock_timestamp() \
          RETURNING id",
     )
     .bind(tenant_id.as_uuid())
@@ -239,13 +246,20 @@ pub async fn generation_id_of(
     conn: &mut PgConnection,
     tenant_id: TenantId,
     attempt_id: AttemptId,
+    worker_id: WorkerId,
+    now: DateTime<Utc>,
 ) -> sqlx::Result<Option<GenerationId>> {
-    let row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT generation_id FROM attempts WHERE tenant_id = $1 AND id = $2")
-            .bind(tenant_id.as_uuid())
-            .bind(attempt_id.as_uuid())
-            .fetch_optional(conn)
-            .await?;
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT generation_id FROM attempts \
+         WHERE tenant_id = $1 AND id = $2 AND worker_id = $3 \
+            AND state IN ('leased', 'running') AND lease_expires_at > $4",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(attempt_id.as_uuid())
+    .bind(worker_id.as_uuid())
+    .bind(now)
+    .fetch_optional(conn)
+    .await?;
     Ok(row.map(|(id,)| GenerationId::from_uuid(id)))
 }
 
@@ -260,17 +274,20 @@ pub async fn mark_running(
     conn: &mut PgConnection,
     tenant_id: TenantId,
     id: AttemptId,
+    worker_id: WorkerId,
     now: DateTime<Utc>,
 ) -> sqlx::Result<bool> {
     let result = sqlx::query(
-        "UPDATE attempts a SET state = 'running', started_at = $3, \
-            execution_deadline = $3 + g.execution_timeout \
+        "UPDATE attempts a SET state = 'running', started_at = $4, \
+            execution_deadline = $4 + g.execution_timeout \
          FROM generations g \
-         WHERE a.tenant_id = $1 AND a.id = $2 AND a.state = 'leased' \
+         WHERE a.tenant_id = $1 AND a.id = $2 AND a.worker_id = $3 \
+            AND a.state = 'leased' AND a.lease_expires_at > $4 \
             AND g.tenant_id = a.tenant_id AND g.id = a.generation_id",
     )
     .bind(tenant_id.as_uuid())
     .bind(id.as_uuid())
+    .bind(worker_id.as_uuid())
     .bind(now)
     .execute(conn)
     .await?;
@@ -292,6 +309,7 @@ pub async fn finish(
     conn: &mut PgConnection,
     tenant_id: TenantId,
     id: AttemptId,
+    worker_id: Option<WorkerId>,
     to: AttemptState,
     failure: Option<(FailureKind, &str, bool)>,
     now: DateTime<Utc>,
@@ -307,6 +325,7 @@ pub async fn finish(
         "UPDATE attempts SET state = $3, finished_at = $4, failure_kind = $5, \
             failure_message = $6, worker_retry_hint = $7 \
          WHERE tenant_id = $1 AND id = $2 AND state IN ('leased', 'running') \
+            AND ($8::uuid IS NULL OR worker_id = $8) \
          RETURNING pool_id",
     )
     .bind(tenant_id.as_uuid())
@@ -316,9 +335,9 @@ pub async fn finish(
     .bind(failure_kind)
     .bind(failure_message)
     .bind(worker_retry_hint)
+    .bind(worker_id.map(|id| id.as_uuid()))
     .fetch_optional(&mut *conn)
     .await?;
-
     let Some((pool_id,)) = settled else {
         return Ok(false);
     };
@@ -326,65 +345,70 @@ pub async fn finish(
     Ok(true)
 }
 
-/// The classified failure a settlement records, grouped so
-/// [`finish_and_decide`] stays under clippy's argument-count ceiling.
+/// Failure information shared by the Worker-facing and internal settlement
+/// entry points. The message is borrowed through the transaction.
+pub struct FailureDetails<'a> {
+    /// The normalized cause that drives Remote's retry policy.
+    pub kind: FailureKind,
+    /// Raw diagnostic text stored with the failure.
+    pub message: &'a str,
+    /// The Worker's retry hint, recorded but not obeyed (ADR 0003).
+    pub worker_retry_hint: bool,
+}
+
+/// A terminal Attempt state paired with the failure details it records.
 struct Settlement<'a> {
     /// The terminal `AttemptState` this settlement records.
     to: AttemptState,
-    /// The classified cause.
-    failure_kind: FailureKind,
-    /// Raw diagnostic text.
-    message: &'a str,
-    /// The Worker's retry hint; recorded but not obeyed (ADR 0003).
-    worker_retry_hint: bool,
+    /// Classified failure details, if the settlement records a failure.
+    failure: FailureDetails<'a>,
 }
 
-/// Shared core of [`record_failure`] and [`record_lease_expiry`]: settles a
-/// live Attempt into `settlement.to` and applies ADR 0003's retry policy to
-/// its Generation in the same transaction.
+/// Shared core of [`record_failure`], [`record_failure_for_worker`], and
+/// [`record_lease_expiry`]: settles a live Attempt into `settlement.to` and
+/// applies ADR 0003's retry policy to its Generation in the same transaction.
 ///
-/// A `FailureKind::OutOfMemory` first marks the executing Pool incapable of
-/// the Generation's pinned Version, so the freshly-invalidated Pool is
-/// correctly excluded from the `eligible_candidates_remain` check that
-/// follows (ADR 0003). A Generation already `Cancelling` settles `Cancelled`
-/// regardless of the retry policy, since a failure racing a cancellation
-/// should not resurrect or fail it. Returns `None` only when the Attempt was
-/// already settled or gone (a race with another caller).
+/// OOM Attempts and pre-execution rejections are excluded for this Generation
+/// only; neither creates a future-model or shape-wide blacklist. A Generation
+/// already `Cancelling` settles `Cancelled` regardless of retry policy.
+/// Returns `None` only when the Attempt was already settled or gone.
 async fn finish_and_decide(
     conn: &mut PgConnection,
     tenant_id: TenantId,
     attempt_id: AttemptId,
+    worker_id: Option<WorkerId>,
     settlement: Settlement<'_>,
     now: DateTime<Utc>,
 ) -> sqlx::Result<Option<(GenerationId, RetryDecision)>> {
     #[derive(sqlx::FromRow)]
     struct Lock {
         generation_id: Uuid,
-        pool_id: Uuid,
     }
     let Some(lock) = sqlx::query_as::<_, Lock>(
-        "SELECT generation_id, pool_id FROM attempts \
-         WHERE tenant_id = $1 AND id = $2 AND state IN ('leased', 'running')",
+        "SELECT generation_id FROM attempts \
+         WHERE tenant_id = $1 AND id = $2 AND state IN ('leased', 'running') \
+            AND ($3::uuid IS NULL OR worker_id = $3)",
     )
     .bind(tenant_id.as_uuid())
     .bind(attempt_id.as_uuid())
+    .bind(worker_id.map(|id| id.as_uuid()))
     .fetch_optional(&mut *conn)
     .await?
     else {
         return Ok(None);
     };
     let generation_id = GenerationId::from_uuid(lock.generation_id);
-    let pool_id = DevicePoolId::from_uuid(lock.pool_id);
 
     let settled = finish(
         conn,
         tenant_id,
         attempt_id,
+        worker_id,
         settlement.to,
         Some((
-            settlement.failure_kind,
-            settlement.message,
-            settlement.worker_retry_hint,
+            settlement.failure.kind,
+            settlement.failure.message,
+            settlement.failure.worker_retry_hint,
         )),
         now,
     )
@@ -409,23 +433,24 @@ async fn finish_and_decide(
     let requirement =
         crate::db::generations::requirement_of(conn, tenant_id, generation_id).await?;
 
-    if settlement.failure_kind.invalidates_slot_capability()
-        && let Some(req) = &requirement
-    {
-        crate::db::workers::mark_pool_incapable(conn, tenant_id, pool_id, req.version).await?;
-    }
-
+    // Generation-local OOM history and pre-execution rejections filter only
+    // this Generation's retry candidates.
+    let excluded_pools =
+        crate::db::native_exclusions::excluded_pools(conn, tenant_id, generation_id).await?;
     let capabilities = crate::db::workers::pool_capabilities(conn, tenant_id).await?;
     let eligible_candidates_remain = requirement.as_ref().is_some_and(|req| {
         gpq_domain::any_candidate_remains(
-            capabilities.iter().map(|(capability, ..)| capability),
+            capabilities
+                .iter()
+                .filter(|(capability, ..)| !excluded_pools.contains(&capability.pool_id))
+                .map(|(capability, ..)| capability),
             req,
         )
     });
-
     let attempts_used = u32::try_from(attempt_count).unwrap_or(u32::MAX);
     let decision = settlement
-        .failure_kind
+        .failure
+        .kind
         .retry_decision(attempts_used, eligible_candidates_remain);
     match decision {
         RetryDecision::Requeue => {
@@ -436,8 +461,8 @@ async fn finish_and_decide(
                 conn,
                 tenant_id,
                 generation_id,
-                settlement.failure_kind,
-                settlement.message,
+                settlement.failure.kind,
+                settlement.failure.message,
                 now,
             )
             .await?;
@@ -457,20 +482,45 @@ pub async fn record_failure(
     conn: &mut PgConnection,
     tenant_id: TenantId,
     attempt_id: AttemptId,
-    failure_kind: FailureKind,
-    message: &str,
-    worker_retry_hint: bool,
+    failure: FailureDetails<'_>,
     now: DateTime<Utc>,
 ) -> sqlx::Result<Option<(GenerationId, RetryDecision)>> {
     finish_and_decide(
         conn,
         tenant_id,
         attempt_id,
+        None,
         Settlement {
             to: AttemptState::Failed,
-            failure_kind,
-            message,
-            worker_retry_hint,
+            failure,
+        },
+        now,
+    )
+    .await
+}
+
+/// Settles a Worker-reported failure only when the attempt belongs to it.
+///
+/// # Errors
+///
+/// Returns [`sqlx::Error`] if any query in [`finish_and_decide`]'s
+/// settlement, retry-policy, or capability lookups fails.
+pub async fn record_failure_for_worker(
+    conn: &mut PgConnection,
+    tenant_id: TenantId,
+    attempt_id: AttemptId,
+    worker_id: WorkerId,
+    failure: FailureDetails<'_>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Option<(GenerationId, RetryDecision)>> {
+    finish_and_decide(
+        conn,
+        tenant_id,
+        attempt_id,
+        Some(worker_id),
+        Settlement {
+            to: AttemptState::Failed,
+            failure,
         },
         now,
     )
@@ -495,11 +545,14 @@ pub async fn record_lease_expiry(
         conn,
         tenant_id,
         attempt_id,
+        None,
         Settlement {
             to: AttemptState::LeaseExpired,
-            failure_kind: FailureKind::LeaseExpired,
-            message: "lease expired without a renewing heartbeat",
-            worker_retry_hint: false,
+            failure: FailureDetails {
+                kind: FailureKind::LeaseExpired,
+                message: "lease expired without a renewing heartbeat",
+                worker_retry_hint: false,
+            },
         },
         now,
     )
@@ -510,40 +563,74 @@ pub async fn record_lease_expiry(
 /// before execution starts never count as an Attempt (ADR 0003), so the
 /// Attempt row is deleted outright, its claimed Execution Slot is released,
 /// `attempt_count` is rolled back, and the Generation returns to `Queued`.
-/// Returns `None` when the Attempt was not (or no longer) `Leased`, i.e.
-/// execution had already started or another caller already handled it.
+/// Returns `None` unless the named Worker owns a live `Leased` Attempt and its
+/// Generation is `Running`; no slot, attempt, or Generation state changes then.
 ///
 /// # Errors
 ///
-/// Returns [`sqlx::Error`] if the delete, the Execution Slot release, or
-/// the Generation's `Running -> Queued` rollback update fails.
+/// Returns [`sqlx::Error`] if recording the generation-scoped pool rejection,
+/// deleting the Attempt, releasing its Slot, or requeuing the Generation fails.
 pub async fn reject_lease(
     conn: &mut PgConnection,
     tenant_id: TenantId,
     attempt_id: AttemptId,
+    worker_id: WorkerId,
     failure_kind: FailureKind,
     message: &str,
     now: DateTime<Utc>,
 ) -> sqlx::Result<Option<GenerationId>> {
     #[derive(sqlx::FromRow)]
-    struct Deleted {
+    struct LeaseLock {
         generation_id: Uuid,
         pool_id: Uuid,
+        lease_expires_at: DateTime<Utc>,
     }
-    let Some(deleted) = sqlx::query_as::<_, Deleted>(
-        "DELETE FROM attempts WHERE tenant_id = $1 AND id = $2 AND state = 'leased' \
-         RETURNING generation_id, pool_id",
+    let Some(lease) = sqlx::query_as::<_, LeaseLock>(
+        "SELECT generation_id, pool_id, lease_expires_at FROM attempts \
+         WHERE tenant_id = $1 AND id = $2 AND worker_id = $3 AND state = 'leased' \
+         FOR UPDATE",
     )
     .bind(tenant_id.as_uuid())
     .bind(attempt_id.as_uuid())
+    .bind(worker_id.as_uuid())
     .fetch_optional(&mut *conn)
     .await?
     else {
         return Ok(None);
     };
-    let generation_id = GenerationId::from_uuid(deleted.generation_id);
-    crate::db::workers::release_slot(conn, tenant_id, DevicePoolId::from_uuid(deleted.pool_id))
-        .await?;
+    if lease.lease_expires_at <= now {
+        return Ok(None);
+    }
+    let generation_id = GenerationId::from_uuid(lease.generation_id);
+    let generation_state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM generations WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(generation_id.as_uuid())
+    .fetch_optional(&mut *conn)
+    .await?;
+    if generation_state.as_deref() != Some("running") {
+        return Ok(None);
+    }
+
+    let pool_id = DevicePoolId::from_uuid(lease.pool_id);
+    crate::db::native_exclusions::record_preexecution_rejection(
+        conn,
+        tenant_id,
+        generation_id,
+        pool_id,
+    )
+    .await?;
+    sqlx::query(
+        "DELETE FROM attempts WHERE tenant_id = $1 AND id = $2 AND worker_id = $3 \
+         AND state = 'leased'",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(attempt_id.as_uuid())
+    .bind(worker_id.as_uuid())
+    .execute(&mut *conn)
+    .await?;
+    crate::db::workers::release_slot(conn, tenant_id, pool_id).await?;
 
     sqlx::query(
         "UPDATE generations SET state = 'queued', attempt_count = greatest(attempt_count - 1, 0), \
@@ -563,9 +650,9 @@ pub async fn reject_lease(
 /// Terminal compare-and-set for a Worker's `CancelAcknowledged`: the Attempt
 /// settles `Cancelled` (if still live) and the Generation settles `Cancelled`
 /// (ADR 0003). Cancellation acknowledgement races result commitment through
-/// this same kind of compare-and-set, so `None` means this call lost the race
-/// (the Generation was already terminal) and the caller must not publish a
-/// duplicate terminal event.
+/// this same kind of compare-and-set. `None` means the Attempt is not owned
+/// by the named Worker or its Generation is not `Cancelling`; neither row or
+/// slot is then changed.
 ///
 /// # Errors
 ///
@@ -576,6 +663,7 @@ pub async fn acknowledge_cancel(
     conn: &mut PgConnection,
     tenant_id: TenantId,
     attempt_id: AttemptId,
+    worker_id: WorkerId,
     now: DateTime<Utc>,
 ) -> sqlx::Result<Option<GenerationId>> {
     #[derive(sqlx::FromRow)]
@@ -584,31 +672,56 @@ pub async fn acknowledge_cancel(
         state: String,
     }
     let Some(lock) = sqlx::query_as::<_, Lock>(
-        "SELECT generation_id, state FROM attempts WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+        "SELECT generation_id, state FROM attempts \
+         WHERE tenant_id = $1 AND id = $2 AND worker_id = $3 FOR UPDATE",
     )
     .bind(tenant_id.as_uuid())
     .bind(attempt_id.as_uuid())
+    .bind(worker_id.as_uuid())
     .fetch_optional(&mut *conn)
     .await?
     else {
         return Ok(None);
     };
     let generation_id = GenerationId::from_uuid(lock.generation_id);
+    // The update below rechecks this state without locking Generation ahead
+    // of Attempt/Slot, preserving the settlement lock order.
+    let generation_state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM generations WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id.as_uuid())
+            .bind(generation_id.as_uuid())
+            .fetch_optional(&mut *conn)
+            .await?;
+    if generation_state.as_deref() != Some("cancelling") {
+        return Ok(None);
+    }
 
     if let Ok(state) = lock.state.parse::<AttemptState>()
         && state.is_live()
     {
-        finish(
-            conn,
-            tenant_id,
-            attempt_id,
-            AttemptState::Cancelled,
-            None,
-            now,
+        let pool_id: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE attempts SET state = 'cancelled', finished_at = $4, failure_kind = NULL, \
+                failure_message = '', worker_retry_hint = false \
+             WHERE tenant_id = $1 AND id = $2 AND worker_id = $3 \
+                AND state IN ('leased', 'running') \
+                AND EXISTS (SELECT 1 FROM generations g \
+                    WHERE g.tenant_id = $1 AND g.id = $5 AND g.state = 'cancelling') \
+             RETURNING pool_id",
         )
+        .bind(tenant_id.as_uuid())
+        .bind(attempt_id.as_uuid())
+        .bind(worker_id.as_uuid())
+        .bind(now)
+        .bind(generation_id.as_uuid())
+        .fetch_optional(&mut *conn)
         .await?;
+        if let Some(pool_id) = pool_id {
+            crate::db::workers::release_slot(conn, tenant_id, DevicePoolId::from_uuid(pool_id))
+                .await?;
+        } else {
+            return Ok(None);
+        }
     }
-
     let settled =
         crate::db::generations::finish_cancelled(conn, tenant_id, generation_id, now).await?;
     Ok(settled.then_some(generation_id))

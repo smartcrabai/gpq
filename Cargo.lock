@@ -1910,6 +1910,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpq"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "buffa",
+ "chrono",
+ "clap",
+ "connectrpc",
+ "futures",
+ "gpq-domain",
+ "gpq-proto",
+ "gpq-remote",
+ "gpq-worker",
+ "hex",
+ "hmac 0.13.0",
+ "http 1.5.0",
+ "hyper 1.11.1",
+ "rand 0.10.3",
+ "reqwest",
+ "sha2 0.11.0",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "gpq-domain"
 version = "0.1.0"
 dependencies = [
@@ -1920,6 +1952,17 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "gpq-inference"
+version = "0.1.0"
+dependencies = [
+ "cmake",
+ "gpq-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1940,7 +1983,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aws-config",
- "aws-credential-types",
  "aws-sdk-s3",
  "axum",
  "base64 0.23.1",
@@ -1955,7 +1997,6 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "http 1.5.0",
- "hyper 1.11.1",
  "ipnet",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -1967,12 +2008,9 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
- "testcontainers",
- "testcontainers-modules",
  "thiserror",
  "tokio",
  "tokio-stream",
- "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tower-http 0.7.1",
  "tracing",
@@ -1995,6 +2033,7 @@ dependencies = [
  "connectrpc",
  "futures",
  "gpq-domain",
+ "gpq-inference",
  "gpq-proto",
  "http 1.5.0",
  "keyring",

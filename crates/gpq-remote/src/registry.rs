@@ -3,7 +3,7 @@
 //! ADR 0010: Remote holds no durable state of its own; the only in-memory
 //! state it keeps is the set of currently connected Worker control sessions,
 //! used to route outbound [`RemoteMessage`]s and to answer "is this Worker
-//! online" questions for scheduling and `OpenAI` model availability (ADR 0006).
+//! online" questions for scheduling and Native catalog availability (ADR 0006).
 //! Losing this map is safe: a reconnecting Worker re-advertises its
 //! capabilities and Remote's database state is otherwise authoritative.
 

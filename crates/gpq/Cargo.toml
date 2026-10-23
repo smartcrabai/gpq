@@ -1,0 +1,65 @@
+[package]
+description = "The single GPU Generation Queue executable: remote, worker, and infer roles"
+edition.workspace = true
+homepage = "https://github.com/smartcrabai/gpq"
+license.workspace = true
+name = "gpq"
+repository.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "gpq"
+path = "src/main.rs"
+
+[package.metadata.dist]
+# ADR 0020: cargo-dist ships the single gpq executable; its roles are subcommands.
+dist = true
+
+[features]
+# Standard builds already enable the platform default backend (below). These
+# explicit features are for specialized builds: `cuda` is never default.
+cuda = ["gpq-worker/cuda"]
+metal = ["gpq-worker/metal"]
+vulkan = ["gpq-worker/vulkan"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gpq-remote.workspace = true
+gpq-worker.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-s3.workspace = true
+buffa.workspace = true
+chrono.workspace = true
+connectrpc.workspace = true
+futures.workspace = true
+gpq-domain.workspace = true
+gpq-proto.workspace = true
+hex.workspace = true
+hmac.workspace = true
+http.workspace = true
+hyper.workspace = true
+rand.workspace = true
+reqwest = { workspace = true, features = ["http2"] }
+sha2.workspace = true
+sqlx.workspace = true
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+# Standard OS distributions: Metal on macOS, Vulkan on Linux and Windows
+# (NVIDIA and AMD). cargo-dist applies one feature set to every target, so the
+# platform default lives in per-target dependency features instead.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpq-worker = { workspace = true, features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+gpq-worker = { workspace = true, features = ["vulkan"] }
+
+[lints]
+workspace = true

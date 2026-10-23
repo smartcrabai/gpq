@@ -1,0 +1,7 @@
+# Ship a single Windows gpq executable without requiring the VC++ runtime
+# redistributable. Native inference CMake targets use the matching /MT runtime.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

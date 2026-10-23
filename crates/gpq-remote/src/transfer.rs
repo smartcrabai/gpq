@@ -9,7 +9,8 @@ use buffa::EnumValue;
 use connectrpc::{ConnectError, Encodable, ErrorCode, Response, ServiceResult, ServiceStream};
 use futures::StreamExt;
 use gpq_domain::{
-    ArtifactId, ArtifactManifest, ArtifactState, ContentHash, Hasher, MediaKind, TenantId,
+    ArtifactId, ArtifactManifest, ArtifactState, AttemptId, ContentHash, Hasher, MediaKind,
+    TenantId,
 };
 use gpq_proto::gpq::v1::MediaKind as ProtoMediaKind;
 use gpq_proto::gpq::worker::v1::__buffa::oneof::deliver_artifact_request;
@@ -52,6 +53,12 @@ fn parse_artifact_id(text: &str) -> Result<ArtifactId, ConnectError> {
         .map_err(|_| ConnectError::new(ErrorCode::InvalidArgument, "malformed artifact_id"))
 }
 
+fn parse_attempt_id(text: &str) -> Result<AttemptId, ConnectError> {
+    text.parse::<uuid::Uuid>()
+        .map(AttemptId::from_uuid)
+        .map_err(|_| ConnectError::new(ErrorCode::InvalidArgument, "malformed attempt_id"))
+}
+
 /// Converts the wire manifest to the domain manifest, rejecting a malformed
 /// digest or an unset/unknown media kind.
 fn domain_manifest(
@@ -81,35 +88,66 @@ fn domain_manifest(
     })
 }
 
-/// Splits `data[start_offset..]` into ADR 0008's bounded one-MiB chunks,
-/// marking the final chunk.
+/// Plans the next transfer chunk: how many bytes it carries from `offset`,
+/// bounded by ADR 0008's one-MiB chunks, and whether it ends the transfer.
 ///
-/// Pure so it is unit-testable without a stream or a database. A resume
-/// request already past the end of `data` yields one empty, `last` chunk so
-/// the stream still terminates cleanly rather than ending with no items.
-fn build_chunks(data: &[u8], start_offset: usize) -> Vec<ArtifactChunk> {
-    if start_offset >= data.len() {
-        return vec![ArtifactChunk {
-            offset: start_offset as u64,
-            data: Vec::new(),
-            last: true,
-            ..Default::default()
-        }];
-    }
+/// Pure so the chunking rule is unit-testable without a database. A resume at
+/// or past the end yields an empty final chunk, so the stream always
+/// terminates cleanly.
+fn next_chunk_span(total: u64, offset: u64) -> (u64, bool) {
+    let remaining = total.saturating_sub(offset);
+    let len = remaining.min(gpq_domain::TRANSFER_CHUNK_BYTES as u64);
+    (len, len == remaining)
+}
 
-    let mut chunks = Vec::new();
-    let mut offset = start_offset;
-    while offset < data.len() {
-        let end = (offset + gpq_domain::TRANSFER_CHUNK_BYTES).min(data.len());
-        chunks.push(ArtifactChunk {
-            offset: offset as u64,
-            data: data[offset..end].to_vec(),
-            last: end == data.len(),
-            ..Default::default()
-        });
-        offset = end;
-    }
-    chunks
+/// Streams `[start, total)` of a `remote_local` input one bounded chunk at a
+/// time. Each chunk is a separate tenant-scoped read, so the whole Artifact is
+/// never held in memory: the single buffer read for a chunk is moved straight
+/// into its outgoing message.
+fn stream_remote_local(
+    state: AppState,
+    tenant: TenantId,
+    attempt: AttemptId,
+    worker: gpq_domain::WorkerId,
+    artifact: ArtifactId,
+    start: u64,
+    total: u64,
+) -> impl futures::Stream<Item = Result<ArtifactChunk, ConnectError>> + Send + 'static {
+    futures::stream::try_unfold(Some(start), move |cursor| {
+        let state = state.clone();
+        async move {
+            let Some(offset) = cursor else {
+                return Ok(None);
+            };
+            let (len, last) = next_chunk_span(total, offset);
+            let mut conn = state.db.begin_tenant(tenant).await.map_err(internal)?;
+            let data = crate::db::artifacts::remote_local_chunk(
+                &mut conn, tenant, attempt, worker, artifact, offset, len,
+            )
+            .await
+            .map_err(internal)?;
+            conn.commit().await.map_err(internal)?;
+            let Some(data) = data else {
+                return Err(ConnectError::new(
+                    ErrorCode::FailedPrecondition,
+                    "artifact is no longer downloadable",
+                ));
+            };
+            if u64::try_from(data.len()).ok() != Some(len) {
+                return Err(internal("stored artifact is shorter than its manifest"));
+            }
+            let next = (!last).then_some(offset + len);
+            Ok(Some((
+                ArtifactChunk {
+                    offset,
+                    data,
+                    last,
+                    ..Default::default()
+                },
+                next,
+            )))
+        }
+    })
 }
 
 impl WorkerTransferService for TransferApi {
@@ -121,7 +159,7 @@ impl WorkerTransferService for TransferApi {
         let Some(token) = crate::auth::bearer_token(ctx.headers()) else {
             return Err(unauthenticated());
         };
-        let Some((tenant_id, _worker_id)) = self
+        let Some((tenant_id, worker_id)) = self
             .state
             .db
             .authenticate_worker(token)
@@ -133,61 +171,55 @@ impl WorkerTransferService for TransferApi {
 
         let request = request.to_owned_message();
         let artifact_id = parse_artifact_id(&request.artifact_id)?;
+        let attempt_id = parse_attempt_id(&request.attempt_id)?;
 
+        // Only the Worker holding a live lease on the Attempt may read its
+        // inputs, and only inputs of that Attempt's Generation (ADR 0008).
+        // Serving does not consume the input: it stays available until the
+        // Generation terminates.
         let mut tx = self
             .state
             .db
             .begin_tenant(tenant_id)
             .await
             .map_err(internal)?;
-        let row = crate::db::artifacts::get(&mut tx, tenant_id, artifact_id)
-            .await
-            .map_err(internal)?;
-        tx.commit().await.map_err(internal)?;
-
+        let row = crate::db::artifacts::attempt_input(
+            &mut tx,
+            tenant_id,
+            attempt_id,
+            worker_id,
+            artifact_id,
+        )
+        .await
+        .map_err(internal)?;
         let Some(row) = row else {
             return Err(ConnectError::new(ErrorCode::NotFound, "artifact not found"));
         };
-        // ObjectStore-placed inputs never reach this RPC: the Worker already
-        // holds a presigned `download_url` in its `LeaseInput` (ADR 0008).
-        if row.direction != crate::db::artifacts::ArtifactDirection::Input
-            || row.placement != gpq_domain::ArtifactPlacement::InlineRelay
+        if row.placement != gpq_domain::ArtifactPlacement::RemoteLocal
+            || row.state != ArtifactState::Available
         {
             return Err(ConnectError::new(
                 ErrorCode::FailedPrecondition,
                 "artifact is not available for direct transfer",
             ));
         }
-        if matches!(
-            row.state,
-            ArtifactState::Consumed | ArtifactState::Expired | ArtifactState::Lost
-        ) {
+        let total = row.manifest.size_bytes;
+        tx.commit().await.map_err(internal)?;
+        if request.offset > total {
             return Err(ConnectError::new(
-                ErrorCode::FailedPrecondition,
-                "artifact is no longer downloadable",
+                ErrorCode::InvalidArgument,
+                "offset is past the end of the artifact",
             ));
         }
-
-        let Some(buffered_len) = self.state.artifacts.len_local(artifact_id) else {
-            return Err(ConnectError::new(
-                ErrorCode::Unavailable,
-                "artifact bytes are not currently available for local transfer",
-            ));
-        };
-        let start_offset = usize::try_from(request.offset)
-            .unwrap_or_else(|_| usize::try_from(buffered_len).unwrap_or(usize::MAX));
-        // ADR 0008: inline relay is non-persistent — `FetchArtifact` always
-        // serves everything from `start_offset` through EOF in one stream,
-        // so `take_local` releases the buffer as soon as the Worker has it,
-        // rather than a separate `peek_local` clone plus `discard_local`.
-        let Some(bytes) = self.state.artifacts.take_local(artifact_id) else {
-            return Err(ConnectError::new(
-                ErrorCode::Unavailable,
-                "artifact bytes are not currently available for local transfer",
-            ));
-        };
-        let chunks = build_chunks(&bytes, start_offset);
-        Response::stream_ok(tokio_stream::iter(chunks.into_iter().map(Ok)))
+        Response::stream_ok(stream_remote_local(
+            self.state.clone(),
+            tenant_id,
+            attempt_id,
+            worker_id,
+            artifact_id,
+            request.offset,
+            total,
+        ))
     }
 
     #[expect(
@@ -230,8 +262,14 @@ impl WorkerTransferService for TransferApi {
         let start_offset = start.offset;
         let (artifact_id, manifest) =
             validate_delivery_start(&self.state, tenant_id, *start).await?;
-        let receipt =
-            receive_delivery_chunks(&self.state, artifact_id, start_offset, &mut requests).await?;
+        let receipt = receive_delivery_chunks(
+            &self.state,
+            artifact_id,
+            &manifest,
+            start_offset,
+            &mut requests,
+        )
+        .await?;
         let (committed_offset, digest) = match receipt {
             ChunkReceipt::NoDownloader { committed_offset } => {
                 return Response::ok(DeliverArtifactResponse {
@@ -330,6 +368,12 @@ async fn validate_delivery_start(
             "delivered manifest does not match the recorded output manifest",
         ));
     }
+    if start.offset > row.manifest.size_bytes {
+        return Err(ConnectError::new(
+            ErrorCode::FailedPrecondition,
+            "delivery offset is past the artifact size",
+        ));
+    }
     if row.committed_offset != start.offset {
         return Err(ConnectError::new(
             ErrorCode::FailedPrecondition,
@@ -349,10 +393,9 @@ async fn validate_delivery_start(
 }
 
 /// Whether a received delivery can complete, should be retried, or must be
-/// rejected permanently because retrying would bypass integrity validation.
-/// Resumed attempts cannot reproduce the prefix digest; that path is only
-/// reachable after a non-integrity interruption. A from-zero digest mismatch
-/// is terminal so it cannot be converted into an unverified resumed success.
+/// rejected permanently. A resumed RPC can validate only its suffix length;
+/// the HTTP stream separately hashes all chunks across internal resumptions
+/// before it marks the Artifact consumed.
 enum DeliveryValidation {
     Accepted,
     Retryable(String),
@@ -420,6 +463,7 @@ fn next_delivery_offset(expected_offset: u64, chunk: &ArtifactChunk) -> Result<u
 async fn receive_delivery_chunks(
     state: &AppState,
     artifact_id: ArtifactId,
+    manifest: &ArtifactManifest,
     start_offset: u64,
     requests: &mut connectrpc::InboundStream<DeliverArtifactRequest>,
 ) -> Result<ChunkReceipt, ConnectError> {
@@ -436,13 +480,29 @@ async fn receive_delivery_chunks(
             ));
         };
         let following_offset = match next_delivery_offset(next_offset, &chunk) {
-            Ok(offset) => offset,
+            Ok(offset)
+                if chunk.data.len() <= gpq_domain::TRANSFER_CHUNK_BYTES
+                    && offset <= manifest.size_bytes =>
+            {
+                offset
+            }
+            Ok(_) => {
+                let reason = "artifact chunk exceeds its transfer or manifest size limit";
+                state
+                    .artifacts
+                    .push_delivery(
+                        artifact_id,
+                        crate::artifacts::DeliveryChunk::Rejected(reason.to_owned()),
+                    )
+                    .await;
+                return Err(ConnectError::new(ErrorCode::InvalidArgument, reason));
+            }
             Err(reason) => {
                 state
                     .artifacts
                     .push_delivery(
                         artifact_id,
-                        crate::artifacts::DeliveryChunk::Failed(reason.clone()),
+                        crate::artifacts::DeliveryChunk::Rejected(reason.clone()),
                     )
                     .await;
                 return Err(ConnectError::new(ErrorCode::InvalidArgument, reason));
@@ -495,53 +555,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunks_cover_the_whole_buffer_from_zero() {
-        let data = vec![0u8; gpq_domain::TRANSFER_CHUNK_BYTES + 10];
-        let chunks = build_chunks(&data, 0);
-
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].offset, 0);
-        assert_eq!(chunks[0].data.len(), gpq_domain::TRANSFER_CHUNK_BYTES);
-        assert!(!chunks[0].last);
-        assert_eq!(chunks[1].offset, gpq_domain::TRANSFER_CHUNK_BYTES as u64);
-        assert_eq!(chunks[1].data.len(), 10);
-        assert!(chunks[1].last);
+    fn chunks_cover_the_whole_artifact_in_bounded_spans() {
+        let chunk = gpq_domain::TRANSFER_CHUNK_BYTES as u64;
+        assert_eq!(next_chunk_span(chunk + 10, 0), (chunk, false));
+        assert_eq!(next_chunk_span(chunk + 10, chunk), (10, true));
     }
 
     #[test]
     fn resume_offset_skips_already_delivered_bytes() {
-        let data = vec![7u8; 100];
-        let chunks = build_chunks(&data, 40);
-
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].offset, 40);
-        assert_eq!(chunks[0].data.len(), 60);
-        assert!(chunks[0].last);
+        assert_eq!(next_chunk_span(100, 40), (60, true));
     }
 
     #[test]
     fn a_single_chunk_fitting_exactly_is_marked_last() {
-        let data = vec![1u8; 5];
-        let chunks = build_chunks(&data, 0);
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].last);
+        assert_eq!(next_chunk_span(5, 0), (5, true));
     }
 
     #[test]
     fn resume_past_the_end_yields_one_empty_last_chunk() {
-        let data = vec![1u8; 5];
-        let chunks = build_chunks(&data, 100);
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].data.is_empty());
-        assert!(chunks[0].last);
-        assert_eq!(chunks[0].offset, 100);
+        assert_eq!(next_chunk_span(5, 100), (0, true));
     }
 
     #[test]
-    fn empty_buffer_yields_one_empty_last_chunk() {
-        let chunks = build_chunks(&[], 0);
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].last);
+    fn empty_artifact_yields_one_empty_last_chunk() {
+        assert_eq!(next_chunk_span(0, 0), (0, true));
     }
 
     #[test]
@@ -646,19 +683,13 @@ mod tests {
     }
 
     #[test]
-    fn a_buffer_exactly_a_multiple_of_the_chunk_size_ends_on_a_boundary() {
+    fn an_artifact_exactly_a_multiple_of_the_chunk_size_ends_on_a_boundary() {
         // ADR 0008: chunk offsets/last-flag at exact multiples of
         // TRANSFER_CHUNK_BYTES must not produce a trailing empty chunk.
-        let data = vec![2u8; gpq_domain::TRANSFER_CHUNK_BYTES * 2];
-        let chunks = build_chunks(&data, 0);
-
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].offset, 0);
-        assert_eq!(chunks[0].data.len(), gpq_domain::TRANSFER_CHUNK_BYTES);
-        assert!(!chunks[0].last);
-        assert_eq!(chunks[1].offset, gpq_domain::TRANSFER_CHUNK_BYTES as u64);
-        assert_eq!(chunks[1].data.len(), gpq_domain::TRANSFER_CHUNK_BYTES);
-        assert!(chunks[1].last);
+        let total = gpq_domain::TRANSFER_CHUNK_BYTES as u64 * 2;
+        let chunk = gpq_domain::TRANSFER_CHUNK_BYTES as u64;
+        assert_eq!(next_chunk_span(total, 0), (chunk, false));
+        assert_eq!(next_chunk_span(total, chunk), (chunk, true));
     }
 
     #[test]

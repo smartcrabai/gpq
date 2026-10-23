@@ -1,9 +1,7 @@
 //! Content hashing.
 //!
-//! Model Versions, Workflow Versions, raw `ComfyUI` prompts, and Artifact
-//! Manifests are all identified by a SHA-256 content hash (ADR 0005, ADR 0008,
-//! ADR 0012). A fixed-size newtype keeps those identities allocation-free and
-//! comparison-cheap.
+//! Native model manifests and Artifacts are identified by SHA-256 content
+//! hashes. A fixed-size newtype keeps identities allocation-free and comparison-cheap.
 
 use std::fmt;
 use std::str::FromStr;

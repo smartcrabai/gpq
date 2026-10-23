@@ -1,6 +1,6 @@
-//! OS service management wrapping `gpq-worker run` (ADR 0020).
+//! OS service management wrapping `gpq worker run`.
 //!
-//! `gpq-worker run` is the single foreground implementation; install,
+//! `gpq worker run` is the single foreground implementation; install,
 //! uninstall, start, and stop only manage systemd on Linux, launchd (and, by
 //! extension, Homebrew services) on macOS, and a native Windows Service on
 //! Windows. Unit/plist rendering is pure and unit-tested; the side-effecting
@@ -17,7 +17,7 @@ pub const SERVICE_NAME: &str = "gpq-worker";
 /// used by [`crate::credential`] (ADR 0009).
 pub const LAUNCHD_LABEL: &str = "ai.smartcrab.gpq-worker";
 
-/// Renders the systemd unit file for `gpq-worker run` (ADR 0020).
+/// Renders the systemd unit file for `gpq worker run` (ADR 0020).
 ///
 /// `binary` and `config` are quoted as systemd command-line words
 /// (`systemd.syntax(7)`): `ExecStart=` splits its value on whitespace the
@@ -44,7 +44,7 @@ pub fn render_systemd_unit(binary: &Path, config: &Path, credential_file: &Path)
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={binary} run --config {config}\n\
+         ExecStart={binary} worker run --config {config}\n\
          LoadCredential={SERVICE_NAME}:{credential_file}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
@@ -74,7 +74,7 @@ fn quote_systemd_word(value: &str) -> String {
     quoted
 }
 
-/// Renders the launchd agent plist for `gpq-worker run` (ADR 0020).
+/// Renders the launchd agent plist for `gpq worker run` (ADR 0020).
 ///
 /// Homebrew's `brew services start gpq-worker` loads this same plist under
 /// `~/Library/LaunchAgents`; `service install`/`uninstall` and Homebrew
@@ -91,6 +91,7 @@ pub fn render_launchd_plist(binary: &Path, config: &Path) -> String {
          \t<key>ProgramArguments</key>\n\
          \t<array>\n\
          \t\t<string>{binary}</string>\n\
+         \t\t<string>worker</string>\n\
          \t\t<string>run</string>\n\
          \t\t<string>--config</string>\n\
          \t\t<string>{config}</string>\n\
@@ -121,7 +122,7 @@ pub fn render_launchd_plist(binary: &Path, config: &Path) -> String {
 #[must_use]
 pub fn windows_create_args(binary: &Path, config: &Path) -> Vec<String> {
     let bin_path = format!(
-        "{} run --config {}",
+        "{} worker run --config {}",
         quote_windows_arg(&binary.display().to_string()),
         quote_windows_arg(&config.display().to_string()),
     );
@@ -140,7 +141,7 @@ pub fn windows_create_args(binary: &Path, config: &Path) -> Vec<String> {
 /// Quotes `value` as one Windows command-line argument, following the same
 /// backslash/quote escaping `CommandLineToArgvW` expects, so a value
 /// containing whitespace is parsed back as a single argument by both
-/// `sc.exe` (locating `ImagePath`'s executable) and `gpq-worker.exe` itself
+/// `sc.exe` (locating `ImagePath`'s executable) and `gpq.exe` itself
 /// (parsing its own `--config` argument).
 fn quote_windows_arg(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
@@ -190,7 +191,7 @@ pub fn launchd_plist_path() -> anyhow::Result<std::path::PathBuf> {
         .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
-/// Installs `gpq-worker run --config <config>` as an OS-managed service.
+/// Installs `gpq worker run --config <config>` as an OS-managed service.
 ///
 /// `credential_file` is only consulted on Linux, where it becomes the
 /// systemd `LoadCredential=` source; other platforms ignore it because they
@@ -198,7 +199,7 @@ pub fn launchd_plist_path() -> anyhow::Result<std::path::PathBuf> {
 ///
 /// Dispatch is by [`std::env::consts::OS`] rather than `#[cfg]` so every
 /// platform's rendering and command-invocation logic stays compiled (and
-/// unit-testable) on every host, matching how `gpq-worker` actually ships:
+/// unit-testable) on every host, matching how the single `gpq` executable ships:
 /// one cross-compiled binary per target, decided at build time by the
 /// target triple, not by which OS happens to be building it.
 ///
@@ -338,62 +339,63 @@ mod tests {
     #[test]
     fn systemd_unit_wires_exec_and_credential() {
         let unit = render_systemd_unit(
-            Path::new("/usr/local/bin/gpq-worker"),
-            Path::new("/etc/gpq-worker/worker.toml"),
-            Path::new("/etc/gpq-worker/credential"),
+            Path::new("/usr/local/bin/gpq"),
+            Path::new("/etc/gpq/worker.toml"),
+            Path::new("/etc/gpq/credential"),
         );
         assert!(unit.contains(
-            "ExecStart=\"/usr/local/bin/gpq-worker\" run --config \"/etc/gpq-worker/worker.toml\""
+            "ExecStart=\"/usr/local/bin/gpq\" worker run --config \"/etc/gpq/worker.toml\""
         ));
-        assert!(unit.contains("LoadCredential=gpq-worker:/etc/gpq-worker/credential"));
+        assert!(unit.contains("LoadCredential=gpq-worker:/etc/gpq/credential"));
         assert!(unit.contains("[Install]"));
     }
 
     #[test]
     fn systemd_unit_quotes_paths_containing_spaces() {
         let unit = render_systemd_unit(
-            Path::new("/usr/local/bin/gpq-worker"),
-            Path::new("/home/jane doe/worker.toml"),
-            Path::new("/home/jane doe/credential"),
+            Path::new("/usr/local/bin/gpq"),
+            Path::new("/home/jane doe/gpq/worker.toml"),
+            Path::new("/home/jane doe/gpq/credential"),
         );
         assert!(unit.contains(
-            "ExecStart=\"/usr/local/bin/gpq-worker\" run --config \"/home/jane doe/worker.toml\""
+            "ExecStart=\"/usr/local/bin/gpq\" worker run --config \"/home/jane doe/gpq/worker.toml\""
         ));
         // `LoadCredential=` splits its value only on the first `:` and never
         // unquotes it, so the path half must stay literal even though it
         // contains a space; quoting it would corrupt the stored path.
-        assert!(unit.contains("LoadCredential=gpq-worker:/home/jane doe/credential"));
+        assert!(unit.contains("LoadCredential=gpq-worker:/home/jane doe/gpq/credential"));
     }
 
     #[test]
     fn systemd_unit_escapes_embedded_quote_and_backslash() {
-        let config_with_special_chars = "/etc/gpq-worker/quo\"te\\path.toml";
+        let config_with_special_chars = "/etc/gpq/quo\"te\\path.toml";
         let unit = render_systemd_unit(
-            Path::new("/usr/local/bin/gpq-worker"),
+            Path::new("/usr/local/bin/gpq"),
             Path::new(config_with_special_chars),
-            Path::new("/etc/gpq-worker/credential"),
+            Path::new("/etc/gpq/credential"),
         );
         assert!(unit.contains(
-            "ExecStart=\"/usr/local/bin/gpq-worker\" run --config \"/etc/gpq-worker/quo\\\"te\\\\path.toml\""
+            "ExecStart=\"/usr/local/bin/gpq\" worker run --config \"/etc/gpq/quo\\\"te\\\\path.toml\""
         ));
     }
 
     #[test]
     fn launchd_plist_wires_program_arguments() {
         let plist = render_launchd_plist(
-            Path::new("/opt/homebrew/bin/gpq-worker"),
-            Path::new("/etc/gpq-worker/worker.toml"),
+            Path::new("/opt/homebrew/bin/gpq"),
+            Path::new("/etc/gpq/worker.toml"),
         );
         assert!(plist.contains("<string>ai.smartcrab.gpq-worker</string>"));
-        assert!(plist.contains("<string>/opt/homebrew/bin/gpq-worker</string>"));
+        assert!(plist.contains("<string>/opt/homebrew/bin/gpq</string>"));
+        assert!(plist.contains("<string>worker</string>"));
         assert!(plist.contains("<string>--config</string>"));
-        assert!(plist.contains("<string>/etc/gpq-worker/worker.toml</string>"));
+        assert!(plist.contains("<string>/etc/gpq/worker.toml</string>"));
     }
 
     #[test]
     fn windows_args_use_key_value_tokens() {
         let args = windows_create_args(
-            Path::new(r"C:\gpq\gpq-worker.exe"),
+            Path::new(r"C:\gpq\gpq.exe"),
             Path::new(r"C:\ProgramData\gpq\worker.toml"),
         );
         assert_eq!(args[0], "create");
@@ -401,7 +403,7 @@ mod tests {
         assert_eq!(args[2], "binPath=");
         assert_eq!(
             args[3],
-            r#""C:\gpq\gpq-worker.exe" run --config "C:\ProgramData\gpq\worker.toml""#
+            r#""C:\gpq\gpq.exe" worker run --config "C:\ProgramData\gpq\worker.toml""#
         );
         assert_eq!(args[4], "start=");
         assert_eq!(args[5], "auto");
@@ -410,12 +412,12 @@ mod tests {
     #[test]
     fn windows_binpath_quotes_program_files_style_path() {
         let args = windows_create_args(
-            Path::new(r"C:\Program Files\gpq\gpq-worker.exe"),
+            Path::new(r"C:\Program Files\gpq\gpq.exe"),
             Path::new(r"C:\ProgramData\gpq\worker.toml"),
         );
         assert_eq!(
             args[3],
-            r#""C:\Program Files\gpq\gpq-worker.exe" run --config "C:\ProgramData\gpq\worker.toml""#
+            r#""C:\Program Files\gpq\gpq.exe" worker run --config "C:\ProgramData\gpq\worker.toml""#
         );
     }
 }

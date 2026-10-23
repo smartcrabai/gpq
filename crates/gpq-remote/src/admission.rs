@@ -1,17 +1,18 @@
-//! Generation admission (ADR 0002, ADR 0003, ADR 0006, ADR 0008, ADR 0012).
+//! Generation admission (ADR 0002, ADR 0003, ADR 0008, ADR 0012).
 //!
-//! Admission resolves a Model or Workflow alias to its pinned immutable
-//! Version, or hashes a raw `ComfyUI` prompt, then derives the modality and
-//! resolves the execution timeout, enforces Tenant policy, and inserts the new
-//! Generation `Queued`. It never leases or executes anything itself —
+//! Admission resolves a Model alias to its pinned immutable manifest, validates
+//! the typed parameters against that manifest's family, derives the modality
+//! and resolves the execution timeout, enforces Tenant policy, and inserts the
+//! new Generation `Queued`. Input Artifacts are the artifact references carried
+//! inside the parameters. It never leases or executes anything itself —
 //! [`crate::scheduler`] picks queued work up separately, woken by
 //! [`crate::state::AppState::scheduler`].
 
 use std::time::Duration;
 
 use gpq_domain::{
-    ArtifactId, ArtifactPlacement, CallerKind, ExecutionTarget, Priority, Requirement, TenantId,
-    TenantSettings, any_candidate_remains, resolve_execution_timeout,
+    ArtifactId, ArtifactPlacement, ExecutionTarget, GenerationParameters, Priority, TenantId,
+    TenantSettings, resolve_execution_timeout,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -23,29 +24,19 @@ use crate::state::AppState;
 /// Which execution target a request names (ADR 0012).
 #[derive(Debug, Clone)]
 pub enum AdmissionTarget {
-    /// An LLM Model alias.
+    /// A native Model alias.
     Model(String),
-    /// A `ComfyUI` Workflow alias.
-    Workflow(String),
-    /// A raw `ComfyUI` Server API prompt.
-    ComfyPrompt {
-        /// Optional client-visible prompt id.
-        prompt_id: Option<Uuid>,
-        /// Optional client correlation id.
-        client_id: Option<String>,
-    },
 }
 
 /// A request to admit one new Generation.
 #[derive(Debug, Clone)]
 pub struct AdmissionRequest {
-    /// The Model, Workflow alias, or raw `ComfyUI` target.
+    /// The Model alias the Generation runs against.
     pub target: AdmissionTarget,
-    /// Opaque backend-shaped payload (ADR 0007).
-    pub parameters: serde_json::Value,
-    /// Input Artifacts the Attempt must read before execution.
-    pub input_artifact_ids: Vec<ArtifactId>,
-    /// Where output Artifacts land.
+    /// Typed native parameters. Their artifact references are the Generation's
+    /// input Artifacts.
+    pub parameters: GenerationParameters,
+    /// Where output Artifacts land: `ObjectStore` or `WorkerLocal`.
     pub output_placement: ArtifactPlacement,
     /// Requested priority; the Tenant default applies when absent.
     pub priority: Option<Priority>,
@@ -54,10 +45,6 @@ pub struct AdmissionRequest {
     /// A caller-requested execution timeout; it may only shorten the resolved
     /// default (ADR 0003).
     pub execution_timeout: Option<Duration>,
-    /// Whether the caller holds a connection open for the whole Generation.
-    pub caller_kind: CallerKind,
-    /// Whether the caller wants incremental LLM token events.
-    pub stream_tokens: bool,
     /// Deduplicates a retried admission call carrying the same request.
     pub idempotency_key: Option<String>,
 }
@@ -65,19 +52,12 @@ pub struct AdmissionRequest {
 /// Why admission rejected a request.
 #[derive(Debug, thiserror::Error)]
 pub enum AdmissionError {
-    /// The Model or Workflow alias does not resolve to any Version.
-    #[error("unknown model or workflow alias")]
+    /// The Model alias does not resolve to any Version.
+    #[error("unknown model alias")]
     UnknownAlias,
-    /// No capable Worker is online for a synchronous caller (ADR 0006's
-    /// `503 model_not_available`); busy online Workers do not trigger this.
-    #[error("no capable worker is online")]
-    Unavailable,
-    /// The request itself is unusable, independent of Worker availability.
+    /// The request itself is unusable.
     #[error("invalid input: {0}")]
     InvalidInput(String),
-    /// The requested Comfy prompt id already belongs to this Tenant.
-    #[error("Comfy prompt id already exists")]
-    PromptIdConflict,
     /// The Tenant already has `max_queued_generations` nonterminal Generations.
     #[error("tenant queue capacity exceeded")]
     CapacityExceeded,
@@ -99,36 +79,22 @@ fn internal(error: sqlx::Error) -> AdmissionError {
 fn idempotency_digest(request: &AdmissionRequest) -> Vec<u8> {
     #[derive(Serialize)]
     struct DigestPayload<'a> {
-        alias_kind: &'static str,
         alias: &'a str,
-        parameters: &'a serde_json::Value,
-        input_artifact_ids: Vec<String>,
+        parameters: &'a GenerationParameters,
         output_placement: &'static str,
         priority: Option<u8>,
         seed: Option<u64>,
         execution_timeout_secs: Option<u64>,
-        stream_tokens: bool,
     }
 
-    let (alias_kind, alias) = match &request.target {
-        AdmissionTarget::Model(alias) => ("model", alias.as_str()),
-        AdmissionTarget::Workflow(alias) => ("workflow", alias.as_str()),
-        AdmissionTarget::ComfyPrompt { .. } => ("comfy_prompt", ""),
-    };
+    let AdmissionTarget::Model(alias) = &request.target;
     let payload = DigestPayload {
-        alias_kind,
         alias,
         parameters: &request.parameters,
-        input_artifact_ids: request
-            .input_artifact_ids
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
         output_placement: request.output_placement.as_str(),
         priority: request.priority.map(u8::from),
         seed: request.seed,
         execution_timeout_secs: request.execution_timeout.map(|d| d.as_secs()),
-        stream_tokens: request.stream_tokens,
     };
     let bytes = serde_json::to_vec(&payload).unwrap_or_default();
     Sha256::digest(bytes).to_vec()
@@ -181,10 +147,9 @@ async fn replay_idempotent(
     Ok(Some(row))
 }
 
-/// Whether one already-fetched input Artifact row is rejected by admission
-/// (ADR 0002): it must be an `input`-direction Artifact, and fit within the
-/// Tenant's size limit. Extracted from the per-id database fetch so the
-/// per-row gate is unit-testable without a database.
+/// Whether one already-fetched input Artifact row is correctly directed,
+/// within the Tenant's size limit, and in its placement-specific ready state.
+/// TTL and remote-local bytes are rechecked in the atomic claim query.
 fn validate_input_artifact_row(
     artifact_id: ArtifactId,
     artifact: &crate::db::artifacts::ArtifactRow,
@@ -200,18 +165,31 @@ fn validate_input_artifact_row(
             "input artifact {artifact_id} exceeds the tenant's size limit"
         )));
     }
+    let ready = match artifact.placement {
+        ArtifactPlacement::RemoteLocal | ArtifactPlacement::WorkerLocal => {
+            artifact.state == gpq_domain::ArtifactState::Available
+        }
+        ArtifactPlacement::ObjectStore => artifact.state == gpq_domain::ArtifactState::Pending,
+    };
+    if !ready {
+        return Err(AdmissionError::InvalidInput(format!(
+            "input artifact {artifact_id} is not ready"
+        )));
+    }
     Ok(())
 }
 
-/// Rejects a request whose input Artifacts do not exist, are not `input`
-/// direction, or exceed the Tenant's size limit.
+/// Rejects inputs that are unready, expired, already linked, missing, or
+/// exceed the Tenant's size limit. Object-store inputs are checked with HEAD;
+/// bytes are never downloaded just to validate readiness.
 async fn validate_input_artifacts(
     tx: &mut sqlx::PgConnection,
     tenant: TenantId,
-    request: &AdmissionRequest,
+    input_artifact_ids: &[ArtifactId],
     settings: &TenantSettings,
+    artifacts: &crate::artifacts::ArtifactService,
 ) -> Result<(), AdmissionError> {
-    for artifact_id in &request.input_artifact_ids {
+    for artifact_id in input_artifact_ids {
         let Some(artifact) = crate::db::artifacts::get(tx, tenant, *artifact_id)
             .await
             .map_err(internal)?
@@ -221,76 +199,24 @@ async fn validate_input_artifacts(
             )));
         };
         validate_input_artifact_row(*artifact_id, &artifact, settings.max_input_artifact_bytes)?;
+        if artifact.placement == ArtifactPlacement::ObjectStore {
+            let Some(object_key) = artifact.object_key.as_deref() else {
+                return Err(AdmissionError::InvalidInput(format!(
+                    "object-store input artifact {artifact_id} has no object key"
+                )));
+            };
+            if !artifacts
+                .input_is_ready(object_key, &artifact.manifest)
+                .await
+                .map_err(AdmissionError::Internal)?
+            {
+                return Err(AdmissionError::InvalidInput(format!(
+                    "object-store input artifact {artifact_id} has not been uploaded"
+                )));
+            }
+        }
     }
     Ok(())
-}
-
-/// Resolves a requested alias or raw prompt to its pinned Version, modality,
-/// execution limits, and scheduling [`Requirement`] (ADR 0012).
-async fn resolve_target(
-    tx: &mut sqlx::PgConnection,
-    tenant: TenantId,
-    request: &AdmissionRequest,
-) -> Result<
-    (
-        ExecutionTarget,
-        gpq_domain::Modality,
-        gpq_domain::ExecutionLimits,
-        Requirement,
-    ),
-    AdmissionError,
-> {
-    match &request.target {
-        AdmissionTarget::Model(alias) => {
-            let Some(resolved) = crate::db::catalog::resolve_model_alias(tx, tenant, alias)
-                .await
-                .map_err(internal)?
-            else {
-                return Err(AdmissionError::UnknownAlias);
-            };
-            let target = ExecutionTarget::Model {
-                version: resolved.content_hash,
-            };
-            let requirement = Requirement::for_model(
-                tenant,
-                resolved.content_hash,
-                resolved.limits.estimated_vram_bytes,
-            );
-            Ok((target, resolved.modality, resolved.limits, requirement))
-        }
-        AdmissionTarget::Workflow(alias) => {
-            let Some(resolved) = crate::db::catalog::resolve_workflow_alias(tx, tenant, alias)
-                .await
-                .map_err(internal)?
-            else {
-                return Err(AdmissionError::UnknownAlias);
-            };
-            let target = ExecutionTarget::Workflow {
-                version: resolved.content_hash,
-            };
-            let requirement = Requirement::for_workflow(
-                tenant,
-                resolved.content_hash,
-                &resolved.manifest,
-                resolved.limits.estimated_vram_bytes,
-            );
-            Ok((target, resolved.modality, resolved.limits, requirement))
-        }
-        AdmissionTarget::ComfyPrompt { .. } => {
-            let canonical = serde_json::to_vec(&request.parameters).map_err(|error| {
-                AdmissionError::InvalidInput(format!(
-                    "raw ComfyUI prompt is not serializable: {error}"
-                ))
-            })?;
-            let version = gpq_domain::ContentHash::digest(&canonical);
-            Ok((
-                ExecutionTarget::ComfyPrompt { version },
-                gpq_domain::Modality::Comfy,
-                gpq_domain::ExecutionLimits::default(),
-                Requirement::for_comfy_prompt(tenant, version),
-            ))
-        }
-    }
 }
 
 /// Whether the Tenant's queue-capacity gate rejects a new admission (ADR
@@ -301,30 +227,10 @@ fn queue_capacity_exceeded(nonterminal: i64, max_queued_generations: u32) -> boo
     u64::try_from(nonterminal).unwrap_or(u64::MAX) >= u64::from(max_queued_generations)
 }
 
-/// Rejects a synchronous caller's request when no online Worker could ever
-/// satisfy `requirement` (ADR 0006's `model_not_available`); a capable but
-/// busy fleet does not reject here.
-async fn ensure_synchronous_capacity(
-    state: &AppState,
-    tx: &mut sqlx::PgConnection,
-    tenant: TenantId,
-    requirement: &Requirement,
-) -> Result<(), AdmissionError> {
-    let capabilities = crate::db::workers::pool_capabilities(tx, tenant)
-        .await
-        .map_err(internal)?;
-    let online_capable = capabilities
-        .iter()
-        .filter(|(_, _, worker_id, _)| state.workers.is_online(*worker_id))
-        .map(|(capability, ..)| capability);
-    if any_candidate_remains(online_capable, requirement) {
-        Ok(())
-    } else {
-        Err(AdmissionError::Unavailable)
-    }
-}
-
-/// Links every requested input Artifact to the freshly inserted Generation.
+/// Links every input Artifact to the freshly inserted Generation. The update
+/// only claims rows that are still unlinked `input` Artifacts of this Tenant;
+/// any row that does not match means a concurrent admission or a stale
+/// reference won the race, so the whole admission is rejected and rolled back.
 async fn link_input_artifacts(
     tx: &mut sqlx::PgConnection,
     tenant: TenantId,
@@ -335,16 +241,29 @@ async fn link_input_artifacts(
         return Ok(());
     }
     let ids: Vec<Uuid> = input_artifact_ids.iter().map(ArtifactId::as_uuid).collect();
-    sqlx::query(
-        "UPDATE artifacts SET generation_id = $1 \
-         WHERE tenant_id = $2 AND id = ANY($3) AND direction = 'input'",
+    let linked = sqlx::query(
+        "UPDATE artifacts SET generation_id = $1, expires_at = NULL \
+         WHERE tenant_id = $2 AND id = ANY($3) AND direction = 'input' \
+           AND generation_id IS NULL AND expires_at > statement_timestamp() \
+           AND (
+               (placement = 'remote_local' AND state = 'available'
+                AND content IS NOT NULL AND octet_length(content) = size_bytes)
+               OR (placement = 'object_store' AND state = 'pending')
+               OR (placement = 'worker_local' AND state = 'available')
+           )",
     )
     .bind(generation.as_uuid())
     .bind(tenant.as_uuid())
     .bind(&ids)
     .execute(tx)
     .await
-    .map_err(internal)?;
+    .map_err(internal)?
+    .rows_affected();
+    if linked != u64::try_from(ids.len()).unwrap_or(u64::MAX) {
+        return Err(AdmissionError::InvalidInput(
+            "an input artifact is missing or already linked to a generation".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -381,70 +300,48 @@ fn requires_missing_object_store(
     output_placement.requires_object_store() && !object_store_available
 }
 
-/// Admits a new Generation (ADR 0002, ADR 0003, ADR 0006, ADR 0008, ADR 0012).
+/// Rejects output placements that Workers cannot produce into. Remote-local
+/// bytes exist only as inputs Remote stores for a Generation (ADR 0008).
+fn validate_output_placement(placement: ArtifactPlacement) -> Result<(), AdmissionError> {
+    match placement {
+        ArtifactPlacement::ObjectStore | ArtifactPlacement::WorkerLocal => Ok(()),
+        ArtifactPlacement::RemoteLocal => Err(AdmissionError::InvalidInput(
+            "output_placement must be object_store or worker_local".to_owned(),
+        )),
+    }
+}
+
+/// Admits a new Generation (ADR 0002, ADR 0003, ADR 0008, ADR 0012).
 ///
 /// # Errors
 ///
-/// Returns [`AdmissionError::ObjectStoreUnavailable`] if `request.output_placement`
-/// needs object storage and this Remote has none configured (ADR 0008);
-/// [`AdmissionError::UnknownAlias`] if the Model or Workflow alias does not
-/// resolve to any Version; [`AdmissionError::PromptIdConflict`] if a raw
-/// `ComfyUI` prompt id already belongs to the Tenant;
-/// [`AdmissionError::CapacityExceeded`] if the Tenant already has
-/// `max_queued_generations` nonterminal Generations; [`AdmissionError::Unavailable`]
-/// if the request is synchronous and no capable Worker is online;
-/// [`AdmissionError::InvalidInput`] if an input Artifact reference is invalid,
-/// mismatched in direction, over the Tenant's size limit, `request.seed` does
-/// not fit a signed 64-bit column, or a raw prompt requests unsupported
-/// admission options; and [`AdmissionError::Internal`] on a database failure,
-/// a dangling idempotency key referencing a missing Generation, or missing
-/// Tenant settings.
-#[expect(
-    clippy::too_many_lines,
-    reason = "admission keeps validation, target resolution, and its atomic transaction together"
-)]
+/// Returns [`AdmissionError::InvalidInput`] if `request.output_placement` is
+/// not `ObjectStore` or `WorkerLocal`, the typed parameters are invalid for the
+/// alias's model family, an input Artifact reference is missing, mismatched in
+/// direction, already linked, or over the Tenant's size limit, or
+/// `request.seed` does not fit a signed 64-bit column;
+/// [`AdmissionError::ObjectStoreUnavailable`] if the output placement needs
+/// object storage and this Remote has none configured (ADR 0008);
+/// [`AdmissionError::UnknownAlias`] if the Model alias does not resolve to any
+/// Version; [`AdmissionError::CapacityExceeded`] if the Tenant already has
+/// `max_queued_generations` nonterminal Generations; and
+/// [`AdmissionError::Internal`] on a database failure, a dangling idempotency
+/// key referencing a missing Generation, or missing Tenant settings.
 pub async fn admit(
     state: &AppState,
     tenant: TenantId,
     request: AdmissionRequest,
 ) -> Result<GenerationRow, AdmissionError> {
-    let raw_metadata = match &request.target {
-        AdmissionTarget::ComfyPrompt {
-            prompt_id,
-            client_id,
-        } => Some((*prompt_id, client_id.as_deref())),
-        AdmissionTarget::Model(_) | AdmissionTarget::Workflow(_) => None,
-    };
-    if raw_metadata.is_some()
-        && (!request.input_artifact_ids.is_empty()
-            || request.output_placement != ArtifactPlacement::WorkerLocal
-            || request.priority.is_some()
-            || request.seed.is_some()
-            || request.execution_timeout.is_some()
-            || request.caller_kind != CallerKind::Durable
-            || request.stream_tokens
-            || request.idempotency_key.is_some())
-    {
-        return Err(AdmissionError::InvalidInput(
-            "raw ComfyUI prompts require durable worker-local admission".to_owned(),
-        ));
-    }
+    validate_output_placement(request.output_placement)?;
     if requires_missing_object_store(
         request.output_placement,
         state.artifacts.object_store_available(),
     ) {
         return Err(AdmissionError::ObjectStoreUnavailable);
     }
+    let AdmissionTarget::Model(alias) = &request.target;
 
     let mut tx = state.db.begin_tenant(tenant).await.map_err(internal)?;
-    if raw_metadata.is_some() {
-        sqlx::query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE")
-            .bind(tenant.as_uuid())
-            .execute(&mut *tx)
-            .await
-            .map_err(internal)?;
-    }
-
     if let Some(key) = request.idempotency_key.as_deref()
         && let Some(row) = replay_idempotent(&mut tx, tenant, key, &request).await?
     {
@@ -456,7 +353,6 @@ pub async fn admit(
         .await
         .map_err(internal)?
         .ok_or_else(|| AdmissionError::Internal(anyhow::anyhow!("tenant settings not found")))?;
-
     let nonterminal = generations::count_nonterminal(&mut tx, tenant)
         .await
         .map_err(internal)?;
@@ -464,51 +360,60 @@ pub async fn admit(
         return Err(AdmissionError::CapacityExceeded);
     }
 
-    validate_input_artifacts(&mut tx, tenant, &request, &settings).await?;
+    let model = crate::db::catalog::resolve_model_alias(&mut tx, tenant, alias)
+        .await
+        .map_err(internal)?
+        .ok_or(AdmissionError::UnknownAlias)?;
+    request
+        .parameters
+        .validate_for_family(model.manifest.family)
+        .map_err(|err| AdmissionError::InvalidInput(err.to_string()))?;
+    let sampling_overrides = match &request.parameters {
+        GenerationParameters::Image(image) => {
+            (image.steps, image.cfg_scale, image.sigmas.as_deref())
+        }
+        GenerationParameters::Video(_) => (None, None, None),
+    };
+    model
+        .manifest
+        .sampling
+        .resolve(
+            sampling_overrides.0,
+            sampling_overrides.1,
+            sampling_overrides.2,
+        )
+        .map_err(|err| AdmissionError::InvalidInput(err.to_string()))?;
+    let inputs = request.parameters.staging_artifact_ids();
+    validate_input_artifacts(&mut tx, tenant, &inputs, &settings, &state.artifacts).await?;
 
-    let (target, modality, limits, requirement) = resolve_target(&mut tx, tenant, &request).await?;
-    if request.caller_kind == CallerKind::Synchronous {
-        ensure_synchronous_capacity(state, &mut tx, tenant, &requirement).await?;
-    }
-
+    let target = ExecutionTarget::for_model(model.content_hash, model.manifest.family);
     let execution_timeout = resolve_execution_timeout(
-        modality,
-        limits,
+        model.manifest.modality(),
+        model.limits,
         request.execution_timeout,
         settings.execution_timeout_ceiling,
     );
     let priority = request.priority.unwrap_or(settings.default_priority);
-    let alias = match &request.target {
-        AdmissionTarget::Model(alias) | AdmissionTarget::Workflow(alias) => alias.clone(),
-        AdmissionTarget::ComfyPrompt { .. } => String::new(),
-    };
-    let generation_id = gpq_domain::GenerationId::new();
-    let prompt_id = raw_metadata
-        .and_then(|(prompt_id, _)| prompt_id)
-        .unwrap_or_else(|| generation_id.as_uuid());
-    if raw_metadata.is_some()
-        && crate::db::comfy::prompt_id_exists(&mut tx, tenant, prompt_id)
-            .await
-            .map_err(internal)?
-    {
-        return Err(AdmissionError::PromptIdConflict);
+    if let Some(seed) = request.seed {
+        gpq_domain::validate_seed(seed).map_err(|_| {
+            AdmissionError::InvalidInput(format!("seed {seed} does not fit a signed 64-bit column"))
+        })?;
     }
-
+    let parameters = serde_json::to_value(&request.parameters)
+        .map_err(|err| AdmissionError::Internal(err.into()))?;
+    let generation_id = gpq_domain::GenerationId::new();
     let row = generations::insert(
         &mut tx,
         NewGeneration {
             id: generation_id,
             tenant_id: tenant,
-            modality,
-            caller_kind: request.caller_kind,
-            alias,
+            alias: alias.clone(),
             target,
-            parameters: request.parameters.clone(),
+            parameters,
             priority,
             seed: request.seed,
             execution_timeout,
             output_placement: request.output_placement,
-            stream_tokens: request.stream_tokens,
         },
     )
     .await
@@ -519,53 +424,13 @@ pub async fn admit(
         generations::InsertGenerationError::Database(source) => internal(source),
     })?;
 
-    if let Some((_, client_id)) = raw_metadata {
-        let (number,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(MAX(number), -1) + 1 FROM comfy_prompts WHERE tenant_id = $1",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(internal)?;
-        crate::db::comfy::insert(
-            &mut tx,
-            tenant,
-            row.generation_id(),
-            prompt_id,
-            client_id,
-            number,
-        )
-        .await
-        .map_err(|error| {
-            if error
-                .as_database_error()
-                .and_then(sqlx::error::DatabaseError::code)
-                .as_deref()
-                == Some("23505")
-            {
-                AdmissionError::PromptIdConflict
-            } else {
-                internal(error)
-            }
-        })?;
-    }
-
-    link_input_artifacts(
-        &mut tx,
-        tenant,
-        row.generation_id(),
-        &request.input_artifact_ids,
-    )
-    .await?;
+    link_input_artifacts(&mut tx, tenant, row.generation_id(), &inputs).await?;
 
     if let Some(key) = request.idempotency_key.as_deref() {
         record_idempotency_key(&mut tx, tenant, key, &request, row.generation_id()).await?;
     }
 
     tx.commit().await.map_err(internal)?;
-    if raw_metadata.is_some() {
-        state.events.notify_tenant(tenant, row.generation_id());
-    }
     state.scheduler.wake_tenant(tenant);
 
     Ok(row)
@@ -573,19 +438,32 @@ pub async fn admit(
 
 #[cfg(test)]
 mod tests {
+    use gpq_domain::ImageParameters;
+
     use super::*;
+
+    fn sample_image(prompt: &str) -> GenerationParameters {
+        GenerationParameters::Image(ImageParameters {
+            prompt: prompt.to_owned(),
+            negative_prompt: String::new(),
+            width: 1024,
+            height: 1024,
+            steps: None,
+            cfg_scale: None,
+            references: Vec::new(),
+            loras: Vec::new(),
+            sigmas: None,
+        })
+    }
 
     fn sample_request(key: Option<&str>) -> AdmissionRequest {
         AdmissionRequest {
-            target: AdmissionTarget::Model("llama-3".to_owned()),
-            parameters: serde_json::json!({"temperature": 0.7}),
-            input_artifact_ids: Vec::new(),
+            target: AdmissionTarget::Model("qwen-image".to_owned()),
+            parameters: sample_image("a red bicycle"),
             output_placement: ArtifactPlacement::WorkerLocal,
             priority: None,
             seed: Some(42),
             execution_timeout: None,
-            caller_kind: CallerKind::Durable,
-            stream_tokens: false,
             idempotency_key: key.map(str::to_owned),
         }
     }
@@ -601,7 +479,7 @@ mod tests {
     #[test]
     fn differing_parameters_hash_differently() {
         let mut other = sample_request(Some("k"));
-        other.parameters = serde_json::json!({"temperature": 0.9});
+        other.parameters = sample_image("a blue bicycle");
         assert_ne!(
             idempotency_digest(&sample_request(Some("k"))),
             idempotency_digest(&other)
@@ -639,9 +517,16 @@ mod tests {
             false
         ));
         assert!(!requires_missing_object_store(
-            ArtifactPlacement::InlineRelay,
+            ArtifactPlacement::RemoteLocal,
             false
         ));
+    }
+
+    #[test]
+    fn remote_local_is_never_an_output_placement() {
+        assert!(validate_output_placement(ArtifactPlacement::RemoteLocal).is_err());
+        assert!(validate_output_placement(ArtifactPlacement::WorkerLocal).is_ok());
+        assert!(validate_output_placement(ArtifactPlacement::ObjectStore).is_ok());
     }
 
     #[test]
@@ -661,7 +546,7 @@ mod tests {
             id: ArtifactId::new(),
             direction,
             state: gpq_domain::ArtifactState::Available,
-            placement: ArtifactPlacement::WorkerLocal,
+            placement: ArtifactPlacement::RemoteLocal,
             manifest: gpq_domain::ArtifactManifest {
                 size_bytes,
                 digest: gpq_domain::ContentHash::from_bytes([1; 32]),
@@ -671,7 +556,6 @@ mod tests {
             object_key: None,
             worker_id: None,
             delivery_token: None,
-            comfy_output_pointers: Vec::new(),
             committed_offset: 0,
         }
     }
@@ -694,18 +578,5 @@ mod tests {
     fn input_artifact_within_the_limit_is_accepted() {
         let artifact = sample_input_artifact(crate::db::artifacts::ArtifactDirection::Input, 1_000);
         assert!(validate_input_artifact_row(ArtifactId::new(), &artifact, 1_000).is_ok());
-    }
-
-    #[test]
-    fn a_model_and_a_workflow_alias_of_the_same_name_hash_differently() {
-        // The idempotency digest must fold in which catalog an alias names,
-        // not just its text, or a Model and Workflow request sharing a key
-        // could replay across catalogs.
-        let mut workflow_request = sample_request(Some("k"));
-        workflow_request.target = AdmissionTarget::Workflow("llama-3".to_owned());
-        assert_ne!(
-            idempotency_digest(&sample_request(Some("k"))),
-            idempotency_digest(&workflow_request)
-        );
     }
 }

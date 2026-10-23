@@ -1,0 +1,23 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "gpq-inference"
+version.workspace = true
+
+[features]
+cuda = []
+default = []
+metal = []
+vulkan = []
+
+[dependencies]
+gpq-domain = { path = "../gpq-domain" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.17"
+
+[build-dependencies]
+cmake = "0.1.54"
+
+[lints]
+workspace = true

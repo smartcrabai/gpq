@@ -136,6 +136,56 @@ jobs:
         with:
           "repo-token": "${{ secrets.GITHUB_TOKEN }}"
           "version": "35.1"
+      - name: "Install native build dependencies (Linux)"
+        if: "runner.os == 'Linux'"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake libvulkan-dev glslc
+          bash scripts/install-spirv-headers.sh "$RUNNER_TEMP/spirv-headers"
+        shell: "bash"
+      - name: "Install native build dependencies (macOS)"
+        if: "runner.os == 'macOS'"
+        run: |
+          command -v cmake >/dev/null || brew install cmake
+          echo "MACOSX_DEPLOYMENT_TARGET=26.7" >> "$GITHUB_ENV"
+          bash scripts/install-spirv-headers.sh "$RUNNER_TEMP/spirv-headers"
+        shell: "bash"
+      - name: "Install native build dependencies (Windows)"
+        if: "runner.os == 'Windows'"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            choco install cmake -y --no-progress --installargs 'ADD_CMAKE_TO_PATH=System'
+            $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+          }
+          choco install vulkan-sdk -y --no-progress
+          $sdk = Get-ChildItem C:\VulkanSDK -Directory | Sort-Object { [version]$_.Name } | Select-Object -Last 1
+          if (-not $sdk) { throw 'Vulkan SDK not found under C:\VulkanSDK' }
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+          bash scripts/install-spirv-headers.sh "$env:RUNNER_TEMP/spirv-headers"
+
+          # ARM64 import library for vulkan-1.dll, generated from the pinned upstream
+          # loader export list (tag vulkan-sdk-1.4.363.0) with the x64-hosted lib.exe.
+          $loaderCommit = 'fa218055ff4948b159f31d43f800c808a13d51df'
+          $defSha256 = '9ba339b7f5ee2df28487698a6840ecf095fac58b415c2c89ad9f161e9d316378'
+          $dir = Join-Path $env:RUNNER_TEMP 'vulkan-arm64'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $def = Join-Path $dir 'vulkan-1.def'
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Loader/$loaderCommit/loader/vulkan-1.def" -OutFile $def
+          if ((Get-FileHash -Algorithm SHA256 $def).Hash.ToLowerInvariant() -ne $defSha256) {
+            throw 'vulkan-1.def checksum mismatch'
+          }
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio with MSVC tools not found' }
+          Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          $importLib = Join-Path $dir 'vulkan-1.lib'
+          lib /nologo /def:$def /machine:ARM64 /out:$importLib
+          if ($LASTEXITCODE -ne 0) { throw 'lib.exe failed to generate the ARM64 vulkan-1 import library' }
+          "GPQ_VULKAN_IMPORT_LIB_ARM64=$importLib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        shell: "pwsh"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

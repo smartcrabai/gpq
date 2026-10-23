@@ -6,20 +6,19 @@ edition = "2024";
 package gpq.v1;
 
 import "google/protobuf/duration.proto";
-import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 import "gpq/v1/common.proto";
+import "gpq/v1/catalog.proto";
 
 option features.field_presence = IMPLICIT;
 
-// One tenant request for one AI-generated result.
+// One tenant request for one generated result.
 message Generation {
   string generation_id = 1;
   GenerationState state = 2;
   Modality modality = 3;
-  // The alias the caller named, empty for a raw ComfyUI prompt.
-  string alias = 4;
-  // Immutable content hash resolved or computed at admission (ADR 0012).
+  string model_alias = 4;
+  // Immutable content hash resolved at admission (ADR 0012).
   string version_sha256 = 5;
   uint32 priority = 6;
   uint64 seed = 7;
@@ -27,29 +26,52 @@ message Generation {
   google.protobuf.Timestamp created_at = 9;
   google.protobuf.Timestamp updated_at = 10;
   uint32 attempt_count = 11;
-  // Final LLM text, retained indefinitely (ADR 0008).
-  string output_text = 12;
   repeated ArtifactRef output_artifacts = 13;
-  Usage usage = 14;
   Failure failure = 15;
   Progress latest_progress = 16;
+  reserved 12, 14;
+  reserved alias, output_text, usage;
+}
+
+message ImageParameters {
+  string prompt = 1;
+  string negative_prompt = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 steps = 5 [features.field_presence = EXPLICIT];
+  float cfg_scale = 6 [features.field_presence = EXPLICIT];
+  repeated string reference_artifact_ids = 7;
+  repeated LoraSelection loras = 8;
+  repeated float sigmas = 9;
+}
+
+message VideoParameters {
+  string prompt = 1;
+  string negative_prompt = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 frames = 5;
+  string first_frame_artifact_id = 6 [features.field_presence = EXPLICIT];
+  string last_frame_artifact_id = 7 [features.field_presence = EXPLICIT];
 }
 
 message SubmitRequest {
-  // Exactly one alias; modality is derived from the resolved version (ADR 0006).
+  // Exactly one model alias; modality is derived from its resolved version.
   oneof target {
     string model_alias = 1;
-    string workflow_alias = 2;
   }
-  // Opaque backend-shaped payload; no universal parameter schema (ADR 0007).
-  google.protobuf.Struct parameters = 3;
-  repeated string input_artifact_ids = 4;
   ArtifactPlacement output_placement = 5;
   // Zero through nine; omitted means the Tenant default.
   uint32 priority = 6;
   uint64 seed = 7 [features.field_presence = EXPLICIT];
   // May only shorten the resolved timeout (ADR 0003).
   google.protobuf.Duration execution_timeout = 8 [features.field_presence = EXPLICIT];
+  oneof generation_parameters {
+    ImageParameters image_parameters = 9;
+    VideoParameters video_parameters = 10;
+  }
+  reserved 2, 3, 4;
+  reserved workflow_alias, parameters, input_artifact_ids;
 }
 
 message SubmitResponse {
@@ -87,17 +109,18 @@ message WatchGenerationRequest {
   string generation_id = 1;
 }
 
-// A reconnected stream starts with a snapshot, then live events; token deltas
-// are never replayed and any gap is explicit (ADR 0006).
+// A reconnected stream starts with a snapshot, then live events; any gap is
+// explicit (ADR 0006).
 message GenerationEvent {
   google.protobuf.Timestamp emitted_at = 1;
   oneof event {
     Generation snapshot = 2;
     StateChanged state_changed = 3;
     Progress progress = 4;
-    TokenDelta token_delta = 5;
     Discontinuity discontinuity = 6;
   }
+  reserved 5;
+  reserved token_delta;
 }
 
 message StateChanged {
@@ -106,18 +129,15 @@ message StateChanged {
   Failure failure = 3;
 }
 
-message TokenDelta {
-  string text = 1;
-}
 
 // Emitted when live events were dropped, e.g. across a reconnect.
 message Discontinuity {
   string reason = 1;
 }
 
-// Native input Artifacts use S3-compatible ephemeral placement so queued work
-// can move between Workers (ADR 0008); Remote alone holds S3 credentials and
-// issues object-scoped presigned URLs.
+// Native inputs may use persistent Remote-local storage without S3; ObjectStore
+// placement remains available for queued work that moves between Workers.
+// Remote alone holds object-store credentials and issues object-scoped URLs.
 message CreateInputArtifactRequest {
   ArtifactManifest manifest = 1;
 }

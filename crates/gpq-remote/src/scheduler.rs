@@ -18,15 +18,17 @@
 //! from the Worker session), which is also when ADR 0003's execution-timeout
 //! clock starts.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration as StdDuration;
 
 use buffa::MessageField;
 use chrono::{DateTime, Utc};
 use gpq_domain::{
-    Candidate, ContentHash, DevicePoolId, ExecutionTarget, GenerationId, MediaKind, SlotCapability,
-    SlotContext, TenantId, WorkerId, lease_expiry_from, select_batch,
+    AttemptId, Candidate, DevicePoolId, GenerationId, MediaKind, SlotCapability, SlotContext,
+    TenantId, WorkerId, lease_expiry_from, select_batch,
 };
 use gpq_proto::gpq::v1 as pb;
+use gpq_proto::gpq::worker::v1::__buffa::oneof::lease_assignment;
 use gpq_proto::gpq::worker::v1::{LeaseAssignment, LeaseInput, RemoteMessage};
 use sqlx::PgConnection;
 use sqlx::postgres::{PgListener, PgNotification};
@@ -202,7 +204,7 @@ async fn try_schedule_tenant(state: &AppState, tenant: TenantId) -> anyhow::Resu
     }
 
     let now = state.db.now().await?;
-    let (capabilities, settings, candidates) = {
+    let (capabilities, settings, candidates, exclusions) = {
         let mut tx = state.db.begin_tenant(tenant).await?;
         let capabilities = crate::db::workers::pool_capabilities(&mut tx, tenant).await?;
         let settings = crate::db::tenants::settings(&mut tx, tenant)
@@ -211,17 +213,32 @@ async fn try_schedule_tenant(state: &AppState, tenant: TenantId) -> anyhow::Resu
         let candidates =
             crate::db::generations::queued_candidates(&mut tx, tenant, CANDIDATE_FETCH_LIMIT)
                 .await?;
+        let generation_ids: Vec<GenerationId> = candidates
+            .iter()
+            .map(|candidate| candidate.generation_id)
+            .collect();
+        let exclusions = crate::db::native_exclusions::excluded_pools_for_generations(
+            &mut tx,
+            tenant,
+            &generation_ids,
+        )
+        .await?;
         tx.commit().await?;
-        (capabilities, settings, candidates)
+        (capabilities, settings, candidates, exclusions)
     };
 
     if candidates.is_empty() {
         return Ok(());
     }
 
-    for assignment in plan_assignments(&capabilities, &candidates, settings, now, |worker_id| {
-        state.workers.is_online(worker_id)
-    }) {
+    for assignment in plan_assignments(
+        &capabilities,
+        &candidates,
+        &exclusions,
+        settings,
+        now,
+        |worker_id| state.workers.is_online(worker_id),
+    ) {
         assign(state, tenant, &assignment, now).await;
     }
     Ok(())
@@ -252,6 +269,7 @@ struct SlotAssignment<'a> {
 fn plan_assignments<'a>(
     capabilities: &'a [(SlotCapability, u32, WorkerId, String)],
     candidates: &'a [Candidate],
+    exclusions: &HashMap<GenerationId, HashSet<DevicePoolId>>,
     settings: gpq_domain::TenantSettings,
     now: DateTime<Utc>,
     is_online: impl Fn(WorkerId) -> bool,
@@ -267,9 +285,12 @@ fn plan_assignments<'a>(
             settings,
             now,
         };
-        // Never over-assign, never preempt (ADR 0002): `select_batch` only
-        // ever returns queued work, bounded by this Pool's free Slots.
-        for candidate in select_batch(&context, candidates) {
+        let pool_rejected = |candidate: &Candidate| {
+            exclusions
+                .get(&candidate.generation_id)
+                .is_some_and(|pools| pools.contains(&capability.pool_id))
+        };
+        let mut push_assignment = |candidate: &'a Candidate| {
             assignments.push(SlotAssignment {
                 worker_id: *worker_id,
                 pool_id: capability.pool_id,
@@ -277,6 +298,28 @@ fn plan_assignments<'a>(
                 capability,
                 candidate,
             });
+        };
+        if candidates.iter().any(&pool_rejected) {
+            // `select_batch` takes a `&[Candidate]`; make the filtered slice
+            // only when this Pool has Generation-specific exclusions, then map
+            // selected identities back to the canonical scheduler snapshot.
+            let eligible: Vec<Candidate> = candidates
+                .iter()
+                .filter(|candidate| !pool_rejected(candidate))
+                .cloned()
+                .collect();
+            for selected in select_batch(&context, &eligible) {
+                if let Some(candidate) = candidates
+                    .iter()
+                    .find(|candidate| candidate.generation_id == selected.generation_id)
+                {
+                    push_assignment(candidate);
+                }
+            }
+        } else {
+            for candidate in select_batch(&context, candidates) {
+                push_assignment(candidate);
+            }
         }
     }
     assignments
@@ -305,6 +348,16 @@ async fn try_assign(
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let mut tx = state.db.begin_tenant(tenant).await?;
+    let excluded = crate::db::native_exclusions::excluded_pools(
+        &mut tx,
+        tenant,
+        assignment.candidate.generation_id,
+    )
+    .await?;
+    if excluded.contains(&assignment.pool_id) {
+        // The planning snapshot may predate a committed rejection or OOM.
+        return Ok(());
+    }
 
     if !crate::db::workers::claim_slot(&mut tx, tenant, assignment.pool_id).await? {
         // Raced with another pass, or the Worker's last capability report
@@ -380,18 +433,17 @@ async fn try_assign(
     Ok(())
 }
 
-/// The single canonical object-store key for a Generation's output
-/// Artifact (ADR 0008).
+/// The canonical object-store key for one Attempt's output Artifact (ADR 0008).
 ///
-/// Computed once here so this scheduler (which presigns the Worker's
-/// upload URL) and `session::try_handle_attempt_result` (which must reject
-/// any other key an `AttemptResult` reports back) can never drift — a
-/// mismatch would otherwise let a Worker Credential read or delete
-/// arbitrary keys in the shared bucket via Remote's own S3 credentials
-/// (confused deputy).
+/// The attempt component prevents an older presigned PUT from overwriting a
+/// later retry's accepted object.
 #[must_use]
-pub(crate) fn leased_output_key(tenant_id: TenantId, generation_id: GenerationId) -> String {
-    format!("{tenant_id}/{generation_id}/output")
+pub(crate) fn leased_output_key(
+    tenant_id: TenantId,
+    generation_id: GenerationId,
+    attempt_id: AttemptId,
+) -> String {
+    format!("{tenant_id}/{generation_id}/attempts/{attempt_id}/output")
 }
 
 async fn build_lease_assignment(
@@ -402,52 +454,36 @@ async fn build_lease_assignment(
     attempt: &AttemptRow,
     generation: &GenerationRow,
 ) -> anyhow::Result<LeaseAssignment> {
-    let target = generation
-        .target()
-        .map_err(|error| anyhow::anyhow!("generation has an unparseable target: {error}"))?;
-    let modality = generation
-        .modality()
-        .map_err(|error| anyhow::anyhow!("generation has an unparseable modality: {error}"))?;
-
-    // A Model lease carries no Workflow: the graph and manifest fields must
-    // stay unset rather than default-constructed, or the Worker would try to
-    // revalidate an empty manifest (ADR 0007 keeps the two targets distinct).
-    let resolved_workflow = match target {
-        ExecutionTarget::Model { .. } | ExecutionTarget::ComfyPrompt { .. } => None,
-        ExecutionTarget::Workflow { version } => {
-            let Some(resolved) =
-                crate::db::catalog::get_workflow_version_row(conn, tenant, version).await?
-            else {
-                anyhow::bail!(
-                    "workflow version {version} pinned by generation {} is no longer registered",
-                    generation.id
-                );
-            };
-            Some((resolved.graph, resolved.manifest, resolved.limits))
-        }
+    let version = generation
+        .version()
+        .map_err(|error| anyhow::anyhow!("generation has an unparseable version: {error}"))?;
+    let Some(model) = crate::db::catalog::get_model_version(conn, tenant, version).await? else {
+        anyhow::bail!(
+            "model version {version} pinned by generation {} is no longer registered",
+            generation.generation_id()
+        );
     };
-    let (model_sha256, workflow_sha256, workflow_graph, workflow_manifest) =
-        lease_target_fields(target, resolved_workflow)?;
-
-    let (parameters, comfy_prompt_json, comfy_prompt_sha256) = match target {
-        ExecutionTarget::ComfyPrompt { version } => {
-            let bytes = serde_json::to_vec(&generation.parameters)?;
-            if bytes.len() > 2 * 1024 * 1024 {
-                anyhow::bail!("raw ComfyUI prompt exceeds the 2 MiB limit");
-            }
-            (MessageField::none(), bytes, version.to_hex())
+    let parameters: gpq_domain::GenerationParameters =
+        serde_json::from_value(generation.parameters.clone()).map_err(|error| {
+            anyhow::anyhow!("generation parameters are not typed native parameters: {error}")
+        })?;
+    let parameters = match parameters {
+        gpq_domain::GenerationParameters::Image(image) => {
+            lease_assignment::GenerationParameters::ImageParameters(Box::new(
+                proto_image_parameters(&image),
+            ))
         }
-        ExecutionTarget::Model { .. } | ExecutionTarget::Workflow { .. } => {
-            let parameters: buffa_types::google::protobuf::Struct =
-                serde_json::from_value(generation.parameters.clone()).map_err(|error| {
-                    anyhow::anyhow!("generation parameters is not a JSON object: {error}")
-                })?;
-            (parameters.into(), Vec::new(), String::new())
+        gpq_domain::GenerationParameters::Video(video) => {
+            lease_assignment::GenerationParameters::VideoParameters(Box::new(
+                proto_video_parameters(&video),
+            ))
         }
     };
 
     let mut inputs = Vec::new();
     for row in crate::db::artifacts::list_inputs(conn, tenant, generation.generation_id()).await? {
+        // Only object-store inputs are fetched by presigned URL; remote-local
+        // bytes are pulled by the Worker through WorkerTransferService.
         let download_url = if row.placement == gpq_domain::ArtifactPlacement::ObjectStore {
             match &row.object_key {
                 Some(key) => state.artifacts.presign_get(key).await?.0.to_string(),
@@ -471,7 +507,7 @@ async fn build_lease_assignment(
         .unwrap_or(gpq_domain::ArtifactPlacement::WorkerLocal);
     let (output_upload_url, output_object_key) =
         if output_placement == gpq_domain::ArtifactPlacement::ObjectStore {
-            let key = leased_output_key(tenant, generation.generation_id());
+            let key = leased_output_key(tenant, generation.generation_id(), attempt.attempt_id());
             let (url, _expires_at) = state.artifacts.presign_put_unsized(&key).await?;
             (url.to_string(), key)
         } else {
@@ -489,12 +525,9 @@ async fn build_lease_assignment(
         generation_id: generation.generation_id().to_string(),
         pool_id: pool_key.to_owned(),
         slot_id: attempt.slot_key.clone(),
-        modality: proto_modality(modality).into(),
-        model_sha256,
-        workflow_sha256,
-        workflow_graph: workflow_graph.map_or_else(MessageField::none, MessageField::some),
-        workflow_manifest: workflow_manifest.map_or_else(MessageField::none, MessageField::some),
-        parameters,
+        model_sha256: version.to_hex(),
+        model_manifest: MessageField::some(proto_model_manifest(&model.manifest)),
+        generation_parameters: Some(parameters),
         inputs,
         output_placement: proto_artifact_placement(output_placement).into(),
         output_upload_url,
@@ -503,59 +536,8 @@ async fn build_lease_assignment(
         execution_timeout: execution_timeout.into(),
         lease_expires_at: buffa_types::google::protobuf::Timestamp::from(attempt.lease_expires_at)
             .into(),
-        stream_tokens: generation.stream_tokens,
-        comfy_prompt_json,
-        comfy_prompt_sha256,
         ..Default::default()
     })
-}
-
-/// Which target-specific fields a `LeaseAssignment` carries, by
-/// [`ExecutionTarget`] (ADR 0007 keeps a Model and a Workflow lease
-/// distinct): a Model lease leaves the Workflow graph and manifest unset
-/// rather than default-constructed, so the Worker never tries to revalidate
-/// an empty manifest; a Workflow lease carries its graph, its manifest, and
-/// the pinned Version hash. `resolved_workflow` is `None` only for a Model
-/// target; the caller has already fetched it for a Workflow target before
-/// calling this, so that combination is a defensive internal-invariant
-/// error rather than a normal outcome.
-fn lease_target_fields(
-    target: ExecutionTarget,
-    resolved_workflow: Option<(
-        serde_json::Value,
-        gpq_domain::WorkflowManifest,
-        gpq_domain::ExecutionLimits,
-    )>,
-) -> anyhow::Result<(
-    String,
-    String,
-    Option<buffa_types::google::protobuf::Struct>,
-    Option<pb::WorkflowManifest>,
-)> {
-    match target {
-        ExecutionTarget::Model { version } => Ok((version.to_hex(), String::new(), None, None)),
-        ExecutionTarget::ComfyPrompt { .. } => {
-            if resolved_workflow.is_some() {
-                anyhow::bail!("raw ComfyUI prompt unexpectedly carried a workflow version");
-            }
-            Ok((String::new(), String::new(), None, None))
-        }
-        ExecutionTarget::Workflow { version } => {
-            let Some((graph_value, manifest, limits)) = resolved_workflow else {
-                anyhow::bail!(
-                    "workflow version {version} pinned by a generation has no resolved workflow version"
-                );
-            };
-            let graph = serde_json::from_value(graph_value)
-                .map_err(|error| anyhow::anyhow!("workflow graph is not a JSON object: {error}"))?;
-            Ok((
-                String::new(),
-                version.to_hex(),
-                Some(graph),
-                Some(proto_workflow_manifest(&manifest, limits)),
-            ))
-        }
-    }
 }
 
 fn proto_duration_from_micros(microseconds: i64) -> buffa_types::google::protobuf::Duration {
@@ -564,21 +546,11 @@ fn proto_duration_from_micros(microseconds: i64) -> buffa_types::google::protobu
     buffa_types::google::protobuf::Duration::from(delta)
 }
 
-fn proto_modality(modality: gpq_domain::Modality) -> pb::Modality {
-    match modality {
-        gpq_domain::Modality::Llm => pb::Modality::Llm,
-        gpq_domain::Modality::Image => pb::Modality::Image,
-        gpq_domain::Modality::Video => pb::Modality::Video,
-        gpq_domain::Modality::Music => pb::Modality::Music,
-        gpq_domain::Modality::Comfy => pb::Modality::Comfy,
-    }
-}
-
 fn proto_artifact_placement(placement: gpq_domain::ArtifactPlacement) -> pb::ArtifactPlacement {
     match placement {
         gpq_domain::ArtifactPlacement::ObjectStore => pb::ArtifactPlacement::ObjectStore,
         gpq_domain::ArtifactPlacement::WorkerLocal => pb::ArtifactPlacement::WorkerLocal,
-        gpq_domain::ArtifactPlacement::InlineRelay => pb::ArtifactPlacement::InlineRelay,
+        gpq_domain::ArtifactPlacement::RemoteLocal => pb::ArtifactPlacement::RemoteLocal,
     }
 }
 
@@ -602,74 +574,102 @@ fn proto_artifact_manifest(manifest: &gpq_domain::ArtifactManifest) -> pb::Artif
     }
 }
 
-fn proto_workflow_manifest(
-    manifest: &gpq_domain::WorkflowManifest,
-    limits: gpq_domain::ExecutionLimits,
-) -> pb::WorkflowManifest {
-    pb::WorkflowManifest {
-        output_node: manifest.output_node.clone(),
-        output_name: manifest.output_name.clone(),
-        artifact_kind: proto_media_kind(manifest.artifact_kind).into(),
-        artifact_mime: manifest.artifact_mime.clone(),
-        required_model_sha256: manifest
-            .required_models
+fn proto_model_family(family: gpq_domain::ModelFamily) -> pb::ModelFamily {
+    match family {
+        gpq_domain::ModelFamily::QwenImage21 => pb::ModelFamily::MODEL_FAMILY_QWEN_IMAGE21,
+        gpq_domain::ModelFamily::MinimaxH3 => pb::ModelFamily::MODEL_FAMILY_MINIMAX_H3,
+    }
+}
+
+fn proto_asset_role(role: gpq_domain::ModelAssetRole) -> pb::ModelAssetRole {
+    match role {
+        gpq_domain::ModelAssetRole::Diffusion => pb::ModelAssetRole::MODEL_ASSET_ROLE_DIFFUSION,
+        gpq_domain::ModelAssetRole::TextEncoder => {
+            pb::ModelAssetRole::MODEL_ASSET_ROLE_TEXT_ENCODER
+        }
+        gpq_domain::ModelAssetRole::VisionEncoder => {
+            pb::ModelAssetRole::MODEL_ASSET_ROLE_VISION_ENCODER
+        }
+        gpq_domain::ModelAssetRole::Vae => pb::ModelAssetRole::MODEL_ASSET_ROLE_VAE,
+        gpq_domain::ModelAssetRole::AudioVae => pb::ModelAssetRole::MODEL_ASSET_ROLE_AUDIO_VAE,
+    }
+}
+
+fn proto_lora_selection(lora: &gpq_domain::LoraSelection) -> pb::LoraSelection {
+    pb::LoraSelection {
+        sha256: lora.sha256.to_hex(),
+        scale: lora.scale,
+        ..Default::default()
+    }
+}
+
+/// The pinned Model Version's manifest as the Worker must receive it, so the
+/// Worker can verify it hashes to `LeaseAssignment.model_sha256`.
+fn proto_model_manifest(manifest: &gpq_domain::ModelManifest) -> pb::ModelManifest {
+    pb::ModelManifest {
+        family: proto_model_family(manifest.family).into(),
+        assets: manifest
+            .assets
             .iter()
-            .map(ContentHash::to_hex)
-            .collect(),
-        required_custom_nodes: manifest.required_custom_nodes.clone().into_iter().collect(),
-        estimated_vram_bytes: limits.estimated_vram_bytes.unwrap_or(0),
-        execution_timeout: limits
-            .execution_timeout
-            .map(|duration| {
-                let delta = chrono::TimeDelta::from_std(duration).unwrap_or_default();
-                buffa_types::google::protobuf::Duration::from(delta)
+            .map(|(role, sha256)| pb::ModelAsset {
+                role: proto_asset_role(*role).into(),
+                sha256: sha256.to_hex(),
+                ..Default::default()
             })
-            .unwrap_or_default()
-            .into(),
+            .collect(),
+        default_loras: manifest
+            .default_loras
+            .iter()
+            .map(proto_lora_selection)
+            .collect(),
+        sampling: MessageField::some(pb::SamplingPreset {
+            steps: manifest.sampling.steps,
+            cfg_scale: manifest.sampling.cfg_scale,
+            sigmas: manifest.sampling.sigmas.clone(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn proto_image_parameters(params: &gpq_domain::ImageParameters) -> pb::ImageParameters {
+    pb::ImageParameters {
+        prompt: params.prompt.clone(),
+        negative_prompt: params.negative_prompt.clone(),
+        width: params.width,
+        height: params.height,
+        steps: params.steps,
+        cfg_scale: params.cfg_scale,
+        reference_artifact_ids: params.references.iter().map(ToString::to_string).collect(),
+        loras: params.loras.iter().map(proto_lora_selection).collect(),
+        // An absent sigma schedule means the model's own preset applies.
+        sigmas: params.sigmas.clone().unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+fn proto_video_parameters(params: &gpq_domain::VideoParameters) -> pb::VideoParameters {
+    pb::VideoParameters {
+        prompt: params.prompt.clone(),
+        negative_prompt: params.negative_prompt.clone(),
+        width: params.width,
+        height: params.height,
+        frames: params.frames,
+        first_frame_artifact_id: params.first_frame.as_ref().map(ToString::to_string),
+        last_frame_artifact_id: params.last_frame.as_ref().map(ToString::to_string),
         ..Default::default()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use gpq_domain::{
+        ContentHash, ModelAssetRole, ModelFamily, ModelManifest, Requirement, ShapeLimits,
+    };
+
     use super::*;
-
-    #[test]
-    fn modality_mapping_is_total_and_faithful() {
-        assert_eq!(proto_modality(gpq_domain::Modality::Llm), pb::Modality::Llm);
-        assert_eq!(
-            proto_modality(gpq_domain::Modality::Image),
-            pb::Modality::Image
-        );
-        assert_eq!(
-            proto_modality(gpq_domain::Modality::Video),
-            pb::Modality::Video
-        );
-        assert_eq!(
-            proto_modality(gpq_domain::Modality::Music),
-            pb::Modality::Music
-        );
-        assert_eq!(
-            proto_modality(gpq_domain::Modality::Comfy),
-            pb::Modality::Comfy
-        );
-    }
-
-    #[test]
-    fn artifact_placement_mapping_is_total_and_faithful() {
-        assert_eq!(
-            proto_artifact_placement(gpq_domain::ArtifactPlacement::ObjectStore),
-            pb::ArtifactPlacement::ObjectStore
-        );
-        assert_eq!(
-            proto_artifact_placement(gpq_domain::ArtifactPlacement::WorkerLocal),
-            pb::ArtifactPlacement::WorkerLocal
-        );
-        assert_eq!(
-            proto_artifact_placement(gpq_domain::ArtifactPlacement::InlineRelay),
-            pb::ArtifactPlacement::InlineRelay
-        );
-    }
 
     #[test]
     fn duration_from_micros_round_trips() {
@@ -685,55 +685,36 @@ mod tests {
         assert_eq!(proto.nanos, 0);
     }
 
-    #[test]
-    fn model_target_leaves_workflow_fields_unset() {
-        // ADR 0007: a Model lease must never carry a default-constructed
-        // Workflow graph/manifest that the Worker would try to revalidate.
-        let version = ContentHash::from_bytes([7; 32]);
-        let Ok((model_sha256, workflow_sha256, graph, manifest)) =
-            lease_target_fields(ExecutionTarget::Model { version }, None)
-        else {
-            panic!("a Model target must resolve without a workflow lookup");
-        };
-        assert_eq!(model_sha256, version.to_hex());
-        assert!(workflow_sha256.is_empty());
-        assert!(graph.is_none());
-        assert!(manifest.is_none());
+    fn sample_manifest() -> ModelManifest {
+        ModelManifest {
+            family: ModelFamily::QwenImage21,
+            assets: BTreeMap::from([
+                (
+                    ModelAssetRole::Diffusion,
+                    ContentHash::digest(b"sample diffusion weights"),
+                ),
+                (
+                    ModelAssetRole::TextEncoder,
+                    ContentHash::digest(b"sample text encoder weights"),
+                ),
+                (
+                    ModelAssetRole::VisionEncoder,
+                    ContentHash::digest(b"sample vision encoder weights"),
+                ),
+                (
+                    ModelAssetRole::Vae,
+                    ContentHash::digest(b"sample vae weights"),
+                ),
+            ]),
+            default_loras: Vec::new(),
+            sampling: ModelFamily::QwenImage21.default_sampling_preset(),
+        }
     }
 
-    #[test]
-    fn workflow_target_carries_graph_manifest_and_pinned_hash() {
-        // ADR 0007: a Workflow lease carries its graph, its manifest, and
-        // the pinned Version hash — never left unset like a Model lease.
-        let version = ContentHash::from_bytes([8; 32]);
-        let workflow_manifest = gpq_domain::WorkflowManifest {
-            output_node: "9".to_owned(),
-            output_name: "IMAGE".to_owned(),
-            artifact_kind: MediaKind::Image,
-            artifact_mime: "image/png".to_owned(),
-            required_models: Vec::new(),
-            required_custom_nodes: std::collections::BTreeMap::new(),
-        };
-        let Ok((model_sha256, workflow_sha256, graph, manifest)) = lease_target_fields(
-            ExecutionTarget::Workflow { version },
-            Some((
-                serde_json::json!({"1": {}}),
-                workflow_manifest,
-                gpq_domain::ExecutionLimits::default(),
-            )),
-        ) else {
-            panic!("a resolved Workflow target must succeed");
-        };
-        assert!(model_sha256.is_empty());
-        assert_eq!(workflow_sha256, version.to_hex());
-        assert!(graph.is_some());
-        assert!(manifest.is_some());
-    }
-
-    #[test]
-    fn unresolved_workflow_target_is_rejected() {
-        let version = ContentHash::from_bytes([9; 32]);
-        assert!(lease_target_fields(ExecutionTarget::Workflow { version }, None).is_err());
+    fn sample_version() -> ContentHash {
+        sample_manifest()
+            .canonical_hash()
+            .unwrap_or_else(|err| panic!("sample manifest has canonical JSON: {err}"))
     }
 
     fn sample_capability(
@@ -747,14 +728,13 @@ mod tests {
             worker_id,
             pool_id,
             slot_id: gpq_domain::SlotId::new(),
-            backend_kind: gpq_domain::BackendKind::LlamaCpp,
-            backend_version: "1.0".to_owned(),
-            model_versions: std::collections::BTreeSet::from([version]),
-            custom_nodes: std::collections::BTreeMap::new(),
+            accelerator: "metal".to_owned(),
+            accelerator_version: "1.0".to_owned(),
+            model_manifests: BTreeMap::from([(version, sample_manifest())]),
+            image_loras: BTreeSet::new(),
             resident_model: None,
             accelerator_memory_bytes: None,
-            supports_comfy_prompt: false,
-            incapable_versions: std::collections::BTreeSet::new(),
+            shape_limits: ShapeLimits::default(),
         }
     }
 
@@ -763,11 +743,27 @@ mod tests {
         version: ContentHash,
         created_at: DateTime<Utc>,
     ) -> Candidate {
+        let parameters = gpq_domain::GenerationParameters::Image(gpq_domain::ImageParameters {
+            prompt: "a lighthouse".to_owned(),
+            negative_prompt: String::new(),
+            width: 64,
+            height: 64,
+            steps: None,
+            cfg_scale: None,
+            references: Vec::new(),
+            loras: Vec::new(),
+            sigmas: None,
+        });
+        let Ok(requirement) =
+            Requirement::for_generation(tenant, version, &sample_manifest(), &parameters)
+        else {
+            panic!("a plain image request must yield a requirement");
+        };
         Candidate {
-            generation_id: gpq_domain::GenerationId::new(),
+            generation_id: GenerationId::new(),
             created_at,
             priority: gpq_domain::Priority::DEFAULT,
-            requirement: gpq_domain::Requirement::for_model(tenant, version, None),
+            requirement,
         }
     }
 
@@ -777,7 +773,7 @@ mod tests {
         let tenant = TenantId::new();
         let worker_id = WorkerId::new();
         let pool_id = DevicePoolId::new();
-        let version = ContentHash::from_bytes([1; 32]);
+        let version = sample_version();
         let capabilities = vec![(
             sample_capability(tenant, worker_id, pool_id, version),
             0_u32,
@@ -789,6 +785,7 @@ mod tests {
         let assignments = plan_assignments(
             &capabilities,
             &candidates,
+            &HashMap::new(),
             gpq_domain::TenantSettings::default(),
             Utc::now(),
             |_| true,
@@ -803,7 +800,7 @@ mod tests {
         let tenant = TenantId::new();
         let worker_id = WorkerId::new();
         let pool_id = DevicePoolId::new();
-        let version = ContentHash::from_bytes([2; 32]);
+        let version = sample_version();
         let capabilities = vec![(
             sample_capability(tenant, worker_id, pool_id, version),
             2_u32,
@@ -815,6 +812,7 @@ mod tests {
         let assignments = plan_assignments(
             &capabilities,
             &candidates,
+            &HashMap::new(),
             gpq_domain::TenantSettings::default(),
             Utc::now(),
             |_| false,
@@ -829,7 +827,7 @@ mod tests {
         let tenant = TenantId::new();
         let worker_id = WorkerId::new();
         let pool_id = DevicePoolId::new();
-        let version = ContentHash::from_bytes([3; 32]);
+        let version = sample_version();
         let capabilities = vec![(
             sample_capability(tenant, worker_id, pool_id, version),
             1_u32,
@@ -845,10 +843,65 @@ mod tests {
         let assignments = plan_assignments(
             &capabilities,
             &candidates,
+            &HashMap::new(),
             gpq_domain::TenantSettings::default(),
             now,
             |_| true,
         );
         assert_eq!(assignments.len(), 1);
+    }
+
+    #[test]
+    fn oom_excluded_pool_does_not_receive_generation_again() {
+        let tenant = TenantId::new();
+        let worker_a = WorkerId::new();
+        let worker_b = WorkerId::new();
+        let pool_a = DevicePoolId::new();
+        let pool_b = DevicePoolId::new();
+        let version = sample_version();
+        let capabilities = vec![
+            (
+                sample_capability(tenant, worker_a, pool_a, version),
+                1,
+                worker_a,
+                "gpu-a".to_owned(),
+            ),
+            (
+                sample_capability(tenant, worker_b, pool_b, version),
+                1,
+                worker_b,
+                "gpu-b".to_owned(),
+            ),
+        ];
+        let candidate = sample_candidate(tenant, version, Utc::now());
+        let exclusions = HashMap::from([(candidate.generation_id, HashSet::from([pool_a]))]);
+
+        let assignments = plan_assignments(
+            &capabilities,
+            std::slice::from_ref(&candidate),
+            &exclusions,
+            gpq_domain::TenantSettings::default(),
+            Utc::now(),
+            |_| true,
+        );
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].pool_id, pool_b);
+        assert_eq!(
+            assignments[0].candidate.generation_id,
+            candidate.generation_id
+        );
+    }
+
+    #[test]
+    fn retry_attempts_get_distinct_output_object_keys() {
+        let tenant = TenantId::new();
+        let generation = GenerationId::new();
+        let first_attempt = AttemptId::new();
+        let second_attempt = AttemptId::new();
+
+        assert_ne!(
+            leased_output_key(tenant, generation, first_attempt),
+            leased_output_key(tenant, generation, second_attempt)
+        );
     }
 }

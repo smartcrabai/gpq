@@ -12,12 +12,17 @@
 //! process by PID alone and never adopt an old process; [`verify_ownership`]
 //! is the single decision point that enforces both rules.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
+
+static IDENTITY_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Durable identity of a managed child process, persisted beside its Pool's
 /// state directory so it survives a Worker restart (ADR 0005).
@@ -56,15 +61,17 @@ pub struct ManagedProcess {
     identity: ProcessIdentity,
     identity_file: PathBuf,
     #[cfg(windows)]
-    job: windows_job::JobHandle,
+    job: Option<windows_job::JobHandle>,
+    #[cfg(windows)]
+    job_assignment_error: Option<String>,
 }
 
 impl ManagedProcess {
-    /// Spawns `executable` into its own process group/Job Object, records its
-    /// durable identity atomically under `state_dir`, and returns the handle.
+    /// Spawns `executable` into its own process group/Job Object and returns
+    /// the owned handle before any further asynchronous identity setup.
     pub async fn spawn(
         executable: &Path,
-        args: &[String],
+        args: &[OsString],
         env: &std::collections::BTreeMap<String, String>,
         state_dir: &Path,
         identity_file_name: &str,
@@ -72,6 +79,7 @@ impl ManagedProcess {
         tokio::fs::create_dir_all(state_dir).await?;
         let mut command = Command::new(executable);
         command
+            .env_clear()
             .args(args)
             .envs(env)
             .stdin(Stdio::null())
@@ -96,39 +104,42 @@ impl ManagedProcess {
         // Assign to the Job Object immediately after spawn, before the child
         // has a chance to spawn grandchildren outside supervision.
         #[cfg(windows)]
-        let job = windows_job::create_and_assign(&child)?;
-        let start_marker = read_start_marker(pid).await?.ok_or_else(|| {
-            anyhow::anyhow!("process {pid} exited before its identity could be recorded")
-        })?;
-        let metadata = tokio::fs::metadata(executable).await?;
+        let (job, job_assignment_error) = match windows_job::create_and_assign(&child) {
+            Ok(job) => (Some(job), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         let identity = ProcessIdentity {
             pid,
-            start_marker,
+            start_marker: String::new(),
             executable: executable.to_path_buf(),
-            executable_size: metadata.len(),
-            executable_mtime_unix: mtime_unix(&metadata),
+            executable_size: 0,
+            executable_mtime_unix: 0,
         };
-        let identity_file = state_dir.join(identity_file_name);
-        write_identity_file(&identity_file, &identity).await?;
         Ok(Self {
             child,
             identity,
-            identity_file,
+            identity_file: state_dir.join(identity_file_name),
             #[cfg(windows)]
             job,
+            #[cfg(windows)]
+            job_assignment_error,
         })
+    }
+
+    /// Installs the durable identity fields after they have been persisted.
+    pub(crate) fn set_identity(&mut self, identity: ProcessIdentity) {
+        debug_assert_eq!(self.identity.pid, identity.pid);
+        self.identity = identity;
+    }
+    #[cfg(windows)]
+    pub(crate) fn startup_error(&self) -> Option<&str> {
+        self.job_assignment_error.as_deref()
     }
 
     /// The operating system process id.
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.identity.pid
-    }
-
-    /// The durable identity recorded for this process.
-    #[must_use]
-    pub fn identity(&self) -> &ProcessIdentity {
-        &self.identity
     }
 
     /// Takes the child's stdout, if it has not already been taken.
@@ -152,22 +163,54 @@ impl ManagedProcess {
         Ok(self.child.wait().await?)
     }
 
-    /// Terminates the whole process tree: SIGTERM followed by SIGKILL if the
-    /// group has not exited within `graceful` (Unix), or an immediate
-    /// `TerminateJobObject` (Windows, where there is no portable polite
-    /// signal every backend would honor).
+    /// Terminates the whole process tree and returns only after the owned
+    /// group or Job Object has no remaining processes.
     pub async fn terminate_tree(&mut self, graceful: Duration) -> anyhow::Result<()> {
         #[cfg(unix)]
-        unix_ps::terminate_group(self.identity.pid, graceful).await?;
+        unix_ps::terminate_group(self.identity.pid, graceful, Some(&mut self.child)).await?;
         #[cfg(windows)]
-        {
-            let _ = graceful;
-            self.job.terminate()?;
+        match &self.job {
+            Some(job) => job.terminate_and_wait(Duration::from_secs(5)).await?,
+            None => {
+                if self.child.try_wait()?.is_none() {
+                    self.child
+                        .start_kill()
+                        .context("killing managed child without an assigned Job Object")?;
+                }
+                anyhow::bail!(
+                    "cannot verify process tree cleanup without an assigned Job Object: {}",
+                    self.job_assignment_error
+                        .as_deref()
+                        .unwrap_or("unknown Job Object assignment failure")
+                );
+            }
         }
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.wait_exit()).await;
+        tokio::time::timeout(Duration::from_secs(5), self.wait_exit())
+            .await
+            .context("waiting for managed process leader to exit")??;
         let _ = tokio::fs::remove_file(&self.identity_file).await;
         Ok(())
     }
+}
+
+pub(crate) async fn record_identity_file(
+    pid: u32,
+    executable: &Path,
+    identity_file: &Path,
+) -> anyhow::Result<ProcessIdentity> {
+    let start_marker = read_start_marker(pid).await?.ok_or_else(|| {
+        anyhow::anyhow!("process {pid} exited before its identity could be recorded")
+    })?;
+    let metadata = tokio::fs::metadata(executable).await?;
+    let identity = ProcessIdentity {
+        pid,
+        start_marker,
+        executable: executable.to_path_buf(),
+        executable_size: metadata.len(),
+        executable_mtime_unix: mtime_unix(&metadata),
+    };
+    write_identity_file(identity_file, &identity).await?;
+    Ok(identity)
 }
 
 /// Owns a freshly [`ManagedProcess::spawn`]ed process until [`Self::disarm`]
@@ -177,13 +220,9 @@ impl ManagedProcess {
 /// `ManagedProcess::spawn` deliberately sets `kill_on_drop(false)` (ADR
 /// 0005: an orderly `terminate_tree` — SIGTERM then SIGKILL on Unix, the Job
 /// Object on Windows — is what ends a managed process, not the OS reaping an
-/// orphan when a bare `Child` handle merely goes out of scope). That makes
-/// every return between a successful spawn and storing the process in
-/// `PoolState::process` responsible for terminating it explicitly, and a
-/// future early return that forgets to is a silent GPU-holding leak. This
-/// guard removes that responsibility from every call site: hold it across
-/// the fallible startup sequence and call [`Self::disarm`] only once the
-/// process is durably owned elsewhere.
+/// orphan when a bare `Child` handle merely goes out of scope). The guard
+/// covers the synchronous handoff from spawn into `PoolState::process`;
+/// durable identity setup then continues while Pool state owns the handle.
 pub(crate) struct ProcessGuard {
     process: Option<ManagedProcess>,
     grace: Duration,
@@ -287,7 +326,7 @@ pub async fn read_identity_file(path: &Path) -> anyhow::Result<Option<ProcessIde
     }
 }
 
-/// Writes a durable identity file atomically (temp file + rename).
+/// Writes a durable identity file atomically (unique temp file + synchronous rename commit).
 pub async fn write_identity_file(path: &Path, identity: &ProcessIdentity) -> anyhow::Result<()> {
     let Some(parent) = path.parent() else {
         anyhow::bail!(
@@ -296,8 +335,9 @@ pub async fn write_identity_file(path: &Path, identity: &ProcessIdentity) -> any
         );
     };
     tokio::fs::create_dir_all(parent).await?;
+    let sequence = IDENTITY_TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp_path = parent.join(format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{sequence}",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("identity"),
@@ -305,7 +345,7 @@ pub async fn write_identity_file(path: &Path, identity: &ProcessIdentity) -> any
     ));
     let body = serde_json::to_vec_pretty(identity)?;
     tokio::fs::write(&temp_path, body).await?;
-    tokio::fs::rename(&temp_path, path).await?;
+    std::fs::rename(&temp_path, path)?;
     Ok(())
 }
 
@@ -321,13 +361,9 @@ pub async fn verify_ownership(identity: &ProcessIdentity) -> anyhow::Result<Owne
     if live_marker != identity.start_marker {
         return Ok(Ownership::Foreign);
     }
-    // Corroborate with the live command line rather than the OS-reported
-    // executable name: an interpreter-launched backend (ComfyUI is
-    // `python main.py`) reports the interpreter, and `ps -o comm=` truncates,
-    // so requiring equality would classify every such child as foreign and
-    // leave its Pool unready forever. A command line that still mentions the
-    // executable we spawned, together with the exact start marker below, is
-    // what proves ownership (ADR 0005).
+    // Corroborate the persisted identity with the full live command line:
+    // short OS executable names can be truncated, while the complete command
+    // line must still contain the executable this Worker launched.
     let live_command_line = read_command_line(identity.pid).await?;
     if !command_line_corroborates(identity, live_command_line.as_deref()) {
         return Ok(Ownership::Foreign);
@@ -409,7 +445,7 @@ async fn read_command_line(pid: u32) -> anyhow::Result<Option<String>> {
 
 #[cfg(unix)]
 async fn terminate_pid_tree(pid: u32, graceful: Duration) -> anyhow::Result<()> {
-    unix_ps::terminate_group(pid, graceful).await
+    unix_ps::terminate_group(pid, graceful, None).await
 }
 
 #[cfg(windows)]
@@ -417,13 +453,15 @@ async fn terminate_pid_tree(pid: u32, _graceful: Duration) -> anyhow::Result<()>
     windows_job::terminate_pid(pid)
 }
 
-/// Unix process-table queries and group signalling, implemented by shelling
-/// out to the POSIX-mandated `ps` and `kill` utilities rather than raw FFI.
+/// Unix process-table queries and group signalling. Process-table identity
+/// checks use `ps`; group signalling uses libc so negative process-group IDs
+/// are never parsed as external utility options.
 #[cfg(unix)]
 mod unix_ps {
     use std::time::Duration;
 
-    use tokio::process::Command;
+    use anyhow::Context;
+    use tokio::process::{Child, Command};
 
     /// The `ps -o lstart=` text for `pid`, or `None` if no such process exists.
     pub async fn start_marker(pid: u32) -> anyhow::Result<Option<String>> {
@@ -459,48 +497,86 @@ mod unix_ps {
         }
     }
 
-    /// Sends SIGTERM to the whole process group led by `pid`, then SIGKILL if
-    /// any member is still alive after `graceful`.
-    pub async fn terminate_group(pid: u32, graceful: Duration) -> anyhow::Result<()> {
-        signal_group(pid, "-TERM").await?;
+    /// Sends SIGTERM to the whole process group identified by
+    /// `process_group_id`, then SIGKILL if any member is still alive after
+    /// `graceful`.
+    pub async fn terminate_group(
+        process_group_id: u32,
+        graceful: Duration,
+        mut child: Option<&mut Child>,
+    ) -> anyhow::Result<()> {
+        if !signal_group(process_group_id, libc::SIGTERM)? {
+            return Ok(());
+        }
         tokio::time::sleep(graceful).await;
-        if group_alive(pid).await? {
-            signal_group(pid, "-KILL").await?;
+        if let Some(child) = child.as_deref_mut() {
+            // Darwin reports EPERM for a process group containing only
+            // zombies; reap our owned leader before probing the group.
+            let _ = child
+                .try_wait()
+                .context("reaping managed process leader after SIGTERM")?;
+        }
+        if group_alive(process_group_id)? {
+            // The process group may exit between the liveness probe and this
+            // signal; ESRCH is therefore a successful teardown race.
+            let _ = signal_group(process_group_id, libc::SIGKILL)?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(child) = child.as_deref_mut() {
+                    let _ = child
+                        .try_wait()
+                        .context("reaping managed process leader after SIGKILL")?;
+                }
+                if !group_alive(process_group_id)? {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "managed process group {process_group_id} remained alive after SIGKILL"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
         Ok(())
     }
 
-    async fn signal_group(pid: u32, signal: &str) -> anyhow::Result<()> {
-        // A negative pid targets every process in that process group.
-        let target = format!("-{pid}");
-        let status = Command::new("kill")
-            .args([signal, &target])
-            .status()
-            .await?;
-        // Exit code 1 from `kill` means "no such process", which is fine: the
-        // group may have already exited on its own.
-        if !status.success() && status.code() != Some(1) {
-            anyhow::bail!("kill {signal} {target} failed with {status}");
+    fn signal_group(process_group_id: u32, signal: libc::c_int) -> anyhow::Result<bool> {
+        let group_id =
+            libc::pid_t::try_from(process_group_id).context("process group ID exceeds pid_t")?;
+        anyhow::ensure!(group_id > 0, "invalid process group ID {group_id}");
+        // SAFETY: a positive PGID derived from the spawned child is passed as
+        // a negative pid, which targets only that dedicated process group.
+        if unsafe { libc::kill(-group_id, signal) } == 0 {
+            return Ok(true);
         }
-        Ok(())
+
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(false);
+        }
+        Err(error)
+            .with_context(|| format!("sending signal {signal} to managed process group {group_id}"))
     }
 
-    async fn group_alive(pid: u32) -> anyhow::Result<bool> {
-        let target = format!("-{pid}");
-        let status = Command::new("kill").args(["-0", &target]).status().await?;
-        Ok(status.success())
+    fn group_alive(process_group_id: u32) -> anyhow::Result<bool> {
+        signal_group(process_group_id, 0)
     }
 }
 
 /// Windows Job Object management and process-table queries.
 #[cfg(windows)]
 mod windows_job {
+    use std::time::Duration;
+
+    use anyhow::Context;
     use tokio::process::Child;
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
@@ -532,6 +608,55 @@ mod windows_job {
                 );
             }
             Ok(())
+        }
+        /// Terminates the job and waits until every assigned process has exited.
+        pub async fn terminate_and_wait(&self, timeout: Duration) -> anyhow::Result<()> {
+            if self.active_processes()? == 0 {
+                return Ok(());
+            }
+            self.terminate()?;
+            tokio::time::timeout(timeout, async {
+                loop {
+                    if self.active_processes()? == 0 {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .context("waiting for managed Windows Job Object processes to exit")??;
+            Ok(())
+        }
+
+        fn active_processes(&self) -> anyhow::Result<u32> {
+            // SAFETY: zero is a valid initial bit pattern for this output structure.
+            let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
+                unsafe { std::mem::zeroed() };
+            let length = u32::try_from(std::mem::size_of_val(&accounting))
+                .context("Windows Job Object accounting structure is too large")?;
+            let mut returned = 0;
+            // SAFETY: `self.0` is a valid owned job handle and the output buffer
+            // and size describe the initialized local structure.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.0,
+                    JobObjectBasicAccountingInformation,
+                    std::ptr::addr_of_mut!(accounting).cast(),
+                    length,
+                    &mut returned,
+                )
+            };
+            if ok == 0 {
+                anyhow::bail!(
+                    "QueryInformationJobObject failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            anyhow::ensure!(
+                returned >= length,
+                "QueryInformationJobObject returned a truncated accounting structure"
+            );
+            Ok(accounting.ActiveProcesses)
         }
     }
 
@@ -690,18 +815,150 @@ mod windows_job {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::path::Path;
     use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::time::Duration;
 
+    #[cfg(unix)]
+    use super::{ManagedProcess, ProcessGuard, record_identity_file};
     use super::{
         Ownership, ProcessIdentity, command_line_corroborates, read_identity_file,
         write_identity_file,
     };
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_process_terminates_its_group_without_a_path_kill_helper() {
+        const FIXTURE: &str = "GPQ_PROCESS_TEARDOWN_FIXTURE";
+        if std::env::var_os(FIXTURE).is_some() {
+            run_process_tree_fixture().await;
+            return;
+        }
+
+        let dir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("creating fixture directory: {error}"));
+        let path_dir = dir.path().join("path");
+        std::fs::create_dir(&path_dir)
+            .unwrap_or_else(|error| panic!("creating fixture PATH: {error}"));
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let ps = std::env::split_paths(&path)
+            .map(|entry| entry.join("ps"))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("could not find ps for the isolated process fixture"));
+        std::os::unix::fs::symlink(ps, path_dir.join("ps"))
+            .unwrap_or_else(|error| panic!("installing fixture ps symlink: {error}"));
+
+        let executable = std::env::current_exe()
+            .unwrap_or_else(|error| panic!("locating test executable: {error}"));
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "process::tests::managed_process_terminates_its_group_without_a_path_kill_helper",
+                "--nocapture",
+            ])
+            .env("PATH", &path_dir)
+            .env("TMPDIR", std::env::temp_dir())
+            .env(FIXTURE, "1")
+            .output()
+            .unwrap_or_else(|error| panic!("running isolated process fixture: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed;"),
+            "isolated process fixture did not pass: stdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    async fn run_process_tree_fixture() {
+        let dir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("creating process fixture state: {error}"));
+        let child_pid_file = dir.path().join("descendant.pid");
+        let args = [
+            OsString::from("-c"),
+            OsString::from(
+                "/bin/sleep 600 & child=$!; trap 'wait \"$child\"; exit 0' TERM; \
+                 printf '%s\\n' \"$child\" > \"$1\"; wait \"$child\"",
+            ),
+            OsString::from("managed-process-fixture"),
+            child_pid_file.as_os_str().to_os_string(),
+        ];
+        let mut env = BTreeMap::new();
+        env.insert(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        );
+        let process = ManagedProcess::spawn(
+            Path::new("/bin/sh"),
+            &args,
+            &env,
+            dir.path(),
+            "identity.json",
+        )
+        .await
+        .unwrap_or_else(|error| panic!("spawning managed process fixture: {error:#}"));
+        let mut process = ProcessGuard::new(process, Duration::from_millis(50));
+        let identity = record_identity_file(
+            process.pid(),
+            Path::new("/bin/sh"),
+            &dir.path().join("identity.json"),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("recording managed process identity: {error:#}"));
+        process.set_identity(identity);
+        let child_pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(&child_pid_file).await
+                    && let Ok(pid) = contents.trim().parse::<u32>()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| panic!("waiting for fixture descendant PID: {error}"));
+
+        process
+            .terminate_tree(Duration::from_millis(50))
+            .await
+            .unwrap_or_else(|error| panic!("terminating managed process fixture: {error:#}"));
+        let _process = process.disarm();
+        assert_fixture_descendant_gone(child_pid).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_fixture_descendant_gone(pid: u32) {
+        let pid = libc::pid_t::try_from(pid)
+            .unwrap_or_else(|error| panic!("fixture PID does not fit pid_t: {error}"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal zero only probes the specific fixture descendant.
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    return;
+                }
+                panic!("probing fixture descendant {pid}: {error}");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "managed process descendant {pid} remained alive after teardown"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     fn sample_identity() -> ProcessIdentity {
         ProcessIdentity {
             pid: 4242,
             start_marker: "Wed Aug 20 10:00:00 2026".to_string(),
-            executable: PathBuf::from("/opt/gpq/llama-server"),
+            executable: PathBuf::from("/opt/gpq/gpq"),
             executable_size: 123_456,
             executable_mtime_unix: 1_755_000_000,
         }
@@ -760,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn command_line_corroboration_accepts_interpreter_launched_backends() {
+    fn command_line_corroboration_checks_the_native_worker_executable() {
         let identity = sample_identity();
         let executable = identity
             .executable
@@ -768,11 +1025,8 @@ mod tests {
             .unwrap_or_else(|| panic!("sample executable path must be UTF-8"));
 
         assert!(
-            command_line_corroborates(
-                &identity,
-                Some(&format!("python3 {executable} --port 8188"))
-            ),
-            "ComfyUI runs as `python main.py`, so the image name is the interpreter"
+            command_line_corroborates(&identity, Some(&format!("{executable} infer --pool gpu0"))),
+            "the managed child command line must retain its native executable",
         );
         assert!(
             command_line_corroborates(&identity, None),

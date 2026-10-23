@@ -6,7 +6,7 @@ repository.workspace = true
 version.workspace = true
 
 [package.metadata.dist]
-# ADR 0020: cargo-dist ships only the Worker binary.
+# ADR 0020: the Remote is a library of the single gpq executable (crates/gpq).
 dist = false
 
 [dependencies]
@@ -47,14 +47,6 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-aws-credential-types.workspace = true
-hyper.workspace = true
-reqwest = { workspace = true, features = ["http2"] }
-testcontainers.workspace = true
-testcontainers-modules.workspace = true
-tokio-tungstenite.workspace = true
 
 [lints]
 workspace = true

@@ -23,29 +23,33 @@ pub use artifact::{
     ArtifactManifest, ArtifactPlacement, ManifestMismatch, MediaKind, OUTPUT_ARTIFACT_TTL,
     TRANSFER_CHUNK_BYTES,
 };
-pub use capability::{IncapableReason, Requirement, SlotCapability, any_candidate_remains};
-pub use failure::{FailureKind, MAX_ATTEMPTS, RetryDecision};
-pub use generation::{CallerKind, ExecutionTarget, Priority};
-pub use hash::{ContentHash, ContentHashError, Hasher};
-pub use id::{
-    ArtifactId, AttemptId, DevicePoolId, GenerationId, ModelVersionId, SlotId, TenantId, WorkerId,
-    WorkflowVersionId,
+pub use capability::{
+    GenerationShape, IncapableReason, Requirement, RequirementError, ShapeLimits, SlotCapability,
+    any_candidate_remains,
 };
+pub use failure::{FailureKind, MAX_ATTEMPTS, RetryDecision};
+pub use generation::{
+    ExecutionTarget, GenerationParameters, ImageParameters, MAX_IMAGE_REFERENCES, MAX_NATIVE_SEED,
+    MAX_PROMPT_BYTES, ParameterValidationError, Priority, SeedOutOfRange, VideoParameters,
+    validate_seed,
+};
+pub use hash::{ContentHash, ContentHashError, Hasher};
+pub use id::{ArtifactId, AttemptId, DevicePoolId, GenerationId, SlotId, TenantId, WorkerId};
 pub use lease::{HEARTBEAT_INTERVAL, LEASE_TTL, lease_expiry_from};
-pub use modality::{BackendKind, Modality};
+pub use modality::Modality;
 pub use schedule::{Candidate, SlotContext, select_batch, select_next};
 pub use state::{ArtifactState, AttemptState, GenerationState, TransitionError};
 pub use tenant::TenantSettings;
 pub use version::{
-    ExecutionLimits, ModelVersion, WorkflowManifest, WorkflowVersion, resolve_execution_timeout,
+    ExecutionLimits, LoraSelection, ModelAssetRole, ModelFamily, ModelManifest, ModelManifestError,
+    ResolvedSampling, SamplingError, SamplingPreset, resolve_execution_timeout,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// JSONB columns and JSON manifests store these enums through `serde`, while
-    /// text columns store `as_str()`. One vocabulary means the two must agree.
+    /// JSONB columns and model manifests store stable serde values.
     fn assert_serde_matches<T>(value: T, expected: &str)
     where
         T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug + Copy,
@@ -77,17 +81,14 @@ mod tests {
         for modality in Modality::all() {
             assert_serde_matches(*modality, modality.as_str());
         }
-        for kind in BackendKind::all() {
-            assert_serde_matches(*kind, kind.as_str());
-        }
         for kind in MediaKind::all() {
             assert_serde_matches(*kind, kind.as_str());
         }
         for placement in ArtifactPlacement::all() {
             assert_serde_matches(*placement, placement.as_str());
         }
-        for caller in CallerKind::all() {
-            assert_serde_matches(*caller, caller.as_str());
-        }
+        assert_serde_matches(ModelFamily::QwenImage21, "qwen_image_2_1");
+        assert_serde_matches(ModelFamily::MinimaxH3, "minimax_h3");
+        assert_serde_matches(ModelAssetRole::AudioVae, "audio_vae");
     }
 }

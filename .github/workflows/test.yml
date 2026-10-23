@@ -22,6 +22,16 @@ jobs:
           version: "35.1"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Vulkan is the default GPU backend on Linux (crates/gpq/Cargo.toml), so
+      # any job that compiles gpq needs CMake, the Vulkan loader, glslc, and
+      # SPIRV-Headers.
+      - name: Install native build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake libvulkan-dev glslc
+          bash scripts/install-spirv-headers.sh "$RUNNER_TEMP/spirv-headers"
+
       - name: Install buf
         uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1
         with:
@@ -32,9 +42,17 @@ jobs:
         shell: bash
         run: buf lint
 
+      # The native API cutover deliberately removes generated source symbols.
+      # Once the accepted native baseline is on main, all PRs compare FILE
+      # compatibility to the current main branch as before.
       - name: Check protobuf breaking changes
         shell: bash
-        run: buf breaking --against "https://github.com/${{ github.repository }}.git#branch=main"
+        run: |
+          if git cat-file -e origin/main:.github/native-proto-baseline.binpb 2>/dev/null; then
+            buf breaking --against "https://github.com/${{ github.repository }}.git#branch=main"
+          else
+            buf breaking --against .github/native-proto-baseline.binpb
+          fi
 
       - name: Install taplo
         shell: bash
@@ -64,13 +82,13 @@ jobs:
 
       - name: Run cargo check
         shell: bash
-        run: cargo check --all-features
+        run: cargo check --workspace --all-targets
 
       # Unit tests first: they need no container, so a failure there is not
       # masked by infrastructure problems.
       - name: Run unit tests
         shell: bash
-        run: cargo test --all-features --bins --lib
+        run: cargo test --workspace --bins --lib
 
       - name: Build binaries for the end-to-end suite
         shell: bash
@@ -83,7 +101,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [postgres, e2e, comfy, lifecycle, objectstore]
+        suite:
+          - postgres
+          - e2e
+          - lifecycle
+          - objectstore
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -93,6 +115,13 @@ jobs:
         with:
           version: "35.1"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install native build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake libvulkan-dev glslc
+          bash scripts/install-spirv-headers.sh "$RUNNER_TEMP/spirv-headers"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -104,7 +133,7 @@ jobs:
       # parallel without sharing state.
       - name: Run integration suite
         shell: bash
-        run: cargo test -p gpq-remote --test ${{ matrix.suite }} -- --test-threads=1
+        run: cargo test -p gpq --test ${{ matrix.suite }}
 
   clippy:
     runs-on: ubuntu-latest
@@ -120,6 +149,13 @@ jobs:
           version: "35.1"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install native build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake libvulkan-dev glslc
+          bash scripts/install-spirv-headers.sh "$RUNNER_TEMP/spirv-headers"
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -128,4 +164,4 @@ jobs:
 
       - name: Run clippy
         shell: bash
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings

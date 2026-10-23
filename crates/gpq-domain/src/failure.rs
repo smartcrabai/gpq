@@ -55,10 +55,10 @@ impl FailureKind {
         )
     }
 
-    /// Whether the failure invalidates the executing Slot's claimed capability.
+    /// Whether this failure requires a different Pool for the current Generation's retry.
     ///
-    /// A runtime OOM proves the Slot cannot host this target, so that Slot is
-    /// marked incapable and the retry must look elsewhere (ADR 0003).
+    /// OOM excludes the executing Pool only for this Attempt's requirement;
+    /// it must not permanently blacklist the Model for future requests.
     #[must_use]
     pub const fn invalidates_slot_capability(&self) -> bool {
         matches!(self, Self::OutOfMemory)
@@ -77,9 +77,8 @@ impl FailureKind {
     ///
     /// `attempts_used` counts Attempts already created for the Generation,
     /// including the one that just failed. `eligible_candidates_remain` answers
-    /// whether any registered Slot is still considered capable; a Generation
-    /// fails for VRAM insufficiency only after every candidate is known
-    /// incapable (ADR 0003).
+    /// whether any registered Slot is still considered capable. Candidate-specific
+    /// failures such as OOM settle only after no eligible Slot remains (ADR 0003).
     #[must_use]
     pub fn retry_decision(
         &self,

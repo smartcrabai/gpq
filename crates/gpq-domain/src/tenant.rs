@@ -47,8 +47,8 @@ impl Default for TenantSettings {
             max_queued_generations: 1000,
             max_input_artifact_bytes: 256 * 1024 * 1024,
             max_output_artifact_bytes: 2 * 1024 * 1024 * 1024,
-            // 24h: the longest modality default (video, music) is admissible
-            // unless an operator lowers the ceiling.
+            // 24h: the video default is admissible unless an operator lowers
+            // the ceiling.
             execution_timeout_ceiling: Duration::from_hours(24),
             default_priority: Priority::DEFAULT,
         }

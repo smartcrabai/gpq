@@ -22,10 +22,8 @@ use buffa::{EnumValue, MessageField};
 use buffa_types::google::protobuf::Timestamp;
 use chrono::{DateTime, Utc};
 use connectrpc::stream_iter;
-use gpq_domain::{
-    AttemptId, ContentHash, FailureKind, HEARTBEAT_INTERVAL, LEASE_TTL, Modality,
-    OUTPUT_ARTIFACT_TTL,
-};
+use gpq_domain::{AttemptId, FailureKind, HEARTBEAT_INTERVAL, LEASE_TTL, OUTPUT_ARTIFACT_TTL};
+use gpq_proto::gpq::v1;
 use gpq_proto::gpq::worker::v1::{
     ArtifactChunk, CancelRequest, CapabilityReport, DeliverArtifactRequest, DeliverArtifactStart,
     DeliverRequest, DiscardOutput, Handshake, Heartbeat, LeaseAssignment, LeaseRejected,
@@ -39,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::artifacts::LocalArtifactStore;
 use crate::config::WorkerConfig;
-use crate::executor::{self, ExecutionContext, Transport};
+use crate::executor::{self, DecodedLease, ExecutionContext, Transport};
 use crate::pool::{PoolAdvertisementData, PoolSupervisor};
 
 /// Ceiling on reconnect backoff, regardless of how many attempts have
@@ -137,6 +135,7 @@ pub async fn run(
 
     let live: LiveAttempts = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| anyhow::anyhow!("failed to build http client: {err}"))?;
 
@@ -438,115 +437,61 @@ fn handle_remote_message(
 /// model hash gets an explicit `LeaseRejected` instead of any Attempt-shaped
 /// work happening. Pure so the classification is unit-testable without a
 /// Pool or a backend.
-enum LeaseAcceptance {
-    /// The lease's own attempt id could not be parsed; there is no id to
-    /// reply to Remote with, so it is dropped rather than rejected.
+enum LeaseRejection {
     Unidentifiable,
-    /// Rejected before any Pool or backend interaction.
     Rejected { kind: FailureKind, message: String },
-    /// Valid enough to proceed to Pool/backend acquisition.
-    Accepted {
-        attempt_id: AttemptId,
-        modality: Modality,
-        resident_model: Option<ContentHash>,
-    },
 }
 
-fn classify_lease(lease: &LeaseAssignment) -> LeaseAcceptance {
+fn classify_lease(lease: &LeaseAssignment) -> Result<(AttemptId, DecodedLease), LeaseRejection> {
     let Ok(attempt_id) = lease.attempt_id.parse::<AttemptId>() else {
-        return LeaseAcceptance::Unidentifiable;
+        return Err(LeaseRejection::Unidentifiable);
     };
-    let modality = match executor::modality_from_proto(lease.modality) {
-        Ok(modality) => modality,
+    let decoded = match executor::decode_lease(lease) {
+        Ok(decoded) => decoded,
         Err(message) => {
-            return LeaseAcceptance::Rejected {
-                kind: FailureKind::Internal,
+            return Err(LeaseRejection::Rejected {
+                kind: FailureKind::InvalidInput,
                 message,
-            };
+            });
         }
     };
-    let raw_payload = !lease.comfy_prompt_json.is_empty();
-    let raw_fields_valid = raw_payload
-        && modality == Modality::Comfy
-        && !lease.comfy_prompt_sha256.is_empty()
-        && lease.model_sha256.is_empty()
-        && lease.workflow_sha256.is_empty()
-        && lease.workflow_graph.as_option().is_none()
-        && lease.workflow_manifest.as_option().is_none()
-        && lease.parameters.as_option().is_none()
-        && lease.inputs.is_empty()
-        && lease.seed == 0
-        && !lease.stream_tokens
-        && lease.output_upload_url.is_empty()
-        && lease.output_object_key.is_empty()
-        && matches!(
-            lease.output_placement,
-            EnumValue::Known(
-                gpq_proto::gpq::v1::ArtifactPlacement::ARTIFACT_PLACEMENT_WORKER_LOCAL
-            )
-        );
-    if (raw_payload || !lease.comfy_prompt_sha256.is_empty() || modality == Modality::Comfy)
-        && !raw_fields_valid
-    {
-        return LeaseAcceptance::Rejected {
-            kind: FailureKind::Internal,
-            message: "raw ComfyUI lease envelope is invalid".to_owned(),
-        };
+    if !matches!(
+        lease.output_placement,
+        EnumValue::Known(
+            gpq_proto::gpq::v1::ArtifactPlacement::ARTIFACT_PLACEMENT_OBJECT_STORE
+                | gpq_proto::gpq::v1::ArtifactPlacement::ARTIFACT_PLACEMENT_WORKER_LOCAL
+        )
+    ) {
+        return Err(LeaseRejection::Rejected {
+            kind: FailureKind::InvalidInput,
+            message: "lease has an unsupported output placement".to_owned(),
+        });
     }
-    let resident_model = if lease.model_sha256.is_empty() {
-        None
-    } else {
-        match lease.model_sha256.parse::<ContentHash>() {
-            Ok(hash) => Some(hash),
-            Err(err) => {
-                return LeaseAcceptance::Rejected {
-                    kind: FailureKind::Internal,
-                    message: format!("invalid model hash on lease: {err}"),
-                };
-            }
-        }
-    };
-    LeaseAcceptance::Accepted {
-        attempt_id,
-        modality,
-        resident_model,
-    }
+    Ok((attempt_id, decoded))
 }
 
 /// Acquires the lease's Slot and spawns its execution, or rejects it before
 /// any Attempt-shaped work happens (ADR 0003: pre-execution capability
 /// mismatches must not create work).
 async fn accept_lease(lease: LeaseAssignment, ctx: &SessionCtx) {
-    let (attempt_id, modality, resident_model) = match classify_lease(&lease) {
-        LeaseAcceptance::Unidentifiable => {
+    let (attempt_id, decoded) = match classify_lease(&lease) {
+        Err(LeaseRejection::Unidentifiable) => {
             tracing::warn!(attempt_id = %lease.attempt_id, "lease carried an unparseable attempt id; dropping");
             return;
         }
-        LeaseAcceptance::Rejected { kind, message } => {
+        Err(LeaseRejection::Rejected { kind, message }) => {
             return reject_lease(ctx, &lease.attempt_id, kind, message).await;
         }
-        LeaseAcceptance::Accepted {
-            attempt_id,
-            modality,
-            resident_model,
-        } => (attempt_id, modality, resident_model),
+        Ok((attempt_id, decoded)) => (attempt_id, decoded),
     };
 
-    // One atomic operation under the Pool's `op_lock`: reserving the Slot in
-    // a separate call let `release_idle` tear down the runtime this Attempt
-    // had just paid to load, in the gap before the Slot was marked busy.
     let slot = match ctx
         .pools
-        .ensure_runtime_and_acquire_slot(
-            &lease.pool_id,
-            modality.backend_kind(),
-            resident_model,
-            attempt_id,
-        )
+        .ensure_runtime_and_acquire_slot(&lease.pool_id, decoded.model_version, attempt_id)
         .await
     {
         Ok(slot) => slot,
-        Err(err) => return reject_lease(ctx, &lease.attempt_id, err.kind, err.message).await,
+        Err(error) => return reject_lease(ctx, &lease.attempt_id, error.kind, error.message).await,
     };
     let Some(backend) = ctx.pools.backend(&lease.pool_id) else {
         return reject_lease(
@@ -584,6 +529,7 @@ async fn accept_lease(lease: LeaseAssignment, ctx: &SessionCtx) {
         attempt_id,
         pool_key: lease.pool_id.clone(),
         lease,
+        decoded,
         slot,
         backend,
         pools: ctx.pools.clone(),
@@ -732,19 +678,33 @@ fn pool_advertisement(data: &PoolAdvertisementData) -> PoolAdvertisement {
     }
     PoolAdvertisement {
         pool_id: data.pool_key.clone(),
-        backend_kind: buffa::EnumValue::Known(executor::backend_kind_to_proto(data.backend)),
+        accelerator: data.accelerator.clone(),
         backend_version: data.backend_version.clone(),
         ready: data.ready,
         unready_reason: data.unready_reason.clone().unwrap_or_default(),
         slots,
-        resident_model_sha256: data
-            .resident_model
-            .map(|hash| hash.to_hex())
-            .unwrap_or_default(),
-        accelerator_memory_bytes: data.accelerator_memory_bytes.unwrap_or_default(),
-        model_sha256: data.models.iter().map(ContentHash::to_hex).collect(),
-        custom_nodes: data.custom_nodes.clone().into_iter().collect(),
-        probes: data.probes.clone().into_iter().collect(),
+        accelerator_memory_bytes: None,
+        models: data
+            .models
+            .iter()
+            .map(|model| v1::ModelAdvertisement {
+                version_sha256: model.version_sha256.to_hex(),
+                manifest: MessageField::some(executor::model_manifest_to_proto(&model.manifest)),
+                ..Default::default()
+            })
+            .collect(),
+        image_lora_sha256: data
+            .image_loras
+            .iter()
+            .map(gpq_domain::ContentHash::to_hex)
+            .collect(),
+        shape_limits: MessageField::some(v1::ShapeLimits {
+            max_image_pixels: Some(data.shape_limits.image_pixels),
+            max_video_pixels: Some(data.shape_limits.video_pixels),
+            max_video_frames: Some(data.shape_limits.video_frames),
+            max_steps: Some(data.shape_limits.steps),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -910,7 +870,7 @@ mod tests {
     fn expired_attempt_ids_is_empty_when_every_lease_is_live() {
         let now = Utc::now();
         let leases = HashMap::from([(AttemptId::new(), now + chrono::Duration::seconds(1))]);
-        assert!(expired_attempt_ids(&leases, now).is_empty());
+        assert_eq!(expired_attempt_ids(&leases, now), Vec::new());
     }
 
     #[test]
@@ -921,79 +881,105 @@ mod tests {
         };
         assert!(matches!(
             classify_lease(&lease),
-            LeaseAcceptance::Unidentifiable
+            Err(LeaseRejection::Unidentifiable)
+        ));
+    }
+
+    fn valid_image_lease() -> LeaseAssignment {
+        use std::collections::BTreeMap;
+
+        use gpq_domain::{ContentHash, ModelAssetRole, ModelFamily, ModelManifest};
+        use gpq_proto::gpq::v1::{ArtifactPlacement, ImageParameters};
+        use gpq_proto::gpq::worker::v1::lease_assignment::GenerationParameters;
+
+        let hash = ContentHash::digest(b"model asset");
+        let manifest = ModelManifest {
+            family: ModelFamily::QwenImage21,
+            assets: BTreeMap::from([
+                (ModelAssetRole::Diffusion, hash),
+                (ModelAssetRole::TextEncoder, hash),
+                (ModelAssetRole::VisionEncoder, hash),
+                (ModelAssetRole::Vae, hash),
+            ]),
+            default_loras: Vec::new(),
+            sampling: ModelFamily::QwenImage21.default_sampling_preset(),
+        };
+        let version = manifest
+            .canonical_hash()
+            .unwrap_or_else(|error| panic!("hashing canonical test model manifest: {error}"));
+        LeaseAssignment {
+            attempt_id: AttemptId::new().to_string(),
+            model_sha256: version.to_hex(),
+            model_manifest: MessageField::some(executor::model_manifest_to_proto(&manifest)),
+            generation_parameters: Some(GenerationParameters::ImageParameters(Box::new(
+                ImageParameters {
+                    prompt: "a mountain".to_owned(),
+                    width: 512,
+                    height: 512,
+                    ..Default::default()
+                },
+            ))),
+            output_placement: EnumValue::Known(ArtifactPlacement::ARTIFACT_PLACEMENT_WORKER_LOCAL),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn typed_lease_is_accepted_only_with_its_canonical_manifest() {
+        let lease = valid_image_lease();
+        let expected_attempt: AttemptId = lease
+            .attempt_id
+            .parse()
+            .unwrap_or_else(|error| panic!("parsing valid test attempt id: {error}"));
+        let Ok((attempt_id, decoded)) = classify_lease(&lease) else {
+            panic!("expected a valid typed lease to be accepted");
+        };
+        assert_eq!(attempt_id, expected_attempt);
+        assert_eq!(
+            decoded.manifest.family,
+            gpq_domain::ModelFamily::QwenImage21
+        );
+        assert_eq!(decoded.model_version.to_hex(), lease.model_sha256);
+    }
+
+    #[test]
+    fn lease_with_malformed_model_hash_is_rejected_before_pool_work() {
+        let mut lease = valid_image_lease();
+        lease.model_sha256 = "not-hex".to_owned();
+        assert!(matches!(
+            classify_lease(&lease),
+            Err(LeaseRejection::Rejected {
+                kind: FailureKind::InvalidInput,
+                ..
+            })
         ));
     }
 
     #[test]
-    fn lease_with_unknown_modality_is_rejected_before_any_pool_work() {
-        // ADR 0003: a bad modality is rejected before any Slot or backend
-        // interaction, not merely dropped like an unidentifiable lease.
+    fn lease_seed_outside_native_range_is_rejected_before_pool_work() {
+        let mut lease = valid_image_lease();
+        lease.seed = gpq_domain::MAX_NATIVE_SEED + 1;
+        assert!(matches!(
+            classify_lease(&lease),
+            Err(LeaseRejection::Rejected {
+                kind: FailureKind::InvalidInput,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lease_without_typed_model_is_rejected_before_pool_work() {
         let lease = LeaseAssignment {
             attempt_id: AttemptId::new().to_string(),
-            modality: buffa::EnumValue::Known(gpq_proto::gpq::v1::Modality::MODALITY_UNSPECIFIED),
             ..Default::default()
         };
         assert!(matches!(
             classify_lease(&lease),
-            LeaseAcceptance::Rejected {
-                kind: FailureKind::Internal,
+            Err(LeaseRejection::Rejected {
+                kind: FailureKind::InvalidInput,
                 ..
-            }
+            })
         ));
-    }
-
-    #[test]
-    fn lease_with_malformed_model_hash_is_rejected() {
-        let lease = LeaseAssignment {
-            attempt_id: AttemptId::new().to_string(),
-            modality: buffa::EnumValue::Known(gpq_proto::gpq::v1::Modality::MODALITY_LLM),
-            model_sha256: "not-hex".to_owned(),
-            ..Default::default()
-        };
-        assert!(matches!(
-            classify_lease(&lease),
-            LeaseAcceptance::Rejected {
-                kind: FailureKind::Internal,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn well_formed_lease_is_accepted_with_its_fields_parsed() {
-        let attempt_id = AttemptId::new();
-        let hash = ContentHash::digest(b"model");
-        let lease = LeaseAssignment {
-            attempt_id: attempt_id.to_string(),
-            modality: buffa::EnumValue::Known(gpq_proto::gpq::v1::Modality::MODALITY_LLM),
-            model_sha256: hash.to_hex(),
-            ..Default::default()
-        };
-        let LeaseAcceptance::Accepted {
-            attempt_id: parsed_id,
-            modality,
-            resident_model,
-        } = classify_lease(&lease)
-        else {
-            panic!("expected a well-formed lease to be Accepted");
-        };
-        assert_eq!(parsed_id, attempt_id);
-        assert_eq!(modality, Modality::Llm);
-        assert_eq!(resident_model, Some(hash));
-    }
-
-    #[test]
-    fn lease_without_a_model_hash_has_no_resident_model() {
-        let lease = LeaseAssignment {
-            attempt_id: AttemptId::new().to_string(),
-            modality: buffa::EnumValue::Known(gpq_proto::gpq::v1::Modality::MODALITY_IMAGE),
-            model_sha256: String::new(),
-            ..Default::default()
-        };
-        let LeaseAcceptance::Accepted { resident_model, .. } = classify_lease(&lease) else {
-            panic!("expected a well-formed lease to be Accepted");
-        };
-        assert_eq!(resident_model, None);
     }
 }

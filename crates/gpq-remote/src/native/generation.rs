@@ -1,15 +1,15 @@
 //! Native Generation service (ADR 0006).
 //!
-//! `Submit` resolves exactly one Model or Workflow alias through
-//! `crate::admission::admit`, the same acceptance path the OpenAI-compatible
-//! surface uses, tagged `CallerKind::Durable` so it survives disconnection
+//! `Submit` resolves one Model alias through `crate::admission::admit`, the same
+//! acceptance path every Generation uses, tagged so it survives disconnection
 //! and Remote restarts (ADR 0003). `GetGeneration`, `ListGenerations`, and
 //! `CancelGeneration` read and mutate the persisted Generation directly.
 //! `WatchGeneration` starts from the current snapshot and then streams live
-//! events with nothing replayed: token deltas never repeat, and a missed
-//! span of live events surfaces as an explicit `Discontinuity` (ADR 0006).
-//! `CreateInputArtifact` provisions an object-store upload slot for a queued
-//! Native Generation's input (ADR 0008).
+//! events with nothing replayed; a missed span of live events surfaces as an
+//! explicit `Discontinuity` (ADR 0006). `CreateInputArtifact` provisions an input
+//! Artifact slot: an object-store upload when object storage is configured
+//! (ADR 0008), otherwise a Remote-local slot the caller fills via
+//! `PUT /v1/artifacts/{id}`.
 
 use std::str::FromStr;
 
@@ -18,13 +18,17 @@ use buffa_types::google::protobuf::Timestamp as ProtoTimestamp;
 use chrono::{DateTime, Utc};
 use connectrpc::{ConnectError, ErrorCode, Response, ServiceRequest, ServiceResult, ServiceStream};
 use futures::StreamExt;
-use gpq_domain::{ArtifactId, CallerKind, ContentHash, GenerationId, TenantId};
+use gpq_domain::{
+    ArtifactId, ContentHash, GenerationId, GenerationParameters, ImageParameters, LoraSelection,
+    TenantId, VideoParameters,
+};
 use gpq_proto::gpq::v1::{
     ArtifactManifest as WireArtifactManifest, ArtifactRef, CancelGenerationRequest,
     CancelGenerationResponse, CreateInputArtifactRequest, CreateInputArtifactResponse,
     Discontinuity, Failure, Generation, GenerationEvent as WireGenerationEvent, GenerationService,
-    GetGenerationRequest, GetGenerationResponse, ListGenerationsRequest, ListGenerationsResponse,
-    Progress, StateChanged, SubmitRequest, SubmitResponse, TokenDelta, Usage,
+    GetGenerationRequest, GetGenerationResponse, ImageParameters as WireImageParameters,
+    ListGenerationsRequest, ListGenerationsResponse, LoraSelection as WireLoraSelection, Progress,
+    StateChanged, SubmitRequest, SubmitResponse, VideoParameters as WireVideoParameters,
     WatchGenerationRequest, generation_event, submit_request,
 };
 use tokio_stream::wrappers::BroadcastStream;
@@ -72,9 +76,64 @@ fn invalid(err: impl std::fmt::Display) -> ConnectError {
     ConnectError::new(ErrorCode::InvalidArgument, err.to_string())
 }
 
+fn parse_artifact_id(field: &str, value: &str) -> Result<ArtifactId, ConnectError> {
+    ArtifactId::from_str(value).map_err(|err| invalid(format!("invalid {field} {value:?}: {err}")))
+}
+
+fn optional_artifact_id(
+    field: &str,
+    value: Option<String>,
+) -> Result<Option<ArtifactId>, ConnectError> {
+    value.map(|id| parse_artifact_id(field, &id)).transpose()
+}
+
+fn lora_from_proto(lora: &WireLoraSelection) -> Result<LoraSelection, ConnectError> {
+    let sha256 = ContentHash::from_str(&lora.sha256)
+        .map_err(|err| invalid(format!("invalid lora sha256 {:?}: {err}", lora.sha256)))?;
+    Ok(LoraSelection {
+        sha256,
+        scale: lora.scale,
+    })
+}
+
+fn image_parameters_from_proto(wire: WireImageParameters) -> Result<ImageParameters, ConnectError> {
+    let references = wire
+        .reference_artifact_ids
+        .iter()
+        .map(|id| parse_artifact_id("reference_artifact_id", id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let loras = wire
+        .loras
+        .iter()
+        .map(lora_from_proto)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ImageParameters {
+        prompt: wire.prompt,
+        negative_prompt: wire.negative_prompt,
+        width: wire.width,
+        height: wire.height,
+        steps: wire.steps,
+        cfg_scale: wire.cfg_scale,
+        references,
+        loras,
+        sigmas: (!wire.sigmas.is_empty()).then_some(wire.sigmas),
+    })
+}
+
+fn video_parameters_from_proto(wire: WireVideoParameters) -> Result<VideoParameters, ConnectError> {
+    Ok(VideoParameters {
+        prompt: wire.prompt,
+        negative_prompt: wire.negative_prompt,
+        width: wire.width,
+        height: wire.height,
+        frames: wire.frames,
+        first_frame: optional_artifact_id("first_frame_artifact_id", wire.first_frame_artifact_id)?,
+        last_frame: optional_artifact_id("last_frame_artifact_id", wire.last_frame_artifact_id)?,
+    })
+}
+
 /// Validates and extracts `Submit`'s idempotency key from the
-/// `idempotency-key` header (ADR 0006: Native creation requires one, unlike
-/// the optional key `OpenAI` endpoints accept). Rejects a missing, blank, or
+/// `idempotency-key` header (ADR 0006: Submit requires one). Rejects a missing, blank, or
 /// oversized key before it reaches `crate::admission::admit`, so a caller
 /// that forgets — or whose retry drops — the header cannot silently
 /// duplicate a Generation and burn duplicate GPU time.
@@ -94,16 +153,12 @@ fn required_idempotency_key(header: Option<&str>) -> Result<String, ConnectError
 /// Maps `crate::admission::AdmissionError` to the Connect codes the parent
 /// contract fixes: `UnknownAlias` -> `NotFound`, `InvalidInput` ->
 /// `InvalidArgument`, `CapacityExceeded` -> `ResourceExhausted`,
-/// `ObjectStoreUnavailable` -> `FailedPrecondition`, `Unavailable` ->
-/// `Unavailable`.
+/// `ObjectStoreUnavailable` -> `FailedPrecondition`.
 fn admission_error(err: AdmissionError) -> ConnectError {
     match err {
         AdmissionError::UnknownAlias => ConnectError::new(ErrorCode::NotFound, "alias not found"),
         AdmissionError::InvalidInput(message) => {
             ConnectError::new(ErrorCode::InvalidArgument, message)
-        }
-        AdmissionError::PromptIdConflict => {
-            ConnectError::new(ErrorCode::AlreadyExists, "Comfy prompt id already exists")
         }
         AdmissionError::CapacityExceeded => ConnectError::new(
             ErrorCode::ResourceExhausted,
@@ -113,31 +168,8 @@ fn admission_error(err: AdmissionError) -> ConnectError {
             ErrorCode::FailedPrecondition,
             "object storage is not configured",
         ),
-        AdmissionError::Unavailable => {
-            ConnectError::new(ErrorCode::Unavailable, "no capable Worker is online")
-        }
         AdmissionError::Internal(err) => internal(err),
     }
-}
-
-#[derive(serde::Deserialize)]
-struct UsageJson {
-    #[serde(rename = "prompt_tokens")]
-    prompt: u32,
-    #[serde(rename = "completion_tokens")]
-    completion: u32,
-    #[serde(rename = "total_tokens")]
-    total: u32,
-}
-
-fn usage_from_json(value: serde_json::Value) -> Result<Usage, serde_json::Error> {
-    let parsed: UsageJson = serde_json::from_value(value)?;
-    Ok(Usage {
-        prompt_tokens: parsed.prompt,
-        completion_tokens: parsed.completion,
-        total_tokens: parsed.total,
-        ..Default::default()
-    })
 }
 
 #[derive(serde::Deserialize)]
@@ -213,12 +245,6 @@ async fn generation_row_to_proto(
         .map(|artifact| artifact_row_to_proto(&state.config.public_base_url, artifact))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let usage = row
-        .usage
-        .clone()
-        .map(usage_from_json)
-        .transpose()
-        .map_err(internal)?;
     let failure = row
         .failure_kind
         .as_deref()
@@ -246,7 +272,7 @@ async fn generation_row_to_proto(
         generation_id: row.id.to_string(),
         state: crate::native::generation_state_to_proto(generation_state),
         modality: crate::native::modality_to_proto(modality),
-        alias: row.alias.clone(),
+        model_alias: row.alias.clone(),
         version_sha256: row.version_sha256.clone(),
         priority: u32::try_from(row.priority).unwrap_or(0),
         seed: row
@@ -257,9 +283,7 @@ async fn generation_row_to_proto(
         created_at: crate::native::timestamp_to_proto(row.created_at),
         updated_at: crate::native::timestamp_to_proto(row.updated_at),
         attempt_count: u32::try_from(row.attempt_count).unwrap_or(0),
-        output_text: row.output_text.clone(),
         output_artifacts,
-        usage: usage.into(),
         failure: failure.into(),
         latest_progress: latest_progress.into(),
         ..Default::default()
@@ -272,7 +296,7 @@ async fn generation_row_to_proto(
 /// replay reports when the event actually happened, not when it was
 /// replayed). `GenerationEvent::Output` has no wire counterpart in
 /// `generation_event::Event` (`snapshot`/`state_changed`/`progress`/
-/// `token_delta`/`discontinuity` only), so it maps to `None` here; the live
+/// `discontinuity` only), so it maps to `None` here; the live
 /// `watch_generation` stream instead intercepts it before calling this
 /// function and builds a fresh `Snapshot` event
 /// ([`refreshed_snapshot_event`]) so a watcher still learns the output
@@ -312,12 +336,6 @@ fn domain_event_to_proto(
             observed_at: emitted_at.clone(),
             ..Default::default()
         })),
-        GenerationEvent::Token { text } => {
-            generation_event::Event::TokenDelta(Box::new(TokenDelta {
-                text,
-                ..Default::default()
-            }))
-        }
         GenerationEvent::Output => return None,
         GenerationEvent::Discontinuity { reason } => {
             generation_event::Event::Discontinuity(Box::new(Discontinuity {
@@ -425,28 +443,18 @@ impl GenerationService for GenerationApi {
                 .and_then(|value| value.to_str().ok()),
         )?;
         let request = request.to_owned_message();
-        let target = match request.target {
-            Some(submit_request::Target::ModelAlias(alias)) => AdmissionTarget::Model(alias),
-            Some(submit_request::Target::WorkflowAlias(alias)) => AdmissionTarget::Workflow(alias),
-            None => {
-                return Err(invalid(
-                    "exactly one of model_alias or workflow_alias is required",
-                ));
-            }
+        let Some(submit_request::Target::ModelAlias(alias)) = request.target else {
+            return Err(invalid("model_alias is required"));
         };
-        let parameters = request
-            .parameters
-            .into_option()
-            .map(|value| serde_json::to_value(&value))
-            .transpose()
-            .map_err(|err| invalid(format!("invalid parameters: {err}")))?
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        let mut input_artifact_ids = Vec::with_capacity(request.input_artifact_ids.len());
-        for id in &request.input_artifact_ids {
-            let artifact_id = ArtifactId::from_str(id)
-                .map_err(|err| invalid(format!("invalid input_artifact_id {id:?}: {err}")))?;
-            input_artifact_ids.push(artifact_id);
-        }
+        let parameters = match request.generation_parameters {
+            Some(submit_request::GenerationParameters::ImageParameters(image)) => {
+                GenerationParameters::Image(image_parameters_from_proto(*image)?)
+            }
+            Some(submit_request::GenerationParameters::VideoParameters(video)) => {
+                GenerationParameters::Video(video_parameters_from_proto(*video)?)
+            }
+            None => return Err(invalid("image_parameters or video_parameters is required")),
+        };
         let output_placement =
             crate::native::artifact_placement_from_proto(request.output_placement)
                 .ok_or_else(|| invalid("output_placement must be set"))?;
@@ -457,18 +465,12 @@ impl GenerationService for GenerationApi {
         let execution_timeout = crate::native::duration_from_proto(request.execution_timeout);
 
         let admission_request = AdmissionRequest {
-            target,
+            target: AdmissionTarget::Model(alias),
             parameters,
-            input_artifact_ids,
             output_placement,
             priority,
             seed: request.seed,
             execution_timeout,
-            caller_kind: CallerKind::Durable,
-            // Native watchers may subscribe to live token deltas through
-            // `WatchGeneration`; unlike OpenAI streaming this is not
-            // requested per-call, so it is always on for Native submissions.
-            stream_tokens: true,
             idempotency_key: Some(idempotency_key),
         };
         let row = crate::admission::admit(&self.state, tenant_id, admission_request)
@@ -529,9 +531,17 @@ impl GenerationService for GenerationApi {
             .begin_tenant(tenant_id)
             .await
             .map_err(internal)?;
-        crate::db::generations::cancel_queued(&mut conn, tenant_id, generation_id, now)
-            .await
-            .map_err(internal)?;
+        let queued_cancelled =
+            crate::db::generations::cancel_queued(&mut conn, tenant_id, generation_id, now)
+                .await
+                .map_err(internal)?;
+        let deleted_inputs = if queued_cancelled {
+            crate::db::artifacts::delete_inputs_for_generation(&mut conn, tenant_id, generation_id)
+                .await
+                .map_err(internal)?
+        } else {
+            Vec::new()
+        };
         crate::db::generations::request_cancel_running(&mut conn, tenant_id, generation_id, now)
             .await
             .map_err(internal)?;
@@ -545,6 +555,8 @@ impl GenerationService for GenerationApi {
             ));
         };
         conn.commit().await.map_err(internal)?;
+        crate::expiry::release_deleted_inputs(&self.state.artifacts, tenant_id, deleted_inputs)
+            .await;
         let generation = generation_row_to_proto(&self.state, tenant_id, &row).await?;
         Response::ok(CancelGenerationResponse {
             generation: generation.into(),
@@ -710,12 +722,6 @@ impl GenerationService for GenerationApi {
             mime_type: wire_manifest.mime_type,
         };
 
-        if !self.state.artifacts.object_store_available() {
-            return Err(ConnectError::new(
-                ErrorCode::FailedPrecondition,
-                "object storage is not configured",
-            ));
-        }
         let mut conn = self
             .state
             .db
@@ -732,24 +738,40 @@ impl GenerationService for GenerationApi {
             )));
         }
 
-        let object_key = format!("tenants/{tenant_id}/inputs/{}", uuid::Uuid::now_v7());
-        let (upload_url, expires_at) = self
-            .state
-            .artifacts
-            .presign_put(&object_key, &manifest)
+        if self.state.artifacts.object_store_available() {
+            let object_key = format!("tenants/{tenant_id}/inputs/{}", uuid::Uuid::now_v7());
+            let (upload_url, expires_at) = self
+                .state
+                .artifacts
+                .presign_put(&object_key, &manifest)
+                .await
+                .map_err(internal)?;
+            let row = crate::db::artifacts::create_input(
+                &mut conn,
+                tenant_id,
+                &manifest,
+                gpq_domain::ArtifactPlacement::ObjectStore,
+                Some(object_key.as_str()),
+            )
             .await
             .map_err(internal)?;
-        let row = crate::db::artifacts::create_input(
-            &mut conn,
-            tenant_id,
-            &manifest,
-            gpq_domain::ArtifactPlacement::ObjectStore,
-            Some(object_key.as_str()),
-        )
-        .await
-        .map_err(internal)?;
-        conn.commit().await.map_err(internal)?;
+            conn.commit().await.map_err(internal)?;
+            return Response::ok(CreateInputArtifactResponse {
+                artifact_id: row.id.as_uuid().to_string(),
+                upload_url: upload_url.to_string(),
+                upload_url_expires_at: crate::native::timestamp_to_proto(expires_at),
+                ..Default::default()
+            });
+        }
 
+        let (row, expires_at) =
+            crate::db::artifacts::create_remote_local_input(&mut conn, tenant_id, &manifest)
+                .await
+                .map_err(internal)?;
+        conn.commit().await.map_err(internal)?;
+        let upload_url =
+            crate::artifacts::remote_local_upload_url(&self.state.config.public_base_url, row.id)
+                .map_err(internal)?;
         Response::ok(CreateInputArtifactResponse {
             artifact_id: row.id.as_uuid().to_string(),
             upload_url: upload_url.to_string(),
@@ -764,18 +786,6 @@ mod tests {
     use gpq_domain::{FailureKind, GenerationState};
 
     use super::*;
-
-    #[test]
-    fn usage_json_round_trips() {
-        let value =
-            serde_json::json!({ "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 });
-        let Ok(usage) = usage_from_json(value) else {
-            panic!("valid usage json");
-        };
-        assert_eq!(usage.prompt_tokens, 10);
-        assert_eq!(usage.completion_tokens, 5);
-        assert_eq!(usage.total_tokens, 15);
-    }
 
     #[test]
     fn required_idempotency_key_rejects_missing_header() {
@@ -799,12 +809,6 @@ mod tests {
             panic!("expected a valid idempotency key");
         };
         assert_eq!(key, "retry-42");
-    }
-
-    #[test]
-    fn usage_json_rejects_missing_fields() {
-        let value = serde_json::json!({ "prompt_tokens": 10 });
-        assert!(usage_from_json(value).is_err());
     }
 
     #[test]
@@ -860,22 +864,6 @@ mod tests {
             panic!("expected a failure payload");
         };
         assert_eq!(failure.message, "oom");
-    }
-
-    #[test]
-    fn token_events_map_to_token_delta() {
-        let event = GenerationEvent::Token {
-            text: "hi".to_owned(),
-        };
-        let Some(wire) =
-            domain_event_to_proto(event, crate::native::timestamp_to_proto(Utc::now()))
-        else {
-            panic!("token event has a wire representation");
-        };
-        let Some(generation_event::Event::TokenDelta(delta)) = wire.event else {
-            panic!("expected TokenDelta");
-        };
-        assert_eq!(delta.text, "hi");
     }
 
     #[test]
@@ -957,7 +945,7 @@ mod tests {
             crate::db::events::EventKind::Progress,
             serde_json::json!({ "unexpected": true }),
         )];
-        assert!(replay_events(&rows).is_empty());
+        assert_eq!(replay_events(&rows), Vec::new());
     }
 
     #[test]

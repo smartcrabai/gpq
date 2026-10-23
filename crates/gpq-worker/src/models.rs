@@ -10,13 +10,12 @@ use std::fs::Metadata;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
-use gpq_domain::ContentHash;
-use gpq_domain::hash::Hasher;
+use anyhow::{Context, ensure};
+use gpq_domain::{ContentHash, Hasher, LoraSelection, ModelAssetRole, ModelManifest};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::PoolConfig;
+use crate::config::{ModelConfig, PoolConfig};
 
 /// Streamed read chunk size while hashing model material.
 const HASH_CHUNK_BYTES: usize = 1024 * 1024;
@@ -57,10 +56,9 @@ type ModelFiles = (BTreeMap<String, CacheKey>, Vec<(String, PathBuf)>);
 
 /// Computes (or returns the cached) SHA-256 [`ContentHash`] of one model.
 ///
-/// Single-file models retain their raw file digest. Directory models use a
-/// deterministic digest of every relative path and regular file, which lets
-/// mlx-dspark models made of config, tokenizer, and sharded weight files obey
-/// the same immutable-version contract.
+/// Single-file assets retain their raw file digest. Directory assets use a
+/// deterministic digest of every relative path and regular file, preserving
+/// content-addressed identity for grouped model material.
 pub fn hash_model(state_dir: &Path, path: &Path) -> anyhow::Result<ContentHash> {
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("reading metadata for model {}", path.display()))?;
@@ -87,44 +85,8 @@ pub fn hash_model(state_dir: &Path, path: &Path) -> anyhow::Result<ContentHash> 
     Ok(hash)
 }
 
-/// Computes a model hash without consulting the metadata cache. This is used
-/// at trust boundaries where a model's bytes must be checked, rather than
-/// relying on metadata that a file replacement can preserve.
-pub(crate) fn hash_model_fresh(path: &Path) -> anyhow::Result<ContentHash> {
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("reading metadata for model {}", path.display()))?;
-    let (_, files) = model_files(path, &metadata)?;
-    if metadata.is_dir() {
-        digest_directory(&files)
-    } else {
-        digest_file(path)
-    }
-}
-
-/// Hashes model material while checking `cancel` between directory entries and
-/// bounded file reads. The blocking caller can therefore stop promptly when a
-/// timed-out or cancelled attempt drops its awaiter.
-pub(crate) fn hash_model_fresh_cancellable(
-    path: &Path,
-    cancel: &CancellationToken,
-) -> anyhow::Result<ContentHash> {
-    ensure_not_cancelled(cancel)?;
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("reading metadata for model {}", path.display()))?;
-    let (_, files) = model_files_with_cancel(path, &metadata, cancel)?;
-    if metadata.is_dir() {
-        digest_directory_with_cancel(&files, cancel)
-    } else {
-        digest_file_with_cancel(path, cancel)
-    }
-}
-
-/// Metadata fingerprint of one model file or directory: size, modification
-/// time, and file identity of the model itself and of every member. Cheap
-/// to read even for a multi-gigabyte model, so a backend adapter can bind a
-/// content hash once per process and reuse it while the fingerprint is
-/// unchanged, refusing to trust the material (rather than rehashing it) once
-/// it differs (ADR 0012).
+/// Metadata fingerprint of configured model material. It detects replaced or
+/// modified files without rereading multi-gigabyte assets for every attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelSnapshot {
     key: CacheKey,
@@ -132,12 +94,30 @@ pub(crate) struct ModelSnapshot {
 }
 
 impl ModelSnapshot {
-    pub(crate) fn read(path: &Path) -> anyhow::Result<Self> {
+    fn read(path: &Path) -> anyhow::Result<Self> {
         let metadata = std::fs::metadata(path)
-            .with_context(|| format!("reading metadata for model {}", path.display()))?;
+            .with_context(|| format!("reading metadata for model asset {}", path.display()))?;
         let key = cache_key(&metadata)?;
         let (members, _) = model_files(path, &metadata)?;
         Ok(Self { key, members })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AssetSnapshot {
+    pub path: PathBuf,
+    snapshot: ModelSnapshot,
+}
+
+impl AssetSnapshot {
+    pub fn verify(&self) -> anyhow::Result<()> {
+        let current = ModelSnapshot::read(&self.path)?;
+        ensure!(
+            current == self.snapshot,
+            "configured model asset {} changed after its manifest was hashed",
+            self.path.display()
+        );
+        Ok(())
     }
 }
 
@@ -152,52 +132,174 @@ fn model_files(path: &Path, metadata: &Metadata) -> anyhow::Result<ModelFiles> {
     Ok((members, files))
 }
 
-fn model_files_with_cancel(
-    path: &Path,
-    metadata: &Metadata,
-    cancel: &CancellationToken,
-) -> anyhow::Result<ModelFiles> {
-    let mut members = BTreeMap::new();
-    let mut files = Vec::new();
-    if metadata.is_dir() {
-        collect_model_files_with_cancel(path, path, &mut members, &mut files, cancel)?;
-    } else if !metadata.is_file() {
-        anyhow::bail!("model {} is not a file or directory", path.display());
-    }
-    Ok((members, files))
+/// One configured model and the trusted local paths corresponding to its
+/// immutable manifest. Paths are resolved only from worker configuration.
+#[derive(Debug, Clone)]
+pub struct ConfiguredModel {
+    pub manifest_hash: ContentHash,
+    pub manifest: ModelManifest,
+    pub asset_paths: BTreeMap<ModelAssetRole, PathBuf>,
+    pub default_lora_paths: Vec<ConfiguredLoraPath>,
+    pub snapshots: Vec<AssetSnapshot>,
 }
 
-/// Hashes every model configured for `pool`, rejecting (with an `Err`) any
-/// computed hash that disagrees with `pool.expected_hashes` (ADR 0005: a
-/// mismatch is rejected rather than silently trusted).
-pub fn scan_models(pool: &PoolConfig) -> anyhow::Result<Vec<(PathBuf, ContentHash)>> {
-    pool.model_paths
-        .iter()
-        .map(|path| {
-            let hash = hash_model_fresh(path)?;
-            if let Some(expected_hex) = pool
-                .expected_hashes
-                .get(&path.to_string_lossy().into_owned())
-            {
-                let expected: ContentHash = expected_hex.parse().with_context(|| {
-                    format!(
-                        "pool `{}` expected hash for {} is malformed",
-                        pool.key,
-                        path.display()
-                    )
-                })?;
-                anyhow::ensure!(
-                    hash == expected,
-                    "model {} hash mismatch: computed {} but pool `{}` expects {}",
-                    path.display(),
-                    hash.to_hex(),
-                    pool.key,
-                    expected_hex
-                );
-            }
-            Ok((path.clone(), hash))
-        })
-        .collect()
+#[derive(Debug, Clone)]
+pub struct ConfiguredLoraPath {
+    pub sha256: ContentHash,
+    pub scale: f32,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfiguredExtraLora {
+    pub path: PathBuf,
+    pub snapshot: AssetSnapshot,
+}
+
+impl ConfiguredModel {
+    pub fn verify_assets(&self) -> anyhow::Result<()> {
+        for snapshot in &self.snapshots {
+            snapshot.verify()?;
+        }
+        Ok(())
+    }
+}
+
+/// Hashes every configured model asset, default `LoRA` and separately
+/// advertiseable image `LoRA` using the per-pool metadata cache.
+pub fn scan_models(
+    pool: &PoolConfig,
+) -> anyhow::Result<(
+    Vec<ConfiguredModel>,
+    BTreeMap<ContentHash, ConfiguredExtraLora>,
+)> {
+    let mut models = Vec::with_capacity(pool.models.len());
+    for configured in &pool.models {
+        let model = scan_one_model(pool, configured)?;
+        ensure!(
+            !models
+                .iter()
+                .any(|existing: &ConfiguredModel| existing.manifest_hash == model.manifest_hash),
+            "pool `{}` configures duplicate model manifest {}",
+            pool.key,
+            model.manifest_hash
+        );
+        models.push(model);
+    }
+    let mut extra_loras = BTreeMap::new();
+    for path in &pool.extra_image_loras {
+        let (hash, snapshot) = hash_and_snapshot(pool, path)?;
+        ensure!(
+            extra_loras
+                .insert(
+                    hash,
+                    ConfiguredExtraLora {
+                        path: path.clone(),
+                        snapshot,
+                    },
+                )
+                .is_none(),
+            "pool `{}` configures duplicate image LoRA hash {hash}",
+            pool.key
+        );
+    }
+    Ok((models, extra_loras))
+}
+
+fn scan_one_model(pool: &PoolConfig, configured: &ModelConfig) -> anyhow::Result<ConfiguredModel> {
+    let mut assets = BTreeMap::new();
+    let mut snapshots = Vec::new();
+    for (role, path) in &configured.assets {
+        let (hash, snapshot) = hash_and_snapshot(pool, path)?;
+        assets.insert(*role, hash);
+        snapshots.push(snapshot);
+    }
+    let mut defaults: Vec<LoraSelection> = Vec::with_capacity(configured.default_loras.len());
+    let mut default_lora_paths = Vec::with_capacity(configured.default_loras.len());
+    for lora in &configured.default_loras {
+        let (sha256, snapshot) = hash_and_snapshot(pool, &lora.path)?;
+        ensure!(
+            !defaults.iter().any(|selection| selection.sha256 == sha256),
+            "pool `{}` model repeats default LoRA hash {sha256}",
+            pool.key
+        );
+        defaults.push(LoraSelection {
+            sha256,
+            scale: lora.scale,
+        });
+        default_lora_paths.push(ConfiguredLoraPath {
+            sha256,
+            scale: lora.scale,
+            path: lora.path.clone(),
+        });
+        snapshots.push(snapshot);
+    }
+    let sampling = configured
+        .sampling
+        .clone()
+        .unwrap_or_else(|| configured.family.default_sampling_preset());
+    let manifest = ModelManifest {
+        family: configured.family,
+        assets,
+        default_loras: defaults,
+        sampling,
+    };
+    let manifest_hash = manifest
+        .canonical_hash()
+        .with_context(|| format!("hashing {:?} model manifest", configured.family))?;
+    Ok(ConfiguredModel {
+        manifest_hash,
+        manifest,
+        asset_paths: configured.assets.clone(),
+        default_lora_paths,
+        snapshots,
+    })
+}
+
+fn hash_and_snapshot(
+    pool: &PoolConfig,
+    path: &Path,
+) -> anyhow::Result<(ContentHash, AssetSnapshot)> {
+    let before = ModelSnapshot::read(path)?;
+    let hash = hash_and_check(pool, path)?;
+    let snapshot = ModelSnapshot::read(path)?;
+    ensure!(
+        before == snapshot,
+        "asset {} changed while its manifest was being hashed",
+        path.display()
+    );
+    Ok((
+        hash,
+        AssetSnapshot {
+            path: path.to_path_buf(),
+            snapshot,
+        },
+    ))
+}
+
+fn hash_and_check(pool: &PoolConfig, path: &Path) -> anyhow::Result<ContentHash> {
+    let hash = hash_model(&pool.state_dir, path)?;
+    if let Some(expected_hex) = pool
+        .expected_hashes
+        .get(&path.to_string_lossy().into_owned())
+    {
+        let expected: ContentHash = expected_hex.parse().with_context(|| {
+            format!(
+                "pool `{}` expected hash for {} is malformed",
+                pool.key,
+                path.display()
+            )
+        })?;
+        ensure!(
+            hash == expected,
+            "asset {} hash mismatch: computed {} but pool `{}` expects {}",
+            path.display(),
+            hash.to_hex(),
+            pool.key,
+            expected_hex
+        );
+    }
+    Ok(hash)
 }
 
 fn cache_key(metadata: &Metadata) -> anyhow::Result<CacheKey> {
@@ -399,7 +501,7 @@ mod tests {
 
     use gpq_domain::ContentHash;
 
-    use super::{hash_model, hash_model_fresh, hash_model_fresh_cancellable};
+    use super::hash_model;
 
     fn write_file(path: &std::path::Path, content: &[u8]) {
         let Ok(mut file) = std::fs::File::create(path) else {
@@ -467,47 +569,6 @@ mod tests {
     }
 
     #[test]
-    fn fresh_hash_detects_same_metadata_content_replacement() {
-        let Ok(dir) = tempfile::tempdir() else {
-            panic!("tempdir")
-        };
-        let model_path = dir.path().join("model.gguf");
-        write_file(&model_path, b"weights v1");
-        let Ok(modified) = std::fs::metadata(&model_path).and_then(|m| m.modified()) else {
-            panic!("read mtime")
-        };
-        let Ok(first) = hash_model_fresh(&model_path) else {
-            panic!("first fresh hash")
-        };
-
-        write_file(&model_path, b"weights v2");
-        let Ok(file) = std::fs::File::open(&model_path) else {
-            panic!("reopen model file")
-        };
-        let Ok(()) = file.set_modified(modified) else {
-            panic!("restore mtime")
-        };
-        let Ok(second) = hash_model_fresh(&model_path) else {
-            panic!("second fresh hash")
-        };
-
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn cancellable_hash_honors_pre_cancelled_token() {
-        let Ok(dir) = tempfile::tempdir() else {
-            panic!("tempdir")
-        };
-        let model_path = dir.path().join("model.gguf");
-        write_file(&model_path, b"weights");
-        let cancel = tokio_util::sync::CancellationToken::new();
-        cancel.cancel();
-
-        assert!(hash_model_fresh_cancellable(&model_path, &cancel).is_err());
-    }
-
-    #[test]
     fn directory_hash_is_stable_and_tracks_member_changes() {
         let Ok(dir) = tempfile::tempdir() else {
             panic!("tempdir")
@@ -540,52 +601,31 @@ mod tests {
     #[test]
     fn scan_models_rejects_expected_hash_mismatch() {
         use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        use crate::config::{PoolConfig, RuntimeConfig, ShapeLimits};
 
         let Ok(dir) = tempfile::tempdir() else {
             panic!("tempdir")
         };
-        let model_path = dir.path().join("model.gguf");
-        write_file(&model_path, b"weights v1");
-
-        let mut expected_hashes = BTreeMap::new();
-        expected_hashes.insert(model_path.to_string_lossy().into_owned(), "0".repeat(64));
-
-        let Ok(base_url) = "http://127.0.0.1:8081/".parse() else {
-            panic!("parse base url")
-        };
-        let pool = crate::config::PoolConfig {
-            key: "pool-a".to_string(),
-            backend: gpq_domain::BackendKind::LlamaCpp,
-            executable: PathBufFixture::absolute(),
-            args: Vec::new(),
-            env: BTreeMap::new(),
+        let model_path = dir.path().join("asset.bin");
+        write_file(&model_path, b"weights");
+        let pool = PoolConfig {
+            key: "pool-a".to_owned(),
+            backend: "cpu".to_owned(),
+            listen: "127.0.0.1:4001".to_owned(),
             state_dir: dir.path().to_path_buf(),
-            startup_timeout: std::time::Duration::from_secs(30),
-            base_url,
-            slots: None,
-            model_paths: vec![model_path],
-            expected_hashes,
-            custom_node_versions: BTreeMap::new(),
+            startup_timeout: Duration::from_secs(30),
+            runtime: RuntimeConfig::default(),
+            shape: ShapeLimits::default(),
+            models: Vec::new(),
+            extra_image_loras: Vec::new(),
+            expected_hashes: BTreeMap::from([(
+                model_path.to_string_lossy().into_owned(),
+                "0".repeat(64),
+            )]),
+            env: BTreeMap::new(),
         };
-
-        let result = super::scan_models(&pool);
-
-        assert!(result.is_err());
-    }
-
-    /// A platform-portable absolute path for tests that only need a
-    /// syntactically valid `PoolConfig::executable`, never executed.
-    struct PathBufFixture;
-
-    impl PathBufFixture {
-        #[cfg(unix)]
-        fn absolute() -> std::path::PathBuf {
-            std::path::PathBuf::from("/usr/bin/true")
-        }
-
-        #[cfg(windows)]
-        fn absolute() -> std::path::PathBuf {
-            std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe")
-        }
+        assert!(super::hash_and_check(&pool, &model_path).is_err());
     }
 }

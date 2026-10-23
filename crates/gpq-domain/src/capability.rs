@@ -1,119 +1,168 @@
-//! Capability matching between a Generation and an Execution Slot.
-//!
-//! ADR 0001 keeps every Slot inside one Tenant. ADR 0012 pins exact Model and
-//! Workflow Versions, while raw `ComfyUI` prompts use content hashes, so a match
-//! is by content hash and never by alias. ADR 0005
-//! makes accelerator memory optional, backend-derived telemetry: unknown memory
-//! does not reject work, and a runtime OOM corrects the claim afterwards. ADR
-//! 0007 matches the Workflow manifest's required Models and custom-node versions
-//! against what the Worker advertises. ADR 0018 rejects workflows naming absent
-//! custom nodes instead of installing them.
+//! Native model, `LoRA`, and shape capability matching.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::generation::{GenerationParameters, ParameterValidationError};
 use crate::hash::ContentHash;
 use crate::id::{DevicePoolId, SlotId, TenantId, WorkerId};
-use crate::modality::BackendKind;
-use crate::version::WorkflowManifest;
+use crate::modality::Modality;
+use crate::version::{LoraSelection, ModelManifest, ModelManifestError};
 
-/// What a Generation needs from a Slot in order to run.
+/// The validated, model-specific shape of a generation request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct GenerationShape {
+    /// Requested output width in pixels.
+    pub width: u32,
+    /// Requested output height in pixels.
+    pub height: u32,
+    /// Effective sampling steps after applying the model preset.
+    pub steps: Option<u32>,
+    /// Requested video frame count; absent for image requests.
+    pub frames: Option<u32>,
+}
+
+/// Per-slot native shape limits; absent values mean no configured limit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct ShapeLimits {
+    /// Maximum pixels in a still image.
+    pub max_image_pixels: Option<u64>,
+    /// Maximum total pixels in a video (width × height × frames).
+    pub max_video_pixels: Option<u64>,
+    /// Maximum video frames.
+    pub max_video_frames: Option<u32>,
+    /// Maximum sampling steps.
+    pub max_steps: Option<u32>,
+}
+
+/// What a Generation needs from a native model slot.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Requirement {
     /// Owning Tenant.
     pub tenant_id: TenantId,
-    /// Runtime kind compatible with the Slot's Active Runtime.
-    pub backend_kind: BackendKind,
-    /// Pinned Model or Workflow Version, or raw prompt content hash.
+    /// Modality determined by the pinned model family.
+    pub modality: Modality,
+    /// Canonical hash of the immutable model manifest.
     pub version: ContentHash,
-    /// Model Versions the execution loads.
-    pub required_models: BTreeSet<ContentHash>,
-    /// Custom-node package name to exact required version.
-    pub required_custom_nodes: BTreeMap<String, String>,
-    /// Estimated accelerator memory, when the target declares one.
-    pub estimated_vram_bytes: Option<u64>,
-    /// Whether this is a raw `ComfyUI` prompt requiring the new adapter.
-    pub requires_comfy_prompt: bool,
+    /// Additional image `LoRA` assets required by this request.
+    pub required_loras: BTreeSet<ContentHash>,
+    /// Validated request shape and effective sampling steps.
+    pub shape: GenerationShape,
+}
+
+/// A malformed model or request that cannot form a scheduling requirement.
+#[derive(Debug, thiserror::Error)]
+pub enum RequirementError {
+    /// The model manifest is missing required runtime assets or has invalid sampling.
+    #[error(transparent)]
+    ModelManifest(#[from] ModelManifestError),
+    /// The request parameters do not match the model family or violate validation.
+    #[error(transparent)]
+    Parameters(#[from] ParameterValidationError),
+    /// The manifest could not be encoded as canonical JSON for its identity hash.
+    #[error("model manifest cannot be serialized for canonical hashing: {0}")]
+    ManifestHash(#[from] serde_json::Error),
+    /// The requested model version is not the supplied manifest's canonical identity.
+    #[error("model manifest hashes to {actual}, not requested version {requested}")]
+    ManifestHashMismatch {
+        /// Requested pinned content hash.
+        requested: ContentHash,
+        /// Canonical hash of the supplied manifest.
+        actual: ContentHash,
+    },
 }
 
 impl Requirement {
-    /// Builds the requirement of an LLM Model Version.
-    #[must_use]
-    pub fn for_model(tenant_id: TenantId, version: ContentHash, vram_bytes: Option<u64>) -> Self {
-        Self {
-            tenant_id,
-            backend_kind: BackendKind::LlamaCpp,
-            version,
-            required_models: BTreeSet::from([version]),
-            required_custom_nodes: BTreeMap::new(),
-            estimated_vram_bytes: vram_bytes,
-            requires_comfy_prompt: false,
-        }
-    }
-
-    /// Builds the requirement of a raw `ComfyUI` Server API prompt.
-    #[must_use]
-    pub fn for_comfy_prompt(tenant_id: TenantId, version: ContentHash) -> Self {
-        Self {
-            tenant_id,
-            backend_kind: BackendKind::ComfyUi,
-            version,
-            required_models: BTreeSet::new(),
-            required_custom_nodes: BTreeMap::new(),
-            estimated_vram_bytes: None,
-            requires_comfy_prompt: true,
-        }
-    }
-
-    /// Builds the requirement of a `ComfyUI` Workflow Version and its manifest.
-    #[must_use]
-    pub fn for_workflow(
+    /// Builds a scheduling requirement from the pinned model and typed parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest, model hash, or generation parameters are invalid.
+    pub fn for_generation(
         tenant_id: TenantId,
         version: ContentHash,
-        manifest: &WorkflowManifest,
-        vram_bytes: Option<u64>,
-    ) -> Self {
-        Self {
-            tenant_id,
-            backend_kind: BackendKind::ComfyUi,
-            version,
-            required_models: manifest.required_models.iter().copied().collect(),
-            required_custom_nodes: manifest.required_custom_nodes.clone(),
-            estimated_vram_bytes: vram_bytes,
-            requires_comfy_prompt: false,
+        manifest: &ModelManifest,
+        parameters: &GenerationParameters,
+    ) -> Result<Self, RequirementError> {
+        manifest.validate()?;
+        parameters.validate_for_family(manifest.family)?;
+        let actual = manifest.canonical_hash()?;
+        if actual != version {
+            return Err(RequirementError::ManifestHashMismatch {
+                requested: version,
+                actual,
+            });
         }
+        let shape = match parameters {
+            GenerationParameters::Image(image) => {
+                let sampling = manifest
+                    .sampling
+                    .resolve(image.steps, image.cfg_scale, image.sigmas.as_deref())
+                    .map_err(ParameterValidationError::from)?;
+                GenerationShape {
+                    width: image.width,
+                    height: image.height,
+                    steps: Some(sampling.steps),
+                    frames: None,
+                }
+            }
+            GenerationParameters::Video(video) => {
+                let sampling = manifest
+                    .sampling
+                    .resolve(None, None, None)
+                    .map_err(ParameterValidationError::from)?;
+                GenerationShape {
+                    width: video.width,
+                    height: video.height,
+                    steps: Some(sampling.steps),
+                    frames: Some(video.frames),
+                }
+            }
+        };
+        let required_loras = match parameters {
+            GenerationParameters::Image(image) => image
+                .loras
+                .iter()
+                .map(|selection: &LoraSelection| selection.sha256)
+                .collect(),
+            GenerationParameters::Video(_) => BTreeSet::new(),
+        };
+        Ok(Self {
+            tenant_id,
+            modality: manifest.modality(),
+            version,
+            required_loras,
+            shape,
+        })
     }
 }
 
-/// What one Execution Slot advertises about itself.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+/// What one native execution slot advertises about itself.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct SlotCapability {
     /// Owning Tenant of the Worker.
     pub tenant_id: TenantId,
     /// The advertising Worker.
     pub worker_id: WorkerId,
-    /// The Device Pool whose Active Runtime exposes this Slot.
+    /// The Device Pool exposing this slot.
     pub pool_id: DevicePoolId,
     /// Slot identity.
     pub slot_id: SlotId,
-    /// Kind of the Active Runtime currently occupying the Pool.
-    pub backend_kind: BackendKind,
-    /// Observed backend version string.
-    pub backend_version: String,
-    /// Model Versions present on the host, by content hash.
-    pub model_versions: BTreeSet<ContentHash>,
-    /// Installed custom nodes, package name to the discovered or
-    /// operator-declared version; `"unknown"` means unavailable.
-    pub custom_nodes: BTreeMap<String, String>,
-    /// Model Version currently loaded in the Pool, if any.
+    /// Observed accelerator/device selector, such as `metal` or `vulkan0`.
+    pub accelerator: String,
+    /// Observed native runtime version.
+    pub accelerator_version: String,
+    /// Available immutable model manifests keyed by their canonical hashes.
+    pub model_manifests: BTreeMap<ContentHash, ModelManifest>,
+    /// Separately available image `LoRA` assets keyed by content hash.
+    pub image_loras: BTreeSet<ContentHash>,
+    /// Model manifest currently resident in the pool, if any.
     pub resident_model: Option<ContentHash>,
     /// Accelerator memory reported by the backend, when known.
     pub accelerator_memory_bytes: Option<u64>,
-    /// Whether the Worker implements raw `ComfyUI` prompts.
-    pub supports_comfy_prompt: bool,
-    /// Versions this Slot proved incapable of, e.g. by running out of memory.
-    pub incapable_versions: BTreeSet<ContentHash>,
+    /// Configured shape limits for this pool.
+    pub shape_limits: ShapeLimits,
 }
 
 /// Why a Slot cannot run a Generation.
@@ -122,48 +171,62 @@ pub enum IncapableReason {
     /// The Slot belongs to a different Tenant.
     #[error("slot belongs to another tenant")]
     TenantMismatch,
-    /// The Slot's Active Runtime is the wrong kind.
-    #[error("slot runs {found} but {required} is required")]
-    BackendMismatch {
-        /// Runtime kind required by the Generation.
-        required: BackendKind,
-        /// Runtime kind the Slot currently hosts.
-        found: BackendKind,
-    },
-    /// A pinned Model Version is not present on the host.
+    /// A pinned model manifest is not present on the host.
     #[error("model version {0} is not installed")]
     MissingModel(ContentHash),
-    /// A required custom node is absent or at the wrong version.
-    #[error("custom node {name} requires {required}, found {found:?}")]
-    MissingCustomNode {
-        /// Package name.
-        name: String,
-        /// Version the Workflow manifest requires.
-        required: String,
-        /// Version installed on the host, if the package exists at all.
-        found: Option<String>,
+    /// The advertised manifest's family does not match the required modality.
+    #[error("model manifest provides {found}, but {required} is required")]
+    ModelModalityMismatch {
+        /// Modality required by the Generation.
+        required: Modality,
+        /// Modality provided by the manifest.
+        found: Modality,
     },
-    /// This Slot does not implement raw `ComfyUI` prompt execution.
-    #[error("slot does not support raw ComfyUI prompts")]
-    UnsupportedComfyPrompt,
-    /// A Slot already failed the version for a candidate-specific reason.
-    #[error("slot is known incapable of version {0}")]
-    KnownIncapable(ContentHash),
-    /// Known accelerator memory is smaller than the version's estimate.
-    #[error("slot has {available} bytes of accelerator memory, {required} estimated")]
-    InsufficientMemory {
-        /// Estimated need.
-        required: u64,
-        /// Reported capacity.
-        available: u64,
+    /// A selected image `LoRA` is not usable on this slot.
+    #[error("image LoRA {0} is not installed")]
+    MissingLora(ContentHash),
+    /// The request shape cannot be accepted by the selected pool.
+    #[error("request shape is invalid for native execution")]
+    InvalidShape,
+    /// The still image exceeds the pool's pixel limit.
+    #[error("image has {requested} pixels, pool limit is {maximum}")]
+    ImagePixelLimit {
+        /// Requested pixels.
+        requested: u64,
+        /// Configured maximum.
+        maximum: u64,
+    },
+    /// The video exceeds the pool's total-pixel limit.
+    #[error("video has {requested} total pixels, pool limit is {maximum}")]
+    VideoPixelLimit {
+        /// Requested width × height × frames.
+        requested: u64,
+        /// Configured maximum.
+        maximum: u64,
+    },
+    /// The video exceeds the pool's frame limit.
+    #[error("video has {requested} frames, pool limit is {maximum}")]
+    VideoFrameLimit {
+        /// Requested frame count.
+        requested: u32,
+        /// Configured maximum.
+        maximum: u32,
+    },
+    /// The request exceeds the pool's sampling-step limit.
+    #[error("request uses {requested} steps, pool limit is {maximum}")]
+    StepLimit {
+        /// Requested sampling steps.
+        requested: u32,
+        /// Configured maximum.
+        maximum: u32,
     },
 }
 
 impl SlotCapability {
     /// Decides whether this Slot may execute a Generation.
     ///
-    /// Unknown accelerator memory never rejects work: ADR 0005 treats memory as
-    /// optional telemetry and relies on runtime OOM to correct the claim.
+    /// Reported accelerator memory is informational; admission gates only on
+    /// pinned assets, selected `LoRAs`, and configured shape limits.
     ///
     /// # Errors
     ///
@@ -172,70 +235,100 @@ impl SlotCapability {
         if self.tenant_id != requirement.tenant_id {
             return Err(IncapableReason::TenantMismatch);
         }
-        if !self.backend_kind.satisfies(requirement.backend_kind) {
-            return Err(IncapableReason::BackendMismatch {
-                required: requirement.backend_kind,
-                found: self.backend_kind,
+        let Some(manifest) = self.model_manifests.get(&requirement.version) else {
+            return Err(IncapableReason::MissingModel(requirement.version));
+        };
+        if manifest.modality() != requirement.modality {
+            return Err(IncapableReason::ModelModalityMismatch {
+                required: requirement.modality,
+                found: manifest.modality(),
             });
         }
-        if requirement.requires_comfy_prompt && !self.supports_comfy_prompt {
-            return Err(IncapableReason::UnsupportedComfyPrompt);
-        }
-        if self.incapable_versions.contains(&requirement.version) {
-            return Err(IncapableReason::KnownIncapable(requirement.version));
-        }
-        for model in &requirement.required_models {
-            if !self.model_versions.contains(model) {
-                return Err(IncapableReason::MissingModel(*model));
+        for lora in &requirement.required_loras {
+            if !self.image_loras.contains(lora) {
+                return Err(IncapableReason::MissingLora(*lora));
             }
         }
-        for (name, required) in &requirement.required_custom_nodes {
-            let found = self.custom_nodes.get(name);
-            if found.map(String::as_str) != Some(required.as_str())
-                || found.is_some_and(|version| version == "unknown")
-            {
-                return Err(IncapableReason::MissingCustomNode {
-                    name: name.clone(),
-                    required: required.clone(),
-                    found: found.cloned(),
-                });
-            }
-        }
-        if let (Some(required), Some(available)) = (
-            requirement.estimated_vram_bytes,
-            self.accelerator_memory_bytes,
-        ) && required > available
+        self.admits_shape(requirement)?;
+        Ok(())
+    }
+
+    fn admits_shape(&self, requirement: &Requirement) -> Result<(), IncapableReason> {
+        let shape = requirement.shape;
+        if shape.width == 0
+            || shape.height == 0
+            || !shape.width.is_multiple_of(32)
+            || !shape.height.is_multiple_of(32)
+            || shape.steps.is_none_or(|steps| steps == 0)
         {
-            return Err(IncapableReason::InsufficientMemory {
-                required,
-                available,
+            return Err(IncapableReason::InvalidShape);
+        }
+        let image_pixels = u64::from(shape.width) * u64::from(shape.height);
+        match requirement.modality {
+            Modality::Image => {
+                if shape.frames.is_some() {
+                    return Err(IncapableReason::InvalidShape);
+                }
+                if let Some(maximum) = self.shape_limits.max_image_pixels
+                    && image_pixels > maximum
+                {
+                    return Err(IncapableReason::ImagePixelLimit {
+                        requested: image_pixels,
+                        maximum,
+                    });
+                }
+            }
+            Modality::Video => {
+                let Some(frames) = shape
+                    .frames
+                    .filter(|frames| *frames >= 5 && (*frames - 5) % 17 == 0)
+                else {
+                    return Err(IncapableReason::InvalidShape);
+                };
+                if let Some(maximum) = self.shape_limits.max_video_frames
+                    && frames > maximum
+                {
+                    return Err(IncapableReason::VideoFrameLimit {
+                        requested: frames,
+                        maximum,
+                    });
+                }
+                let video_pixels = image_pixels.saturating_mul(u64::from(frames));
+                if let Some(maximum) = self.shape_limits.max_video_pixels
+                    && video_pixels > maximum
+                {
+                    return Err(IncapableReason::VideoPixelLimit {
+                        requested: video_pixels,
+                        maximum,
+                    });
+                }
+            }
+        }
+        if let Some(maximum) = self.shape_limits.max_steps
+            && let Some(steps) = shape.steps
+            && steps > maximum
+        {
+            return Err(IncapableReason::StepLimit {
+                requested: steps,
+                maximum,
             });
         }
         Ok(())
     }
 
-    /// Whether the Slot already holds the requirement's Model in memory.
+    /// Whether the Slot already holds the requirement's exact Model in memory.
     ///
-    /// Cache-aware scheduling prefers these Slots (ADR 0002).
+    /// Cache-aware scheduling prefers these Slots.
     #[must_use]
     pub fn holds_resident_model(&self, requirement: &Requirement) -> bool {
-        self.resident_model
-            .is_some_and(|resident| match requirement.backend_kind {
-                BackendKind::LlamaCpp | BackendKind::MlxDspark => resident == requirement.version,
-                BackendKind::ComfyUi => requirement.required_models.contains(&resident),
-            })
-    }
-
-    /// Records that this Slot proved incapable of a version.
-    pub fn mark_incapable(&mut self, version: ContentHash) {
-        self.incapable_versions.insert(version);
+        self.resident_model == Some(requirement.version)
     }
 }
 
 /// Whether any registered Slot is still a candidate for a requirement.
 ///
-/// A Generation fails for VRAM insufficiency only after every candidate is known
-/// incapable (ADR 0003).
+/// A Generation fails after a candidate-specific failure only when no
+/// registered Slot remains capable.
 #[must_use]
 pub fn any_candidate_remains<'a>(
     slots: impl IntoIterator<Item = &'a SlotCapability>,
@@ -249,276 +342,297 @@ pub fn any_candidate_remains<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generation::{ImageParameters, VideoParameters};
+    use crate::version::{ModelAssetRole, ModelFamily};
 
-    fn hash(seed: &[u8]) -> ContentHash {
-        ContentHash::digest(seed)
+    fn manifest(family: ModelFamily) -> ModelManifest {
+        let roles: &[ModelAssetRole] = match family {
+            ModelFamily::QwenImage21 => &[
+                ModelAssetRole::Diffusion,
+                ModelAssetRole::TextEncoder,
+                ModelAssetRole::VisionEncoder,
+                ModelAssetRole::Vae,
+            ],
+            ModelFamily::MinimaxH3 => &[
+                ModelAssetRole::Diffusion,
+                ModelAssetRole::TextEncoder,
+                ModelAssetRole::Vae,
+                ModelAssetRole::AudioVae,
+            ],
+        };
+        ModelManifest {
+            family,
+            assets: roles
+                .iter()
+                .map(|role| (*role, ContentHash::digest(&[*role as u8])))
+                .collect(),
+            default_loras: Vec::new(),
+            sampling: family.default_sampling_preset(),
+        }
     }
 
-    fn slot(tenant_id: TenantId, kind: BackendKind) -> SlotCapability {
+    fn image_parameters(loras: Vec<LoraSelection>) -> GenerationParameters {
+        GenerationParameters::Image(ImageParameters {
+            prompt: "a landscape".to_owned(),
+            negative_prompt: String::new(),
+            width: 512,
+            height: 512,
+            steps: None,
+            cfg_scale: None,
+            references: Vec::new(),
+            loras,
+            sigmas: None,
+        })
+    }
+
+    fn video_parameters() -> GenerationParameters {
+        GenerationParameters::Video(VideoParameters {
+            prompt: "a moving landscape".to_owned(),
+            negative_prompt: String::new(),
+            width: 512,
+            height: 512,
+            frames: 22,
+            first_frame: None,
+            last_frame: None,
+        })
+    }
+
+    fn requirement(
+        tenant_id: TenantId,
+        manifest: &ModelManifest,
+        parameters: &GenerationParameters,
+    ) -> Requirement {
+        let version = manifest
+            .canonical_hash()
+            .unwrap_or_else(|error| panic!("fixture manifest has canonical JSON: {error}"));
+        Requirement::for_generation(tenant_id, version, manifest, parameters)
+            .unwrap_or_else(|error| panic!("fixture request is valid: {error}"))
+    }
+
+    fn slot(tenant_id: TenantId) -> SlotCapability {
         SlotCapability {
             tenant_id,
             worker_id: WorkerId::new(),
             pool_id: DevicePoolId::new(),
             slot_id: SlotId::new(),
-            backend_kind: kind,
-            backend_version: "b1".to_owned(),
-            model_versions: BTreeSet::new(),
-            custom_nodes: BTreeMap::new(),
+            accelerator: "vulkan0".to_owned(),
+            accelerator_version: "native-test".to_owned(),
+            model_manifests: BTreeMap::new(),
+            image_loras: BTreeSet::new(),
             resident_model: None,
             accelerator_memory_bytes: None,
-            supports_comfy_prompt: false,
-            incapable_versions: BTreeSet::new(),
+            shape_limits: ShapeLimits::default(),
         }
     }
 
+    fn add_model(slot: &mut SlotCapability, model: ModelManifest) -> ContentHash {
+        let version = model
+            .canonical_hash()
+            .unwrap_or_else(|error| panic!("fixture manifest has canonical JSON: {error}"));
+        slot.model_manifests.insert(version, model);
+        version
+    }
+
     #[test]
-    fn rejects_other_tenants() {
+    fn rejects_other_tenants_and_requires_the_exact_manifest_hash() {
         let tenant = TenantId::new();
-        let slot = slot(TenantId::new(), BackendKind::LlamaCpp);
-        let requirement = Requirement::for_model(tenant, hash(b"m"), None);
+        let manifest = manifest(ModelFamily::QwenImage21);
+        let request = image_parameters(Vec::new());
+
+        assert!(matches!(
+            Requirement::for_generation(
+                tenant,
+                ContentHash::digest(b"wrong manifest hash"),
+                &manifest,
+                &request,
+            ),
+            Err(RequirementError::ManifestHashMismatch { .. })
+        ));
+
+        let requirement = requirement(tenant, &manifest, &request);
+        let mut slot = slot(TenantId::new());
+        add_model(&mut slot, manifest.clone());
         assert_eq!(
             slot.admits(&requirement),
             Err(IncapableReason::TenantMismatch)
         );
-    }
 
-    #[test]
-    fn rejects_wrong_runtime_kind() {
-        let tenant = TenantId::new();
-        let mut slot = slot(tenant, BackendKind::ComfyUi);
-        slot.model_versions.insert(hash(b"m"));
-        let requirement = Requirement::for_model(tenant, hash(b"m"), None);
+        slot.tenant_id = tenant;
+        slot.model_manifests.clear();
         assert_eq!(
             slot.admits(&requirement),
-            Err(IncapableReason::BackendMismatch {
-                required: BackendKind::LlamaCpp,
-                found: BackendKind::ComfyUi
-            })
+            Err(IncapableReason::MissingModel(requirement.version))
         );
-    }
-
-    #[test]
-    fn requires_exact_model_version() {
-        let tenant = TenantId::new();
-        let mut slot = slot(tenant, BackendKind::LlamaCpp);
-        slot.model_versions.insert(hash(b"other"));
-        let requirement = Requirement::for_model(tenant, hash(b"m"), None);
-        assert_eq!(
-            slot.admits(&requirement),
-            Err(IncapableReason::MissingModel(hash(b"m")))
-        );
-        slot.model_versions.insert(hash(b"m"));
+        add_model(&mut slot, manifest);
         assert_eq!(slot.admits(&requirement), Ok(()));
     }
 
     #[test]
-    fn mlx_dspark_admits_llm_model_requirements() {
+    fn image_loras_must_be_separately_advertised() {
         let tenant = TenantId::new();
-        let mut slot = slot(tenant, BackendKind::MlxDspark);
-        slot.model_versions.insert(hash(b"m"));
-        slot.resident_model = Some(hash(b"m"));
-        let requirement = Requirement::for_model(tenant, hash(b"m"), None);
-
-        assert_eq!(slot.admits(&requirement), Ok(()));
-        assert!(slot.holds_resident_model(&requirement));
-    }
-
-    #[test]
-    fn requires_exact_custom_node_versions() {
-        let tenant = TenantId::new();
-        let mut slot = slot(tenant, BackendKind::ComfyUi);
-        slot.model_versions.insert(hash(b"m"));
-        slot.custom_nodes
-            .insert("comfyui-extra".to_owned(), "1.2.0".to_owned());
-        let manifest = WorkflowManifest {
-            output_node: "9".to_owned(),
-            output_name: "images".to_owned(),
-            artifact_kind: crate::artifact::MediaKind::Image,
-            artifact_mime: "image/png".to_owned(),
-            required_models: vec![hash(b"m")],
-            required_custom_nodes: BTreeMap::from([(
-                "comfyui-extra".to_owned(),
-                "1.3.0".to_owned(),
-            )]),
-        };
-        let requirement = Requirement::for_workflow(tenant, hash(b"w"), &manifest, None);
+        let lora = ContentHash::digest(b"style");
+        let manifest = manifest(ModelFamily::QwenImage21);
+        let request = image_parameters(vec![LoraSelection {
+            sha256: lora,
+            scale: 0.7,
+        }]);
+        let requirement = requirement(tenant, &manifest, &request);
+        let mut slot = slot(tenant);
+        add_model(&mut slot, manifest);
         assert_eq!(
             slot.admits(&requirement),
-            Err(IncapableReason::MissingCustomNode {
-                name: "comfyui-extra".to_owned(),
-                required: "1.3.0".to_owned(),
-                found: Some("1.2.0".to_owned()),
-            })
+            Err(IncapableReason::MissingLora(lora))
         );
+        slot.image_loras.insert(lora);
+        assert_eq!(slot.admits(&requirement), Ok(()));
     }
 
     #[test]
-    fn unknown_custom_node_version_does_not_satisfy_an_exact_pin() {
+    fn image_shape_and_sampling_limits_exclude_unsupported_requests() {
         let tenant = TenantId::new();
-        let mut slot = slot(tenant, BackendKind::ComfyUi);
-        slot.custom_nodes
-            .insert("comfyui-extra".to_owned(), "unknown".to_owned());
-        let manifest = WorkflowManifest {
-            output_node: "9".to_owned(),
-            output_name: "images".to_owned(),
-            artifact_kind: crate::artifact::MediaKind::Image,
-            artifact_mime: "image/png".to_owned(),
-            required_models: Vec::new(),
-            required_custom_nodes: BTreeMap::from([(
-                "comfyui-extra".to_owned(),
-                "unknown".to_owned(),
-            )]),
+        let manifest = manifest(ModelFamily::QwenImage21);
+        let request = image_parameters(Vec::new());
+        let requirement = requirement(tenant, &manifest, &request);
+        let mut slot = slot(tenant);
+        add_model(&mut slot, manifest);
+        slot.shape_limits = ShapeLimits {
+            max_image_pixels: Some(512 * 512),
+            max_video_pixels: None,
+            max_video_frames: None,
+            max_steps: Some(40),
         };
-        let requirement = Requirement::for_workflow(tenant, hash(b"w"), &manifest, None);
+        assert_eq!(slot.admits(&requirement), Ok(()));
+
+        slot.shape_limits.max_image_pixels = Some(512 * 512 - 1);
         assert!(matches!(
             slot.admits(&requirement),
-            Err(IncapableReason::MissingCustomNode {
-                found: Some(found),
-                ..
-            }) if found == "unknown"
+            Err(IncapableReason::ImagePixelLimit { .. })
+        ));
+        slot.shape_limits.max_image_pixels = None;
+        slot.shape_limits.max_steps = Some(39);
+        assert!(matches!(
+            slot.admits(&requirement),
+            Err(IncapableReason::StepLimit {
+                requested: 40,
+                maximum: 39,
+            })
         ));
     }
 
     #[test]
-    fn extra_models_and_custom_nodes_do_not_block_admission() {
+    fn effective_schedule_steps_drive_image_admission_limits() {
         let tenant = TenantId::new();
-        let mut slot = slot(tenant, BackendKind::ComfyUi);
-        slot.model_versions.insert(hash(b"m"));
-        slot.model_versions.insert(hash(b"unrelated"));
-        slot.custom_nodes
-            .insert("comfyui-extra".to_owned(), "1.3.0".to_owned());
-        slot.custom_nodes
-            .insert("comfyui-unused".to_owned(), "9.9.9".to_owned());
-        let manifest = WorkflowManifest {
-            output_node: "9".to_owned(),
-            output_name: "images".to_owned(),
-            artifact_kind: crate::artifact::MediaKind::Image,
-            artifact_mime: "image/png".to_owned(),
-            required_models: vec![hash(b"m")],
-            required_custom_nodes: BTreeMap::from([(
-                "comfyui-extra".to_owned(),
-                "1.3.0".to_owned(),
-            )]),
-        };
-        let requirement = Requirement::for_workflow(tenant, hash(b"w"), &manifest, None);
-        assert_eq!(slot.admits(&requirement), Ok(()));
-    }
+        let mut qwen = manifest(ModelFamily::QwenImage21);
+        qwen.sampling.steps = 8;
+        let request = image_parameters(Vec::new());
+        let qwen_requirement = requirement(tenant, &qwen, &request);
+        assert_eq!(qwen_requirement.shape.steps, Some(8));
 
-    #[test]
-    fn missing_custom_node_reports_no_installed_version() {
-        let tenant = TenantId::new();
-        let mut slot = slot(tenant, BackendKind::ComfyUi);
-        slot.model_versions.insert(hash(b"m"));
-        let manifest = WorkflowManifest {
-            output_node: "9".to_owned(),
-            output_name: "images".to_owned(),
-            artifact_kind: crate::artifact::MediaKind::Image,
-            artifact_mime: "image/png".to_owned(),
-            required_models: vec![hash(b"m")],
-            required_custom_nodes: BTreeMap::from([(
-                "comfyui-extra".to_owned(),
-                "1.3.0".to_owned(),
-            )]),
+        let mut slot = slot(tenant);
+        add_model(&mut slot, qwen.clone());
+        slot.shape_limits.max_steps = Some(8);
+        assert_eq!(slot.admits(&qwen_requirement), Ok(()));
+
+        let mut request = image_parameters(Vec::new());
+        let GenerationParameters::Image(image) = &mut request else {
+            unreachable!();
         };
-        let requirement = Requirement::for_workflow(tenant, hash(b"w"), &manifest, None);
+        image.sigmas = Some(vec![1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0]);
+        let long_schedule = requirement(tenant, &qwen, &request);
+        assert_eq!(long_schedule.shape.steps, Some(10));
+        slot.shape_limits.max_steps = Some(9);
         assert_eq!(
-            slot.admits(&requirement),
-            Err(IncapableReason::MissingCustomNode {
-                name: "comfyui-extra".to_owned(),
-                required: "1.3.0".to_owned(),
-                found: None,
+            slot.admits(&long_schedule),
+            Err(IncapableReason::StepLimit {
+                requested: 10,
+                maximum: 9,
             })
         );
     }
 
     #[test]
-    fn unknown_memory_does_not_reject_work() {
+    fn explicit_steps_must_match_selected_schedule_and_empty_sigmas_fall_back() {
         let tenant = TenantId::new();
-        let mut slot = slot(tenant, BackendKind::LlamaCpp);
-        slot.model_versions.insert(hash(b"m"));
-        let requirement = Requirement::for_model(tenant, hash(b"m"), Some(48 * 1024 * 1024 * 1024));
-        assert_eq!(slot.admits(&requirement), Ok(()));
-
-        slot.accelerator_memory_bytes = Some(8 * 1024 * 1024 * 1024);
-        assert_eq!(
-            slot.admits(&requirement),
-            Err(IncapableReason::InsufficientMemory {
-                required: 48 * 1024 * 1024 * 1024,
-                available: 8 * 1024 * 1024 * 1024,
-            })
-        );
-    }
-
-    #[test]
-    fn accelerator_memory_boundary_is_inclusive() {
-        let tenant = TenantId::new();
-        let mut slot = slot(tenant, BackendKind::LlamaCpp);
-        slot.model_versions.insert(hash(b"m"));
-        slot.accelerator_memory_bytes = Some(8 * 1024 * 1024 * 1024);
-
-        let exact = Requirement::for_model(tenant, hash(b"m"), Some(8 * 1024 * 1024 * 1024));
-        assert_eq!(slot.admits(&exact), Ok(()));
-
-        let over = Requirement::for_model(tenant, hash(b"m"), Some(8 * 1024 * 1024 * 1024 + 1));
-        assert_eq!(
-            slot.admits(&over),
-            Err(IncapableReason::InsufficientMemory {
-                required: 8 * 1024 * 1024 * 1024 + 1,
-                available: 8 * 1024 * 1024 * 1024,
-            })
-        );
-    }
-
-    #[test]
-    fn oom_marking_removes_the_slot_from_candidates() {
-        let tenant = TenantId::new();
-        let mut slot = slot(tenant, BackendKind::LlamaCpp);
-        slot.model_versions.insert(hash(b"m"));
-        let requirement = Requirement::for_model(tenant, hash(b"m"), None);
-        assert!(any_candidate_remains([&slot], &requirement));
-
-        slot.mark_incapable(hash(b"m"));
-        assert_eq!(
-            slot.admits(&requirement),
-            Err(IncapableReason::KnownIncapable(hash(b"m")))
-        );
-        assert!(!any_candidate_remains([&slot], &requirement));
-    }
-
-    #[test]
-    fn resident_model_is_recognized_for_both_backends() {
-        let tenant = TenantId::new();
-        let mut llama = slot(tenant, BackendKind::LlamaCpp);
-        llama.model_versions.insert(hash(b"m"));
-        llama.resident_model = Some(hash(b"m"));
-        let model_requirement = Requirement::for_model(tenant, hash(b"m"), None);
-        assert!(llama.holds_resident_model(&model_requirement));
-
-        let manifest = WorkflowManifest {
-            output_node: "9".to_owned(),
-            output_name: "images".to_owned(),
-            artifact_kind: crate::artifact::MediaKind::Image,
-            artifact_mime: "image/png".to_owned(),
-            required_models: vec![hash(b"sd")],
-            required_custom_nodes: BTreeMap::new(),
+        let qwen = manifest(ModelFamily::QwenImage21);
+        let mut request = image_parameters(Vec::new());
+        let GenerationParameters::Image(image) = &mut request else {
+            unreachable!();
         };
-        let mut comfy = slot(tenant, BackendKind::ComfyUi);
-        comfy.model_versions.insert(hash(b"sd"));
-        comfy.resident_model = Some(hash(b"sd"));
-        let workflow_requirement = Requirement::for_workflow(tenant, hash(b"w"), &manifest, None);
-        assert!(comfy.holds_resident_model(&workflow_requirement));
+        image.steps = Some(1);
+        image.sigmas = Some(vec![1.0, 0.5, 0.0]);
+        assert!(matches!(
+            Requirement::for_generation(
+                tenant,
+                qwen.canonical_hash()
+                    .unwrap_or_else(|error| panic!("fixture manifest has canonical JSON: {error}")),
+                &qwen,
+                &request,
+            ),
+            Err(RequirementError::Parameters(
+                ParameterValidationError::SamplingStepsMismatch
+            ))
+        ));
+
+        let mut qwen = qwen;
+        qwen.sampling.steps = 3;
+        qwen.sampling.sigmas = vec![1.0, 0.75, 0.25, 0.0];
+        let mut request = image_parameters(Vec::new());
+        let GenerationParameters::Image(image) = &mut request else {
+            unreachable!();
+        };
+        image.sigmas = Some(Vec::new());
+        let requirement = requirement(tenant, &qwen, &request);
+        assert_eq!(requirement.shape.steps, Some(3));
+
+        let mut slot = slot(tenant);
+        add_model(&mut slot, qwen);
+        slot.shape_limits.max_steps = Some(3);
+        assert_eq!(slot.admits(&requirement), Ok(()));
     }
 
     #[test]
-    fn raw_comfy_prompts_require_the_adapter_flag() {
+    fn video_shape_limits_cover_total_pixels_and_frame_count() {
         let tenant = TenantId::new();
-        let requirement = Requirement::for_comfy_prompt(tenant, hash(b"raw"));
-        let mut slot = slot(tenant, BackendKind::ComfyUi);
+        let manifest = manifest(ModelFamily::MinimaxH3);
+        let request = video_parameters();
+        let requirement = requirement(tenant, &manifest, &request);
+        let mut slot = slot(tenant);
+        add_model(&mut slot, manifest);
+        slot.shape_limits = ShapeLimits {
+            max_image_pixels: None,
+            max_video_pixels: Some(512 * 512 * 22),
+            max_video_frames: Some(22),
+            max_steps: Some(4),
+        };
+        assert_eq!(slot.admits(&requirement), Ok(()));
+        slot.shape_limits.max_video_pixels = Some(512 * 512 * 22 - 1);
+        assert!(matches!(
+            slot.admits(&requirement),
+            Err(IncapableReason::VideoPixelLimit { .. })
+        ));
+        slot.shape_limits.max_video_pixels = Some(512 * 512 * 22);
+        slot.shape_limits.max_video_frames = Some(21);
         assert_eq!(
             slot.admits(&requirement),
-            Err(IncapableReason::UnsupportedComfyPrompt)
+            Err(IncapableReason::VideoFrameLimit {
+                requested: 22,
+                maximum: 21,
+            })
         );
-        slot.supports_comfy_prompt = true;
-        assert_eq!(slot.admits(&requirement), Ok(()));
+    }
+
+    #[test]
+    fn reported_memory_does_not_gate_admission() {
+        let tenant = TenantId::new();
+        let manifest = manifest(ModelFamily::QwenImage21);
+        let request = image_parameters(Vec::new());
+        let requirement = requirement(tenant, &manifest, &request);
+        let mut slot = slot(tenant);
+        add_model(&mut slot, manifest);
+
+        for memory in [None, Some(0), Some(1024)] {
+            slot.accelerator_memory_bytes = memory;
+            assert_eq!(slot.admits(&requirement), Ok(()));
+        }
     }
 }

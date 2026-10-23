@@ -1,9 +1,72 @@
 # Injected into cargo-dist's build-local-artifacts job (Cargo.toml
-# `github-build-setup`). gpq-proto's build script runs protoc, and the
-# Protobuf Edition 2024 schemas require protoc 33+ (ADR 0004), which no
-# GitHub runner image ships.
+# `github-build-setup`). Provisions the build-time prerequisites of the single
+# gpq executable, which compiles the native inference runtime (gpq-inference):
+#
+# - protoc 33+ for gpq-proto (ADR 0004), which no GitHub runner image ships.
+# - CMake and SPIRV-Headers (pinned upstream source) on every target.
+# - Metal on macOS needs no SDK: shader source is embedded and compiled at run
+#   time, so only the Apple toolchain is required.
+# - Vulkan (the default GPU backend on Linux and Windows) needs the loader
+#   headers and glslc. On Windows the x64 Vulkan SDK supplies the headers and
+#   the host glslc, and an ARM64 import library is generated from the pinned
+#   upstream loader .def, because the SDK ships only x64 import libraries.
+#   vulkan-1.dll is not packaged: the loader resolves at run time from the
+#   driver install, which matches the target architecture.
 - name: Install protoc
   uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
   with:
     version: "35.1"
     repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+- name: Install native build dependencies (Linux)
+  if: runner.os == 'Linux'
+  shell: bash
+  run: |
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends cmake libvulkan-dev glslc
+    bash scripts/install-spirv-headers.sh "$RUNNER_TEMP/spirv-headers"
+
+- name: Install native build dependencies (macOS)
+  if: runner.os == 'macOS'
+  shell: bash
+  run: |
+    command -v cmake >/dev/null || brew install cmake
+    echo "MACOSX_DEPLOYMENT_TARGET=26.7" >> "$GITHUB_ENV"
+    bash scripts/install-spirv-headers.sh "$RUNNER_TEMP/spirv-headers"
+
+- name: Install native build dependencies (Windows)
+  if: runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+      choco install cmake -y --no-progress --installargs 'ADD_CMAKE_TO_PATH=System'
+      $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+    }
+    choco install vulkan-sdk -y --no-progress
+    $sdk = Get-ChildItem C:\VulkanSDK -Directory | Sort-Object { [version]$_.Name } | Select-Object -Last 1
+    if (-not $sdk) { throw 'Vulkan SDK not found under C:\VulkanSDK' }
+    "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+    bash scripts/install-spirv-headers.sh "$env:RUNNER_TEMP/spirv-headers"
+
+    # ARM64 import library for vulkan-1.dll, generated from the pinned upstream
+    # loader export list (tag vulkan-sdk-1.4.363.0) with the x64-hosted lib.exe.
+    $loaderCommit = 'fa218055ff4948b159f31d43f800c808a13d51df'
+    $defSha256 = '9ba339b7f5ee2df28487698a6840ecf095fac58b415c2c89ad9f161e9d316378'
+    $dir = Join-Path $env:RUNNER_TEMP 'vulkan-arm64'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $def = Join-Path $dir 'vulkan-1.def'
+    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Loader/$loaderCommit/loader/vulkan-1.def" -OutFile $def
+    if ((Get-FileHash -Algorithm SHA256 $def).Hash.ToLowerInvariant() -ne $defSha256) {
+      throw 'vulkan-1.def checksum mismatch'
+    }
+    $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if (-not $vs) { throw 'Visual Studio with MSVC tools not found' }
+    Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+    Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+    $importLib = Join-Path $dir 'vulkan-1.lib'
+    lib /nologo /def:$def /machine:ARM64 /out:$importLib
+    if ($LASTEXITCODE -ne 0) { throw 'lib.exe failed to generate the ARM64 vulkan-1 import library' }
+    "GPQ_VULKAN_IMPORT_LIB_ARM64=$importLib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

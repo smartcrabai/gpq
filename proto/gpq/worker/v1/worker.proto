@@ -7,10 +7,10 @@ edition = "2024";
 package gpq.worker.v1;
 
 import "google/protobuf/duration.proto";
-import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 import "gpq/v1/common.proto";
 import "gpq/v1/catalog.proto";
+import "gpq/v1/generation.proto";
 
 option features.field_presence = IMPLICIT;
 
@@ -67,23 +67,21 @@ message SlotAdvertisement {
   string attempt_id = 3;
 }
 
-// A Device Pool, its Active Runtime, and its Slots (ADR 0005).
+// A Device Pool, its Active Accelerator, and its Slots (ADR 0005).
 message PoolAdvertisement {
   string pool_id = 1;
-  gpq.v1.BackendKind backend_kind = 2;
   string backend_version = 3;
   bool ready = 4;
   string unready_reason = 5;
   repeated SlotAdvertisement slots = 6;
   string resident_model_sha256 = 7;
-  uint64 accelerator_memory_bytes = 8;
-  // Content hashes of Model Versions installed for this Pool.
-  repeated string model_sha256 = 9;
-  // Installed custom nodes, package name to the discovered or operator-declared
-  // version; "unknown" means no version was available.
-  map<string, string> custom_nodes = 10;
-  // Probe results per required backend operation (ADR 0005).
-  map<string, bool> probes = 11;
+  uint64 accelerator_memory_bytes = 8 [features.field_presence = EXPLICIT];
+  repeated string image_lora_sha256 = 12;
+  gpq.v1.ShapeLimits shape_limits = 13;
+  repeated gpq.v1.ModelAdvertisement models = 14;
+  string accelerator = 15;
+  reserved 2, 9, 10, 11;
+  reserved backend_kind, model_sha256, custom_nodes, probes;
 }
 
 // Sent after the handshake and whenever capability or occupancy changes.
@@ -106,12 +104,6 @@ message AttemptProgress {
   gpq.v1.Progress progress = 2;
 }
 
-// Incremental LLM output, forwarded to connected callers and never persisted
-// (ADR 0008).
-message AttemptTokenDelta {
-  string attempt_id = 1;
-  string text = 2;
-}
 
 // A produced output Artifact. Worker-local placement keeps the bytes on the
 // Worker until Remote requests delivery.
@@ -122,21 +114,17 @@ message AttemptOutput {
   string object_key = 3;
   // Opaque token the Worker accepts in DeliverArtifact for worker-local bytes.
   string delivery_token = 4;
-  // RFC6901 pointers into the raw ComfyUI history outputs object.
-  repeated string comfy_output_pointers = 5;
+  reserved 5;
+  reserved comfy_output_pointers;
 }
 
 // Result commitment. Remote verifies the live lease, a nonterminal Generation,
 // and the absence of a prior Accepted Result before accepting (ADR 0003).
 message AttemptResult {
   string attempt_id = 1;
-  string output_text = 2;
   repeated AttemptOutput outputs = 3;
-  gpq.v1.Usage usage = 4;
-  // The accepted raw ComfyUI history outputs object.
-  bytes comfy_outputs_json = 5;
-  // Output node IDs from the raw ComfyUI history prompt tuple.
-  repeated string comfy_output_node_ids = 6;
+  reserved 2, 4, 5, 6;
+  reserved output_text, usage, comfy_outputs_json, comfy_output_node_ids;
 }
 
 message AttemptFailure {
@@ -162,12 +150,13 @@ message WorkerMessage {
     Heartbeat heartbeat = 3;
     AttemptRunning attempt_running = 4;
     AttemptProgress attempt_progress = 5;
-    AttemptTokenDelta attempt_token_delta = 6;
     AttemptResult attempt_result = 7;
     AttemptFailure attempt_failure = 8;
     CancelAcknowledged cancel_acknowledged = 9;
     LeaseRejected lease_rejected = 10;
   }
+  reserved 6;
+  reserved attempt_token_delta;
 }
 
 // An input Artifact the Attempt must read before execution.
@@ -186,18 +175,7 @@ message LeaseAssignment {
   string generation_id = 2;
   string pool_id = 3;
   string slot_id = 4;
-  gpq.v1.Modality modality = 5;
-  // Pinned Model Version for LLM backend work (ADR 0012).
   string model_sha256 = 6;
-  // Pinned registered Workflow Version, its graph, and its manifest for
-  // registered ComfyUI Workflow work. Raw prompt JSON is carried below. The
-  // graph travels with the lease and the Worker revalidates before execution
-  // (ADR 0007).
-  string workflow_sha256 = 7;
-  google.protobuf.Struct workflow_graph = 8;
-  gpq.v1.WorkflowManifest workflow_manifest = 9;
-  // Opaque backend-shaped parameters (ADR 0007).
-  google.protobuf.Struct parameters = 10;
   repeated LeaseInput inputs = 11;
   gpq.v1.ArtifactPlacement output_placement = 12;
   // Presigned PUT URL when outputs go to object storage.
@@ -206,11 +184,14 @@ message LeaseAssignment {
   uint64 seed = 15;
   google.protobuf.Duration execution_timeout = 16;
   google.protobuf.Timestamp lease_expires_at = 17;
-  bool stream_tokens = 18;
-  // Canonical raw ComfyUI prompt JSON, preserving integer values.
-  bytes comfy_prompt_json = 19;
-  // SHA-256 of comfy_prompt_json.
-  string comfy_prompt_sha256 = 20;
+  gpq.v1.ModelManifest model_manifest = 21;
+  oneof generation_parameters {
+    gpq.v1.ImageParameters image_parameters = 22;
+    gpq.v1.VideoParameters video_parameters = 23;
+  }
+  reserved 5, 7, 8, 9, 10, 18, 19, 20;
+  reserved modality, workflow_sha256, workflow_graph, workflow_manifest;
+  reserved parameters, stream_tokens, comfy_prompt_json, comfy_prompt_sha256;
 }
 
 // Cooperative cancellation. After lease expiry the Worker must cancel even

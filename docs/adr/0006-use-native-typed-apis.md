@@ -1,0 +1,9 @@
+# Use native typed APIs
+
+The public Generation contract is native Connect unary and server-streaming RPC. `SubmitRequest` targets only `target.model_alias` and carries one typed `ImageParameters` or `VideoParameters` value; `QwenImage21` maps to Image and `MinimaxH3` maps to Video. The public surface is limited to typed Generation, model catalog, Tenant, and Artifact operations rather than compatibility or opaque backend-payload APIs.
+
+`ImageParameters` contain prompt and negative prompt, dimensions, optional steps/CFG/sigmas, reference Artifact IDs, and image LoRA hash/scale selections. `VideoParameters` contain prompt and negative prompt, dimensions, frame count, and optional first/last-frame Artifact IDs. Reconnected Generation event streams begin with the current snapshot and then live events. Tenant Master Keys authenticate public operations; Worker credentials remain separate and tenant-scoped.
+
+Each immutable `ModelManifest` binds a Model Family, role-keyed asset SHA-256 values, ordered default LoRA selections, and a sampling preset; its canonical content hash identifies the Model Version. Admission resolves the Model alias and pins that version hash. Worker matching checks the exact manifest hash, modality, requested LoRA hashes, and configured shape limits; estimated model and accelerator memory are metadata only. `RemoteLocal` input Artifacts store bytes in PostgreSQL, so S3 is not mandatory; outputs use `WorkerLocal` or `ObjectStore` placement and single-use downloads with expiry.
+
+This native-only cutover intentionally removes retired generated API symbols while reserving removed field numbers and names. CI accepts the resulting schema once through the checked-in `.github/native-proto-baseline.binpb`; after it lands on `main`, every pull request resumes strict `FILE` breaking comparison against current `main`. This keeps subsequent schema additions and removals subject to the normal gate without a lasting exception.

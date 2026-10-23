@@ -1,50 +1,42 @@
-//! Worker self-diagnosis (`gpq-worker diagnose`).
+//! Worker self-diagnosis (`gpq worker diagnose`).
 //!
-//! Checks, per Device Pool (ADR 0005): the backend executable exists and is
-//! executable, its state directory is writable, configured model paths are
-//! present with matching SHA-256 hashes, and the backend answers its
-//! required endpoint probes on its loopback address. Also checks Worker
-//! Credential presence and storage backend (ADR 0009) and Remote
-//! reachability (ADR 0004). The credential's value is never printed.
+//! Checks the single executable, configured asset hashes, accelerator
+//! availability, managed-child ownership, state directories, credential, and
+//! Remote reachability. Never prints any credential or the child bearer token.
 
+use std::ffi::OsString;
+use std::path::Path;
 use std::time::Duration;
 
-use crate::backend;
 use crate::config::{PoolConfig, WorkerConfig};
 use crate::credential::CredentialStore;
-use crate::models::hash_model_fresh;
-use crate::process::{self, Ownership};
+use crate::models;
+use crate::process::{self, ManagedProcess, Ownership};
 
-/// The outcome of one diagnostic check.
+const DIAGNOSTIC_PROCESS_GRACE: Duration = Duration::from_secs(10);
+const DIAGNOSTIC_PROCESS_IDENTITY_FILE: &str = ".gpq-diagnose-process-identity.json";
+
 #[derive(Debug, Clone)]
 pub enum Outcome {
-    /// The check passed; the string is a short human-readable detail.
     Ok(String),
-    /// The check failed; the string explains why, without secret material.
     Failed(String),
 }
 
 impl Outcome {
-    /// Whether this outcome represents success.
     #[must_use]
     pub fn is_ok(&self) -> bool {
         matches!(self, Self::Ok(_))
     }
 }
 
-/// One labeled diagnostic check and its outcome.
 #[derive(Debug, Clone)]
 pub struct CheckResult {
-    /// Human-readable name of the thing being checked.
     pub label: String,
-    /// Whether it passed.
     pub outcome: Outcome,
 }
 
-/// The full set of checks performed by `gpq-worker diagnose`.
 #[derive(Debug, Clone, Default)]
 pub struct Report {
-    /// Every check performed, in the order they ran.
     pub checks: Vec<CheckResult>,
 }
 
@@ -56,18 +48,14 @@ impl Report {
         });
     }
 
-    /// Whether every check passed.
     #[must_use]
     pub fn all_ok(&self) -> bool {
         self.checks.iter().all(|check| check.outcome.is_ok())
     }
 
-    /// Renders the report as human-readable lines. Never includes the
-    /// credential value (ADR 0009).
     #[must_use]
     pub fn render(&self) -> String {
         use std::fmt::Write as _;
-
         let mut out = String::new();
         for check in &self.checks {
             match &check.outcome {
@@ -83,54 +71,70 @@ impl Report {
     }
 }
 
-/// Runs every diagnostic check against `config`.
-///
-/// # Errors
-///
-/// Returns an error only if a check itself cannot even be attempted (never
-/// for an ordinary failed check, which is recorded in the returned
-/// [`Report`] instead).
-pub async fn run(config: &WorkerConfig) -> anyhow::Result<Report> {
+pub async fn run(config: &WorkerConfig, config_path: &Path) -> anyhow::Result<Report> {
     let mut report = Report::default();
-
     check_credential(config, &mut report);
+    check_executable(&mut report);
     check_remote(config, &mut report).await;
-
     for pool in &config.pools {
-        check_executable(pool, &mut report);
         check_state_dir_writable(pool, &mut report).await;
         check_models(pool, &mut report);
         check_managed_process(pool, &mut report).await;
-        check_backend(pool, &mut report).await;
+        check_accelerator(pool, config_path, &mut report).await;
     }
-
     Ok(report)
 }
 
 fn check_credential(config: &WorkerConfig, report: &mut Report) {
-    let store = CredentialStore::new(&config.name, &config.state_dir);
-    let label = "credential";
+    let store = CredentialStore::new(&config.name, &config.state_dir, config.credential_storage);
     match store.load() {
-        Ok(Some(_credential)) => report.push(
-            label,
+        Ok(Some(_)) => report.push(
+            "credential",
             Outcome::Ok(format!(
                 "enrolled, stored via {}",
-                CredentialStore::describe()
+                CredentialStore::describe(config.credential_storage)
             )),
         ),
         Ok(None) => report.push(
-            label,
-            Outcome::Failed("not enrolled; run `gpq-worker enroll`".to_owned()),
+            "credential",
+            Outcome::Failed("not enrolled; run `gpq worker enroll`".to_owned()),
         ),
-        Err(err) => report.push(label, Outcome::Failed(format!("{err:#}"))),
+        Err(error) => report.push("credential", Outcome::Failed(format!("{error:#}"))),
     }
 }
 
+fn check_executable(report: &mut Report) {
+    let label = "gpq executable";
+    match std::env::current_exe() {
+        Ok(path) => match std::fs::metadata(&path) {
+            Ok(metadata) if is_executable(&metadata) => {
+                report.push(label, Outcome::Ok(path.display().to_string()));
+            }
+            Ok(_) => report.push(
+                label,
+                Outcome::Failed(format!("{} is not executable", path.display())),
+            ),
+            Err(error) => report.push(label, Outcome::Failed(error.to_string())),
+        },
+        Err(error) => report.push(label, Outcome::Failed(error.to_string())),
+    }
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
 async fn check_remote(config: &WorkerConfig, report: &mut Report) {
-    let label = "remote reachability";
     match remote_reachable(&config.remote_url).await {
-        Ok(detail) => report.push(label, Outcome::Ok(detail)),
-        Err(detail) => report.push(label, Outcome::Failed(detail)),
+        Ok(detail) => report.push("remote reachability", Outcome::Ok(detail)),
+        Err(detail) => report.push("remote reachability", Outcome::Failed(detail)),
     }
 }
 
@@ -148,128 +152,202 @@ async fn remote_reachable(remote_url: &url::Url) -> Result<String, String> {
     )
     .await
     {
-        Ok(Ok(_stream)) => Ok(format!("connected to {addr}")),
-        Ok(Err(err)) => Err(format!("connecting to {addr}: {err}")),
+        Ok(Ok(_)) => Ok(format!("connected to {addr}")),
+        Ok(Err(error)) => Err(format!("connecting to {addr}: {error}")),
         Err(_) => Err(format!("timed out connecting to {addr}")),
     }
 }
 
-fn check_executable(pool: &PoolConfig, report: &mut Report) {
-    let label = format!("pool `{}` executable", pool.key);
-    match std::fs::metadata(&pool.executable) {
-        Ok(metadata) if is_executable(&metadata) => {
-            report.push(label, Outcome::Ok(pool.executable.display().to_string()));
-        }
-        Ok(_) => report.push(
-            label,
-            Outcome::Failed(format!("{} is not executable", pool.executable.display())),
-        ),
-        Err(err) => report.push(
-            label,
-            Outcome::Failed(format!("{}: {err}", pool.executable.display())),
-        ),
-    }
-}
-
-#[cfg(unix)]
-fn is_executable(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    metadata.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(metadata: &std::fs::Metadata) -> bool {
-    metadata.is_file()
-}
-
 async fn check_state_dir_writable(pool: &PoolConfig, report: &mut Report) {
     let label = format!("pool `{}` state dir", pool.key);
-    let probe = pool.state_dir.join(".gpq-worker-diagnose-probe");
+    let probe = pool.state_dir.join(".gpq-diagnose-probe");
     match tokio::fs::write(&probe, b"ok").await {
-        Ok(()) => {
-            if let Err(err) = tokio::fs::remove_file(&probe).await {
-                report.push(
-                    label,
-                    Outcome::Failed(format!("wrote probe file but could not remove it: {err}")),
-                );
-                return;
-            }
-            report.push(label, Outcome::Ok(pool.state_dir.display().to_string()));
-        }
-        Err(err) => report.push(
+        Ok(()) => match tokio::fs::remove_file(&probe).await {
+            Ok(()) => report.push(label, Outcome::Ok(pool.state_dir.display().to_string())),
+            Err(error) => report.push(
+                label,
+                Outcome::Failed(format!("wrote probe file but could not remove it: {error}")),
+            ),
+        },
+        Err(error) => report.push(
             label,
-            Outcome::Failed(format!("{}: {err}", pool.state_dir.display())),
+            Outcome::Failed(format!("{}: {error}", pool.state_dir.display())),
         ),
     }
 }
 
 fn check_models(pool: &PoolConfig, report: &mut Report) {
-    for model_path in &pool.model_paths {
-        let label = format!("pool `{}` model {}", pool.key, model_path.display());
-        if !model_path.is_file() && !model_path.is_dir() {
-            report.push(label, Outcome::Failed("path not found".to_owned()));
-            continue;
-        }
-        let Some(expected) = pool.expected_hashes.get(&model_path.display().to_string()) else {
-            report.push(
-                label,
-                Outcome::Ok("present (no expected hash configured)".to_owned()),
-            );
-            continue;
-        };
-        match hash_model_fresh(model_path) {
-            Ok(actual) if actual.to_hex() == *expected => {
-                report.push(label, Outcome::Ok(format!("sha256 {actual} matches")));
-            }
-            Ok(actual) => report.push(
-                label,
-                Outcome::Failed(format!(
-                    "sha256 mismatch: expected {expected}, computed {actual}"
-                )),
+    let label = format!("pool `{}` native model assets", pool.key);
+    match models::scan_models(pool) {
+        Ok((models, image_loras)) => report.push(
+            label,
+            Outcome::Ok(format!(
+                "{} immutable model bundle(s), {} image LoRA(s) hashed",
+                models.len(),
+                image_loras.len()
+            )),
+        ),
+        Err(error) => report.push(label, Outcome::Failed(format!("{error:#}"))),
+    }
+}
+
+async fn check_accelerator(pool: &PoolConfig, config_path: &Path, report: &mut Report) {
+    let label = format!("pool `{}` native accelerator configuration", pool.key);
+    let outcome = match run_accelerator_probe(pool, config_path).await {
+        Ok(detail) => Outcome::Ok(detail),
+        Err(detail) => Outcome::Failed(detail),
+    };
+    report.push(label, outcome);
+}
+
+async fn run_accelerator_probe(pool: &PoolConfig, config_path: &Path) -> Result<String, String> {
+    let executable =
+        std::env::current_exe().map_err(|error| format!("resolving gpq executable: {error}"))?;
+    let args = [
+        OsString::from("infer"),
+        OsString::from("--config"),
+        config_path.as_os_str().to_os_string(),
+        OsString::from("--pool"),
+        pool.key.clone().into(),
+        OsString::from("--diagnose"),
+    ];
+    let process = ManagedProcess::spawn(
+        &executable,
+        &args,
+        &pool.env,
+        &pool.state_dir,
+        DIAGNOSTIC_PROCESS_IDENTITY_FILE,
+    )
+    .await
+    .map_err(|error| format!("spawning isolated device probe: {error:#}"))?;
+    let mut process = process::ProcessGuard::new(process, DIAGNOSTIC_PROCESS_GRACE);
+    #[cfg(windows)]
+    if let Some(error) = process.startup_error().map(str::to_owned) {
+        let cleanup = stop_diagnostic_process(process).await;
+        return Err(format!(
+            "cannot supervise isolated device probe with a Windows Job Object: {error}; cleanup: {}",
+            cleanup.map_or_else(
+                |error| format!("failed: {error}"),
+                |()| "complete".to_owned()
+            )
+        ));
+    }
+    let stdout = process.take_stdout().map(|mut stdout| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut output = String::new();
+            stdout.read_to_string(&mut output).await.map(|_| output)
+        })
+    });
+    let stderr = process.take_stderr().map(|mut stderr| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut output = String::new();
+            stderr.read_to_string(&mut output).await.map(|_| output)
+        })
+    });
+    let (failure, exited) =
+        match tokio::time::timeout(pool.startup_timeout, process.wait_exit()).await {
+            Ok(Ok(status)) if status.success() => (None, true),
+            Ok(Ok(status)) => (
+                Some(format!("isolated device probe exited with {status}")),
+                true,
             ),
-            Err(err) => report.push(label, Outcome::Failed(format!("{err:#}"))),
+            Ok(Err(error)) => (
+                Some(format!("waiting for isolated device probe: {error:#}")),
+                false,
+            ),
+            Err(_) => (
+                Some(format!(
+                    "isolated device probe exceeded {:?}",
+                    pool.startup_timeout
+                )),
+                false,
+            ),
+        };
+    let cleanup = if exited {
+        drop(process.disarm());
+        None
+    } else {
+        Some(stop_diagnostic_process(process).await)
+    };
+    let output = if cleanup.as_ref().is_none_or(Result::is_ok) {
+        collect_child_output(stdout, stderr)
+            .await
+            .map_err(|error| format!("reading isolated device probe output: {error:#}"))?
+    } else {
+        String::new()
+    };
+    match failure {
+        None => Ok(output.trim().to_owned()),
+        Some(failure) => Err(format!(
+            "{failure}; cleanup: {}; {output}",
+            cleanup.unwrap_or(Ok(())).map_or_else(
+                |error| format!("failed: {error}"),
+                |()| "complete".to_owned()
+            )
+        )),
+    }
+}
+
+async fn stop_diagnostic_process(mut process: process::ProcessGuard) -> Result<(), String> {
+    match process.terminate_tree(DIAGNOSTIC_PROCESS_GRACE).await {
+        Ok(()) => {
+            drop(process.disarm());
+            Ok(())
+        }
+        Err(error) => {
+            match tokio::time::timeout(DIAGNOSTIC_PROCESS_GRACE, process.wait_exit()).await {
+                Ok(Ok(_)) => {
+                    drop(process.disarm());
+                    Err(format!(
+                        "{error:#}; child exited, but process-tree cleanup was not verified"
+                    ))
+                }
+                Ok(Err(wait_error)) => Err(format!(
+                    "{error:#}; waiting for child exit failed: {wait_error:#}"
+                )),
+                Err(_) => Err(format!("{error:#}; child did not exit after termination")),
+            }
         }
     }
 }
 
-async fn check_backend(pool: &PoolConfig, report: &mut Report) {
-    let label = format!("pool `{}` backend", pool.key);
-    match backend::build(pool).probe().await {
-        Ok(capabilities) => {
-            let probes = capabilities
-                .probes
-                .iter()
-                .map(|(name, ok)| format!("{name}={ok}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            report.push(
-                label,
-                Outcome::Ok(format!("version {} ({probes})", capabilities.version)),
-            );
-        }
-        Err(err) => report.push(label, Outcome::Failed(err.message)),
-    }
+async fn collect_child_output(
+    stdout: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
+    stderr: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
+) -> anyhow::Result<String> {
+    let stdout = match stdout {
+        Some(stdout) => stdout.await??,
+        None => String::new(),
+    };
+    let stderr = match stderr {
+        Some(stderr) => stderr.await??,
+        None => String::new(),
+    };
+    Ok(if stderr.trim().is_empty() {
+        stdout
+    } else if stdout.trim().is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n{stderr}")
+    })
 }
 
-/// Reports the durably-identified managed process this Worker previously
-/// recorded for `pool`, if any, and whether it is still the process that
-/// owns that identity (ADR 0005: children are identified durably by PID,
-/// start time, and executable identity, never by PID alone). Only reads the
-/// persisted identity file; never spawns anything (`diagnose` does no work).
 async fn check_managed_process(pool: &PoolConfig, report: &mut Report) {
-    let label = format!("pool `{}` managed process", pool.key);
+    let label = format!("pool `{}` managed native child", pool.key);
     let identity_file = pool.state_dir.join(crate::pool::PROCESS_IDENTITY_FILE);
     let identity = match process::read_identity_file(&identity_file).await {
         Ok(Some(identity)) => identity,
         Ok(None) => {
             report.push(
                 label,
-                Outcome::Ok("no managed process recorded yet".to_owned()),
+                Outcome::Ok("no managed child recorded yet".to_owned()),
             );
             return;
         }
-        Err(err) => {
-            report.push(label, Outcome::Failed(format!("{err:#}")));
+        Err(error) => {
+            report.push(label, Outcome::Failed(format!("{error:#}")));
             return;
         }
     };
@@ -277,27 +355,22 @@ async fn check_managed_process(pool: &PoolConfig, report: &mut Report) {
         Ok(Ownership::Owned) => report.push(
             label,
             Outcome::Ok(format!(
-                "pid {} ({}) is running and owned by this worker",
-                identity.pid,
-                identity.executable.display()
+                "pid {} is running and owned by this worker",
+                identity.pid
             )),
         ),
         Ok(Ownership::Foreign) => report.push(
             label,
             Outcome::Failed(format!(
-                "pid {} has been reused by an unrelated process since this worker last recorded it (ADR 0005: never adopted)",
+                "pid {} was reused by an unrelated process",
                 identity.pid
             )),
         ),
         Ok(Ownership::Gone) => report.push(
             label,
-            Outcome::Ok(format!(
-                "pid {} ({}) recorded but no longer running",
-                identity.pid,
-                identity.executable.display()
-            )),
+            Outcome::Ok(format!("pid {} is no longer running", identity.pid)),
         ),
-        Err(err) => report.push(label, Outcome::Failed(format!("{err:#}"))),
+        Err(error) => report.push(label, Outcome::Failed(format!("{error:#}"))),
     }
 }
 
@@ -306,25 +379,14 @@ mod tests {
     use super::{Outcome, Report};
 
     #[test]
-    fn all_ok_is_true_only_when_every_check_passed() {
-        let mut report = Report::default();
-        assert!(report.all_ok(), "an empty report has no failing checks");
-
-        report.push("a", Outcome::Ok("fine".to_owned()));
-        assert!(report.all_ok());
-
-        report.push("b", Outcome::Failed("broken".to_owned()));
+    fn report_renders_failures_without_credentials() {
+        let report = Report {
+            checks: vec![super::CheckResult {
+                label: "credential".to_owned(),
+                outcome: Outcome::Failed("not enrolled".to_owned()),
+            }],
+        };
         assert!(!report.all_ok());
-    }
-
-    #[test]
-    fn render_marks_each_outcome() {
-        let mut report = Report::default();
-        report.push("a", Outcome::Ok("fine".to_owned()));
-        report.push("b", Outcome::Failed("broken".to_owned()));
-
-        let rendered = report.render();
-        assert!(rendered.contains("[ok]   a: fine"));
-        assert!(rendered.contains("[fail] b: broken"));
+        assert_eq!(report.render(), "[fail] credential: not enrolled\n");
     }
 }

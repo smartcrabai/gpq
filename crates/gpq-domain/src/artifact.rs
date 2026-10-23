@@ -57,17 +57,15 @@ impl MediaKind {
 state_enum! {
     /// Where an Artifact's bytes live.
     ///
-    /// ADR 0008: Native input Artifacts use S3-compatible ephemeral placement so
-    /// queued work can move between Workers; outputs choose Worker-local relay or
-    /// the same ephemeral placement; synchronous `OpenAI` image inputs may be relayed
-    /// inline while the request stays connected.
+    /// `RemoteLocal` stores input bytes on Remote when object storage is absent;
+    /// `WorkerLocal` stores output bytes until Remote requests delivery.
     ArtifactPlacement {
         /// Object storage reachable by Remote and Workers through presigned URLs.
         ObjectStore => "object_store",
         /// The producing Worker's crash-recoverable state directory.
         WorkerLocal => "worker_local",
-        /// Bytes carried inline through the connected request; never persisted.
-        InlineRelay => "inline_relay",
+        /// Persistent input bytes stored by Remote.
+        RemoteLocal => "remote_local",
     }
 }
 
@@ -212,7 +210,7 @@ mod tests {
     fn only_object_store_needs_s3() {
         assert!(ArtifactPlacement::ObjectStore.requires_object_store());
         assert!(!ArtifactPlacement::WorkerLocal.requires_object_store());
-        assert!(!ArtifactPlacement::InlineRelay.requires_object_store());
+        assert!(!ArtifactPlacement::RemoteLocal.requires_object_store());
     }
 
     #[test]

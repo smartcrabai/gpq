@@ -1,18 +1,21 @@
 //! Worker Credential persistence (ADR 0009).
 //!
 //! The Worker Credential is a revocable machine credential distinct from the
-//! Tenant Master Key. It is stored in platform-appropriate secret storage:
-//! Keychain on macOS, Credential Manager on Windows, systemd credentials
-//! (read-only, `$CREDENTIALS_DIRECTORY/gpq-worker`) for Linux services managed
-//! by systemd, and otherwise an owner-only mode-0600 file under the Worker's
-//! state directory. The credential is never written to configuration,
-//! command arguments, environment variables, logs, or diagnostics, and unsafe
-//! file permissions or ownership stop startup rather than being silently
-//! accepted.
+//! Tenant Master Key. It is stored in platform-appropriate secret storage by
+//! default: Keychain on macOS, Credential Manager on Windows, systemd
+//! credentials (read-only, `$CREDENTIALS_DIRECTORY/gpq-worker`) for Linux
+//! services managed by systemd, and otherwise an owner-only mode-0600 file
+//! under the Worker's state directory. Unix configurations may explicitly
+//! select that owner-only file store on any supported platform.
+//! The credential is never written to command arguments, environment
+//! variables, logs, or diagnostics, and unsafe file permissions or ownership
+//! stop startup rather than being silently accepted.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+
+use crate::config::CredentialStorage;
 
 /// Reverse-DNS service identity used for platform secret stores, matching the
 /// launchd label used elsewhere (ADR 0020).
@@ -23,32 +26,32 @@ const SERVICE_NAME: &str = "ai.smartcrab.gpq-worker";
 /// `LoadCredential=` entries. Its presence means credential storage for this
 /// process is systemd-managed and read-only.
 const SYSTEMD_CREDENTIALS_DIR_VAR: &str = "CREDENTIALS_DIRECTORY";
-/// Platform-appropriate persistence for one Worker's revocable credential.
+/// Configured persistence for one Worker's revocable credential.
 pub struct CredentialStore {
     worker_name: String,
     state_dir: PathBuf,
+    storage: CredentialStorage,
 }
 
 impl CredentialStore {
-    /// Creates a store scoped to `worker_name`, falling back to a file under
-    /// `state_dir` on platforms without a native secret store.
+    /// Creates a store scoped to `worker_name` and the configured storage mode.
     #[must_use]
-    pub fn new(worker_name: &str, state_dir: &Path) -> Self {
+    pub fn new(worker_name: &str, state_dir: &Path, storage: CredentialStorage) -> Self {
         Self {
             worker_name: worker_name.to_owned(),
             state_dir: state_dir.to_owned(),
+            storage,
         }
     }
 
-    /// Path of the owner-only fallback credential file under `state_dir`,
-    /// used only on non-systemd, non-macOS Unix — and referenced by
-    /// `service::install` as the source for systemd's `LoadCredential=`.
+    /// Path of the owner-only credential file under `state_dir`, used when
+    /// file storage is selected and as systemd's `LoadCredential=` source.
     #[must_use]
     pub fn fallback_path(&self) -> PathBuf {
         self.state_dir.join("worker-credential")
     }
 
-    /// Persists `credential` to this platform's secret store.
+    /// Persists `credential` to the configured secret store.
     ///
     /// Refuses to run while systemd owns the credential directory for this
     /// process: that directory is populated by `LoadCredential=` and is
@@ -57,14 +60,17 @@ impl CredentialStore {
     /// # Errors
     ///
     /// Returns an error if systemd owns the credential directory, or if the
-    /// platform secret store (or fallback file write) fails.
+    /// configured secret store (or fallback file write) fails.
     pub fn store(&self, credential: &str) -> anyhow::Result<()> {
         if std::env::var_os(SYSTEMD_CREDENTIALS_DIR_VAR).is_some() {
             bail!(
                 "credential directory for `{}` is managed by systemd (LoadCredential=); \
-                 run `gpq-worker enroll` outside the service unit",
+                 run `gpq worker enroll` outside the service unit",
                 self.worker_name
             );
+        }
+        if self.storage == CredentialStorage::File {
+            return self.store_file(credential);
         }
         self.store_platform(credential)
     }
@@ -87,6 +93,11 @@ impl CredentialStore {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     fn store_platform(&self, credential: &str) -> anyhow::Result<()> {
+        self.store_file(credential)
+    }
+
+    #[cfg(unix)]
+    fn store_file(&self, credential: &str) -> anyhow::Result<()> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -108,6 +119,11 @@ impl CredentialStore {
         std::fs::rename(&tmp_path, &path).with_context(|| format!("installing {}", path.display()))
     }
 
+    #[cfg(not(unix))]
+    fn store_file(&self, _credential: &str) -> anyhow::Result<()> {
+        bail!("file credential storage is supported only on Unix")
+    }
+
     /// Loads the stored credential, returning `None` when enrollment has not
     /// run yet.
     ///
@@ -119,6 +135,9 @@ impl CredentialStore {
     /// Returns an error if a stored credential exists but cannot be read, or
     /// if a fallback file's permissions or ownership are unsafe.
     pub fn load(&self) -> anyhow::Result<Option<String>> {
+        if self.storage == CredentialStorage::File {
+            return self.load_file();
+        }
         if let Some(dir) = std::env::var_os(SYSTEMD_CREDENTIALS_DIR_VAR) {
             let path = Path::new(&dir).join(crate::service::SERVICE_NAME);
             return match std::fs::read_to_string(&path) {
@@ -144,7 +163,17 @@ impl CredentialStore {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     fn load_platform(&self) -> anyhow::Result<Option<String>> {
+        self.load_file()
+    }
+
+    #[cfg(unix)]
+    fn load_file(&self) -> anyhow::Result<Option<String>> {
         load_unix_file_credential(&self.fallback_path())
+    }
+
+    #[cfg(not(unix))]
+    fn load_file(&self) -> anyhow::Result<Option<String>> {
+        bail!("file credential storage is supported only on Unix")
     }
 
     /// Deletes the stored credential, if any. Used by `service uninstall` and
@@ -152,10 +181,13 @@ impl CredentialStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if the platform secret store (or fallback file
+    /// Returns an error if the configured secret store (or fallback file
     /// removal) fails for a reason other than the entry already being
     /// absent.
     pub fn delete(&self) -> anyhow::Result<()> {
+        if self.storage == CredentialStorage::File {
+            return self.delete_file();
+        }
         self.delete_platform()
     }
 
@@ -171,6 +203,11 @@ impl CredentialStore {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     fn delete_platform(&self) -> anyhow::Result<()> {
+        self.delete_file()
+    }
+
+    #[cfg(unix)]
+    fn delete_file(&self) -> anyhow::Result<()> {
         match std::fs::remove_file(self.fallback_path()) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -178,10 +215,18 @@ impl CredentialStore {
         }
     }
 
+    #[cfg(not(unix))]
+    fn delete_file(&self) -> anyhow::Result<()> {
+        bail!("file credential storage is supported only on Unix")
+    }
+
     /// Human-readable backend name for `diagnose` output. Never includes the
     /// credential itself.
     #[must_use]
-    pub fn describe() -> &'static str {
+    pub fn describe(storage: CredentialStorage) -> &'static str {
+        if storage == CredentialStorage::File {
+            return "owner-only file (mode 0600)";
+        }
         if std::env::var_os(SYSTEMD_CREDENTIALS_DIR_VAR).is_some() {
             return "systemd LoadCredential (read-only)";
         }
@@ -204,7 +249,7 @@ impl CredentialStore {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 fn load_unix_file_credential(path: &Path) -> anyhow::Result<Option<String>> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -239,18 +284,20 @@ fn load_unix_file_credential(path: &Path) -> anyhow::Result<Option<String>> {
 }
 
 /// Returns the current process's real user id.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 fn current_uid() -> u32 {
     // SAFETY: `getuid(2)` takes no arguments, has no preconditions, and
     // cannot fail.
     unsafe { libc::getuid() }
 }
 
-#[cfg(all(test, unix, not(target_os = "macos")))]
+#[cfg(all(test, unix))]
 mod tests {
     use std::io::Write as _;
 
-    use super::load_unix_file_credential;
+    use super::{CredentialStore, load_unix_file_credential};
+
+    use crate::config::CredentialStorage;
 
     fn write_with_mode(path: &std::path::Path, contents: &str, mode: u32) {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -314,6 +361,33 @@ mod tests {
             panic!("expected a 0644 file to be refused");
         };
         assert!(err.to_string().contains("expected mode 0600"));
+    }
+
+    #[test]
+    fn explicit_file_storage_round_trips_with_private_permissions() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let store = CredentialStore::new("worker", dir.path(), CredentialStorage::File);
+        store
+            .store("s3cret")
+            .unwrap_or_else(|err| panic!("store credential: {err}"));
+
+        let path = store.fallback_path();
+        let metadata = std::fs::metadata(&path)
+            .unwrap_or_else(|err| panic!("metadata {}: {err}", path.display()));
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(
+            store
+                .load()
+                .unwrap_or_else(|err| panic!("load credential: {err}"))
+                .as_deref(),
+            Some("s3cret")
+        );
+        store
+            .delete()
+            .unwrap_or_else(|err| panic!("delete credential: {err}"));
+        assert!(!path.exists());
     }
 
     // Ownership mismatch cannot be exercised without a second uid available

@@ -11,26 +11,27 @@ use buffa::EnumValue;
 use connectrpc::{ConnectError, Encodable, ErrorCode, Response, ServiceResult, ServiceStream};
 use futures::StreamExt;
 use gpq_domain::{
-    ArtifactId, ArtifactManifest, ArtifactPlacement, AttemptId, BackendKind, ContentHash,
-    ExecutionLimits, FailureKind, GenerationId, GenerationState, MediaKind, Modality,
-    RetryDecision, TenantId, WorkerId,
+    ArtifactManifest, ArtifactPlacement, AttemptId, ContentHash, FailureKind, GenerationId,
+    GenerationState, LoraSelection, MediaKind, ModelAssetRole, ModelFamily, ModelManifest,
+    RetryDecision, SamplingPreset, ShapeLimits, TenantId, WorkerId,
 };
 use gpq_proto::gpq::v1::{
     ArtifactManifest as ProtoArtifactManifest, ArtifactPlacement as ProtoArtifactPlacement,
-    BackendKind as ProtoBackendKind, FailureKind as ProtoFailureKind, MediaKind as ProtoMediaKind,
+    FailureKind as ProtoFailureKind, MediaKind as ProtoMediaKind, ModelAdvertisement,
+    ModelAssetRole as ProtoModelAssetRole, ModelFamily as ProtoModelFamily,
+    ModelManifest as ProtoModelManifest, ShapeLimits as ProtoShapeLimits,
 };
 use gpq_proto::gpq::worker::v1::__buffa::oneof::worker_message;
 use gpq_proto::gpq::worker::v1::{
     AttemptFailure, AttemptOutput, AttemptProgress, AttemptResult, AttemptRunning,
-    AttemptTokenDelta, CancelAcknowledged, CancelRequest, CapabilityReport, DiscardOutput,
-    HandshakeAck, Heartbeat, LeaseRejected, PoolAdvertisement, RemoteMessage, WorkerMessage,
-    WorkerSessionService,
+    CancelAcknowledged, CancelRequest, CapabilityReport, DiscardOutput, HandshakeAck, Heartbeat,
+    LeaseRejected, PoolAdvertisement, RemoteMessage, WorkerMessage, WorkerSessionService,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::db::workers::PoolUpsert;
+use crate::db::workers::{PoolUpsert, lock_current_worker_credential};
 use crate::events::GenerationEvent;
 use crate::scheduler::leased_output_key;
 use crate::state::AppState;
@@ -69,67 +70,14 @@ fn parse_uuid_id<T>(text: &str, wrap: impl FnOnce(uuid::Uuid) -> T) -> Result<T,
         .map_err(|err| sqlx::Error::Decode(Box::new(err)))
 }
 
-/// Absolute one-shot download URL for an output Artifact, built from the
-/// configured public base URL (ADR 0006, ADR 0008). Falls back to the bare
-/// relative path on a URL-join failure so a misconfigured base URL never
-/// blocks reporting that the output exists.
-fn output_download_url(state: &AppState, artifact_id: ArtifactId) -> String {
-    crate::artifacts::download_url(&state.config.public_base_url, artifact_id).map_or_else(
-        |err| {
-            tracing::error!(%err, %artifact_id, "failed to build absolute artifact download url");
-            crate::artifacts::download_path(artifact_id)
-        },
-        |url| url.to_string(),
-    )
-}
-
 impl WorkerSessionService for SessionApi {
     async fn session(
         &self,
         ctx: connectrpc::RequestContext,
-        requests: connectrpc::InboundStream<WorkerMessage>,
+        mut requests: connectrpc::InboundStream<WorkerMessage>,
     ) -> ServiceResult<ServiceStream<impl Encodable<RemoteMessage> + Send + use<>>> {
-        let Some(token) = crate::auth::bearer_token(ctx.headers()) else {
-            return Err(unauthenticated());
-        };
-        let Some((tenant_id, worker_id)) = self
-            .state
-            .db
-            .authenticate_worker(token)
-            .await
-            .map_err(internal)?
-        else {
-            return Err(unauthenticated());
-        };
-
-        let mut requests = requests;
-        let Some(first) = requests.next().await else {
-            return Err(ConnectError::new(
-                ErrorCode::InvalidArgument,
-                "empty session stream",
-            ));
-        };
-        let first = first?.to_owned_message();
-        let Some(worker_message::Message::Handshake(handshake)) = first.message else {
-            return Err(ConnectError::new(
-                ErrorCode::InvalidArgument,
-                "first message on a Session must be a Handshake",
-            ));
-        };
-        let handshake = *handshake;
-
-        // ADR 0004: a major protocol mismatch is rejected explicitly.
-        if !gpq_proto::protocol_compatible(handshake.protocol_major) {
-            return Err(ConnectError::new(
-                ErrorCode::FailedPrecondition,
-                format!(
-                    "worker protocol major {} is incompatible with remote major {}",
-                    handshake.protocol_major,
-                    gpq_proto::PROTOCOL_MAJOR
-                ),
-            ));
-        }
-
+        let (tenant_id, worker_id, credential_hash) =
+            authenticate_session(&self.state, ctx, &mut requests).await?;
         let session_id = uuid::Uuid::now_v7().to_string();
 
         let mut tx = self
@@ -138,6 +86,12 @@ impl WorkerSessionService for SessionApi {
             .begin_tenant(tenant_id)
             .await
             .map_err(internal)?;
+        if !lock_current_worker_credential(&mut tx, tenant_id, worker_id, &credential_hash)
+            .await
+            .map_err(internal)?
+        {
+            return Err(unauthenticated());
+        }
         // ADR 0003: a reconnecting Worker resumes Attempts still leased to it.
         let resumable = crate::db::attempts::live_for_worker(&mut tx, tenant_id, worker_id)
             .await
@@ -184,12 +138,75 @@ impl WorkerSessionService for SessionApi {
             ));
         }
 
-        let state = self.state.clone();
-        spawn_session_pump(state, tenant_id, worker_id, requests, outbound_tx, guard);
+        spawn_session_pump(
+            self.state.clone(),
+            tenant_id,
+            worker_id,
+            credential_hash,
+            requests,
+            outbound_tx,
+            guard,
+        );
 
         let outbound_stream = ReceiverStream::new(outbound_rx).map(Ok::<_, ConnectError>);
         Response::stream_ok(outbound_stream)
     }
+}
+
+/// Authenticates the Worker and consumes the stream's required protocol handshake.
+async fn authenticate_session(
+    state: &AppState,
+    ctx: connectrpc::RequestContext,
+    requests: &mut connectrpc::InboundStream<WorkerMessage>,
+) -> Result<(TenantId, WorkerId, Vec<u8>), ConnectError> {
+    let Some(token) = crate::auth::bearer_token(ctx.headers()) else {
+        return Err(unauthenticated());
+    };
+    let Some((tenant_id, worker_id)) = state
+        .db
+        .authenticate_worker(token)
+        .await
+        .map_err(internal)?
+    else {
+        return Err(unauthenticated());
+    };
+    let credential_hash = state.db.hasher().hash(token);
+
+    let Some(first) = requests.next().await else {
+        return Err(ConnectError::new(
+            ErrorCode::InvalidArgument,
+            "empty session stream",
+        ));
+    };
+    let first = first?.to_owned_message();
+    let Some(worker_message::Message::Handshake(handshake)) = first.message else {
+        return Err(ConnectError::new(
+            ErrorCode::InvalidArgument,
+            "first message on a Session must be a Handshake",
+        ));
+    };
+    let handshake = *handshake;
+
+    // ADR 0004: a major protocol mismatch is rejected explicitly.
+    if !gpq_proto::protocol_compatible(handshake.protocol_major) {
+        return Err(ConnectError::new(
+            ErrorCode::FailedPrecondition,
+            format!(
+                "worker protocol major {} is incompatible with remote major {}",
+                handshake.protocol_major,
+                gpq_proto::PROTOCOL_MAJOR
+            ),
+        ));
+    }
+    Ok((tenant_id, worker_id, credential_hash))
+}
+
+/// The authenticated Worker identity and credential hash bound to one session.
+/// Stateful handlers still lock and revalidate the credential per message.
+struct AuthenticatedWorker<'a> {
+    tenant_id: TenantId,
+    worker_id: WorkerId,
+    credential_hash: &'a [u8],
 }
 
 /// Spawns [`run_inbound_pump`] for a newly established session, clearing
@@ -206,20 +223,19 @@ fn spawn_session_pump(
     state: AppState,
     tenant_id: TenantId,
     worker_id: WorkerId,
+    credential_hash: Vec<u8>,
     requests: connectrpc::InboundStream<WorkerMessage>,
     outbound_tx: mpsc::Sender<RemoteMessage>,
     guard: crate::registry::SessionGuard,
 ) {
     tokio::spawn(async move {
         let _guard = guard;
-        Box::pin(run_inbound_pump(
-            &state,
+        let worker = AuthenticatedWorker {
             tenant_id,
             worker_id,
-            requests,
-            &outbound_tx,
-        ))
-        .await;
+            credential_hash: &credential_hash,
+        };
+        Box::pin(run_inbound_pump(&state, &worker, requests, &outbound_tx)).await;
         if let Ok(mut tx) = state.db.begin_tenant(tenant_id).await {
             let _ = crate::db::workers::clear_session(&mut tx, tenant_id, worker_id).await;
             let _ = tx.commit().await;
@@ -236,15 +252,14 @@ fn spawn_session_pump(
 /// simply returning and letting the caller's `outbound_tx` drop.
 async fn run_inbound_pump(
     state: &AppState,
-    tenant_id: TenantId,
-    worker_id: WorkerId,
+    worker: &AuthenticatedWorker<'_>,
     mut requests: connectrpc::InboundStream<WorkerMessage>,
     outbound: &mpsc::Sender<RemoteMessage>,
 ) {
     loop {
         let item = tokio::select! {
             () = state.shutdown.cancelled() => {
-                tracing::info!(%worker_id, "ending worker session for remote's graceful shutdown");
+                tracing::info!(worker_id = %worker.worker_id, "ending worker session for remote's graceful shutdown");
                 break;
             }
             item = requests.next() => item,
@@ -258,76 +273,144 @@ async fn run_inbound_pump(
         let Some(message) = item.to_owned_message().message else {
             continue;
         };
-        tracing::trace!(%worker_id, kind = worker_message_kind(&message), "dispatching worker message");
-        match message {
-            worker_message::Message::Handshake(_) => {
-                tracing::warn!(%worker_id, "ignoring a duplicate Handshake on an established session");
-            }
-            worker_message::Message::CapabilityReport(report) => {
-                handle_capability_report(state, tenant_id, worker_id, *report).await;
-            }
-            worker_message::Message::Heartbeat(heartbeat) => {
-                if !handle_heartbeat(state, tenant_id, worker_id, *heartbeat, outbound).await {
-                    break;
-                }
-            }
-            worker_message::Message::AttemptRunning(running) => {
-                log_on_err(
-                    "AttemptRunning",
-                    try_handle_attempt_running(state, tenant_id, *running),
-                )
-                .await;
-            }
-            worker_message::Message::AttemptProgress(progress) => {
-                log_on_err(
-                    "AttemptProgress",
-                    try_handle_attempt_progress(state, tenant_id, *progress),
-                )
-                .await;
-            }
-            worker_message::Message::AttemptTokenDelta(delta) => {
-                log_on_err(
-                    "AttemptTokenDelta",
-                    try_handle_token_delta(state, tenant_id, *delta),
-                )
-                .await;
-            }
-            worker_message::Message::AttemptResult(result) => {
-                log_on_err(
-                    "AttemptResult",
-                    // Boxed: `try_handle_attempt_result`'s future is large
-                    // and would otherwise be embedded inline in this
-                    // dispatch loop's own generated future.
-                    Box::pin(try_handle_attempt_result(
-                        state, tenant_id, worker_id, *result, outbound,
-                    )),
-                )
-                .await;
-            }
-            worker_message::Message::AttemptFailure(failure) => {
-                log_on_err(
-                    "AttemptFailure",
-                    // Box the large future so it does not inflate the dispatch loop.
-                    Box::pin(try_handle_attempt_failure(state, tenant_id, *failure)),
-                )
-                .await;
-            }
-            worker_message::Message::CancelAcknowledged(ack) => {
-                log_on_err(
-                    "CancelAcknowledged",
-                    try_handle_cancel_acknowledged(state, tenant_id, *ack),
-                )
-                .await;
-            }
-            worker_message::Message::LeaseRejected(rejected) => {
-                log_on_err(
-                    "LeaseRejected",
-                    try_handle_lease_rejected(state, tenant_id, *rejected),
-                )
-                .await;
-            }
+        tracing::trace!(worker_id = %worker.worker_id, kind = worker_message_kind(&message), "dispatching worker message");
+        if !dispatch_worker_message(state, worker, message, outbound).await {
+            break;
         }
     }
+}
+
+/// Dispatches one already-authenticated message; `false` ends the session
+/// only when a heartbeat finds that the Worker Credential has been revoked.
+async fn dispatch_attempt_result(
+    state: &AppState,
+    worker: &AuthenticatedWorker<'_>,
+    result: AttemptResult,
+    outbound: &mpsc::Sender<RemoteMessage>,
+) {
+    log_on_err(
+        "AttemptResult",
+        Box::pin(try_handle_attempt_result(
+            state,
+            worker.tenant_id,
+            worker.worker_id,
+            worker.credential_hash,
+            result,
+            outbound,
+        )),
+    )
+    .await;
+}
+
+async fn dispatch_attempt_failure(
+    state: &AppState,
+    worker: &AuthenticatedWorker<'_>,
+    failure: AttemptFailure,
+) {
+    log_on_err(
+        "AttemptFailure",
+        Box::pin(try_handle_attempt_failure(
+            state,
+            worker.tenant_id,
+            worker.worker_id,
+            worker.credential_hash,
+            failure,
+        )),
+    )
+    .await;
+}
+
+async fn dispatch_worker_message(
+    state: &AppState,
+    worker: &AuthenticatedWorker<'_>,
+    message: worker_message::Message,
+    outbound: &mpsc::Sender<RemoteMessage>,
+) -> bool {
+    match message {
+        worker_message::Message::Handshake(_) => {
+            tracing::warn!(worker_id = %worker.worker_id, "ignoring a duplicate Handshake on an established session");
+        }
+        worker_message::Message::CapabilityReport(report) => {
+            handle_capability_report(
+                state,
+                worker.tenant_id,
+                worker.worker_id,
+                worker.credential_hash,
+                *report,
+            )
+            .await;
+        }
+        worker_message::Message::Heartbeat(heartbeat) => {
+            return handle_heartbeat(
+                state,
+                worker.tenant_id,
+                worker.worker_id,
+                worker.credential_hash,
+                *heartbeat,
+                outbound,
+            )
+            .await;
+        }
+        worker_message::Message::AttemptRunning(running) => {
+            log_on_err(
+                "AttemptRunning",
+                try_handle_attempt_running(
+                    state,
+                    worker.tenant_id,
+                    worker.worker_id,
+                    worker.credential_hash,
+                    *running,
+                ),
+            )
+            .await;
+        }
+        worker_message::Message::AttemptProgress(progress) => {
+            log_on_err(
+                "AttemptProgress",
+                try_handle_attempt_progress(
+                    state,
+                    worker.tenant_id,
+                    worker.worker_id,
+                    worker.credential_hash,
+                    *progress,
+                ),
+            )
+            .await;
+        }
+        worker_message::Message::AttemptResult(result) => {
+            dispatch_attempt_result(state, worker, *result, outbound).await;
+        }
+        worker_message::Message::AttemptFailure(failure) => {
+            dispatch_attempt_failure(state, worker, *failure).await;
+        }
+        worker_message::Message::CancelAcknowledged(ack) => {
+            log_on_err(
+                "CancelAcknowledged",
+                try_handle_cancel_acknowledged(
+                    state,
+                    worker.tenant_id,
+                    worker.worker_id,
+                    worker.credential_hash,
+                    *ack,
+                ),
+            )
+            .await;
+        }
+        worker_message::Message::LeaseRejected(rejected) => {
+            log_on_err(
+                "LeaseRejected",
+                try_handle_lease_rejected(
+                    state,
+                    worker.tenant_id,
+                    worker.worker_id,
+                    worker.credential_hash,
+                    *rejected,
+                ),
+            )
+            .await;
+        }
+    }
+    true
 }
 
 /// Stable label naming each `WorkerMessage` variant (ADR 0004), used for
@@ -340,7 +423,6 @@ fn worker_message_kind(message: &worker_message::Message) -> &'static str {
         worker_message::Message::Heartbeat(_) => "heartbeat",
         worker_message::Message::AttemptRunning(_) => "attempt_running",
         worker_message::Message::AttemptProgress(_) => "attempt_progress",
-        worker_message::Message::AttemptTokenDelta(_) => "attempt_token_delta",
         worker_message::Message::AttemptResult(_) => "attempt_result",
         worker_message::Message::AttemptFailure(_) => "attempt_failure",
         worker_message::Message::CancelAcknowledged(_) => "cancel_acknowledged",
@@ -429,49 +511,6 @@ async fn publish_state_event(
         .await
 }
 
-/// Releases the underlying bytes of Artifacts returned by
-/// `db::artifacts::delete_inputs_for_generation`, called at every
-/// Worker-reported Generation terminal transition (ADR 0008: "Inputs are
-/// deleted when the Generation terminates"). Object-store objects are
-/// deleted directly; inline-relay buffers are dropped from memory. Inputs
-/// never use Worker-local placement, so that case only logs a warning.
-/// Best-effort: a failure here only leaks bytes behind an already-deleted
-pub(crate) async fn release_deleted_inputs(
-    artifacts: &crate::artifacts::ArtifactService,
-    rows: Vec<crate::db::artifacts::ArtifactRow>,
-) {
-    for row in rows {
-        match row.placement {
-            ArtifactPlacement::ObjectStore => {
-                let Some(key) = row.object_key.as_deref() else {
-                    tracing::warn!(artifact_id = %row.id, "object-store input artifact is missing its object_key");
-                    continue;
-                };
-                if let Err(err) = artifacts.delete(key).await {
-                    tracing::warn!(%err, artifact_id = %row.id, "failed to delete object-store input artifact");
-                }
-            }
-            ArtifactPlacement::InlineRelay => artifacts.discard_local(row.id),
-            ArtifactPlacement::WorkerLocal => {
-                tracing::warn!(artifact_id = %row.id, "unexpected worker-local input artifact at terminal cleanup");
-            }
-        }
-    }
-}
-
-/// Converts a proto `BackendKind` to the domain type, `None` for unset or
-/// unrecognized values.
-fn domain_backend_kind(value: EnumValue<ProtoBackendKind>) -> Option<BackendKind> {
-    match value {
-        EnumValue::Known(ProtoBackendKind::BACKEND_KIND_LLAMA_CPP) => Some(BackendKind::LlamaCpp),
-        EnumValue::Known(ProtoBackendKind::BACKEND_KIND_MLX_DSPARK) => Some(BackendKind::MlxDspark),
-        EnumValue::Known(ProtoBackendKind::BACKEND_KIND_COMFYUI) => Some(BackendKind::ComfyUi),
-        EnumValue::Known(ProtoBackendKind::BACKEND_KIND_UNSPECIFIED) | EnumValue::Unknown(_) => {
-            None
-        }
-    }
-}
-
 /// Converts a proto `ArtifactPlacement` to the domain type, `None` for unset
 /// or unrecognized values.
 fn domain_placement(value: EnumValue<ProtoArtifactPlacement>) -> Option<ArtifactPlacement> {
@@ -482,8 +521,8 @@ fn domain_placement(value: EnumValue<ProtoArtifactPlacement>) -> Option<Artifact
         EnumValue::Known(ProtoArtifactPlacement::ARTIFACT_PLACEMENT_WORKER_LOCAL) => {
             Some(ArtifactPlacement::WorkerLocal)
         }
-        EnumValue::Known(ProtoArtifactPlacement::ARTIFACT_PLACEMENT_INLINE_RELAY) => {
-            Some(ArtifactPlacement::InlineRelay)
+        EnumValue::Known(ProtoArtifactPlacement::ARTIFACT_PLACEMENT_REMOTE_LOCAL) => {
+            Some(ArtifactPlacement::RemoteLocal)
         }
         EnumValue::Known(ProtoArtifactPlacement::ARTIFACT_PLACEMENT_UNSPECIFIED)
         | EnumValue::Unknown(_) => None,
@@ -551,9 +590,128 @@ fn domain_manifest_from_proto(proto: &ProtoArtifactManifest) -> Option<ArtifactM
     })
 }
 
-/// Builds a [`PoolUpsert`] from one advertised Pool, `None` if its backend
-/// kind is unset or unrecognized (the Pool is dropped from this report; a
-/// later report with a recognized kind will pick it back up).
+/// Converts a proto `ModelFamily` to the domain type, `None` for unset or
+/// unrecognized values.
+fn domain_model_family(value: EnumValue<ProtoModelFamily>) -> Option<ModelFamily> {
+    match value {
+        EnumValue::Known(ProtoModelFamily::MODEL_FAMILY_QWEN_IMAGE21) => {
+            Some(ModelFamily::QwenImage21)
+        }
+        EnumValue::Known(ProtoModelFamily::MODEL_FAMILY_MINIMAX_H3) => Some(ModelFamily::MinimaxH3),
+        EnumValue::Known(ProtoModelFamily::MODEL_FAMILY_UNSPECIFIED) | EnumValue::Unknown(_) => {
+            None
+        }
+    }
+}
+
+/// Converts a proto `ModelAssetRole` to the domain type, `None` for unset or
+/// unrecognized values.
+fn domain_asset_role(value: EnumValue<ProtoModelAssetRole>) -> Option<ModelAssetRole> {
+    match value {
+        EnumValue::Known(ProtoModelAssetRole::MODEL_ASSET_ROLE_DIFFUSION) => {
+            Some(ModelAssetRole::Diffusion)
+        }
+        EnumValue::Known(ProtoModelAssetRole::MODEL_ASSET_ROLE_TEXT_ENCODER) => {
+            Some(ModelAssetRole::TextEncoder)
+        }
+        EnumValue::Known(ProtoModelAssetRole::MODEL_ASSET_ROLE_VISION_ENCODER) => {
+            Some(ModelAssetRole::VisionEncoder)
+        }
+        EnumValue::Known(ProtoModelAssetRole::MODEL_ASSET_ROLE_VAE) => Some(ModelAssetRole::Vae),
+        EnumValue::Known(ProtoModelAssetRole::MODEL_ASSET_ROLE_AUDIO_VAE) => {
+            Some(ModelAssetRole::AudioVae)
+        }
+        EnumValue::Known(ProtoModelAssetRole::MODEL_ASSET_ROLE_UNSPECIFIED)
+        | EnumValue::Unknown(_) => None,
+    }
+}
+
+/// Converts an advertised Model manifest to the domain type. `None` for any
+/// unset or unrecognized enum, a malformed or duplicate asset, a malformed
+/// `LoRA` hash, or a missing sampling preset: the whole manifest is then not
+/// registered, because a partially understood manifest cannot hash to its
+/// advertised content identity.
+fn model_manifest_from_proto(proto: &ProtoModelManifest) -> Option<ModelManifest> {
+    let family = domain_model_family(proto.family)?;
+    let mut assets = BTreeMap::new();
+    for asset in &proto.assets {
+        let role = domain_asset_role(asset.role)?;
+        let sha256 = asset.sha256.parse::<ContentHash>().ok()?;
+        if assets.insert(role, sha256).is_some() {
+            return None;
+        }
+    }
+    let default_loras = proto
+        .default_loras
+        .iter()
+        .map(|lora| {
+            Some(LoraSelection {
+                sha256: lora.sha256.parse::<ContentHash>().ok()?,
+                scale: lora.scale,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let sampling = proto.sampling.as_option()?;
+    Some(ModelManifest {
+        family,
+        assets,
+        default_loras,
+        sampling: SamplingPreset {
+            steps: sampling.steps,
+            cfg_scale: sampling.cfg_scale,
+            sigmas: sampling.sigmas.clone(),
+        },
+    })
+}
+
+/// Converts an advertised Pool's shape limits; an absent message means
+/// every limit is unknown (no bound).
+fn shape_limits_from_proto(limits: Option<&ProtoShapeLimits>) -> ShapeLimits {
+    match limits {
+        Some(limits) => ShapeLimits {
+            max_image_pixels: limits.max_image_pixels,
+            max_video_pixels: limits.max_video_pixels,
+            max_video_frames: limits.max_video_frames,
+            max_steps: limits.max_steps,
+        },
+        None => ShapeLimits::default(),
+    }
+}
+
+/// The Model Versions a Pool advertised that Remote may trust: each manifest
+/// must be valid and must hash (ADR 0012's canonical hash) to the content
+/// hash it was advertised under. A mismatch is logged and dropped, so the
+/// Pool still registers its other models but never offers the bad one.
+fn verified_models(advertisements: &[ModelAdvertisement]) -> Vec<(ContentHash, ModelManifest)> {
+    advertisements
+        .iter()
+        .filter_map(|advertisement| {
+            let advertised = advertisement.version_sha256.parse::<ContentHash>().ok()?;
+            let manifest = advertisement
+                .manifest
+                .as_option()
+                .and_then(model_manifest_from_proto)?;
+            let computed = manifest.canonical_hash().ok();
+            if computed != Some(advertised) {
+                tracing::warn!(
+                    advertised = %advertisement.version_sha256,
+                    "dropping advertised model: manifest does not hash to its advertised version"
+                );
+                return None;
+            }
+            if let Err(error) = manifest.validate() {
+                tracing::warn!(%error, %advertised, "dropping advertised model: manifest is not runnable");
+                return None;
+            }
+            Some((advertised, manifest))
+        })
+        .collect()
+}
+
+/// Builds a [`PoolUpsert`] from one advertised Pool plus the verified Model
+/// Versions it carries (which the caller registers before upserting), `None`
+/// if its accelerator is unset (the Pool is dropped from this report; a later
+/// report with a named accelerator will pick it back up).
 ///
 /// The Worker's own busy/idle slot tally is deliberately NOT carried over:
 /// `device_pools.free_slots` is generated from Remote's `claimed_slots`
@@ -561,45 +719,42 @@ fn domain_manifest_from_proto(proto: &ProtoArtifactManifest) -> Option<ArtifactM
 /// capability report is a stale snapshot that predates leases already
 /// dispatched, so letting it set free slots would resurrect claims the
 /// scheduler has spent and double-book the Pool.
-fn pool_upsert_from_proto(pool: &PoolAdvertisement) -> Option<PoolUpsert> {
-    let backend_kind = domain_backend_kind(pool.backend_kind)?;
-    let total_slots = u32::try_from(pool.slots.len()).unwrap_or(u32::MAX);
+fn pool_upsert_from_proto(
+    pool: &PoolAdvertisement,
+) -> Option<(PoolUpsert, Vec<(ContentHash, ModelManifest)>)> {
+    if pool.accelerator.is_empty() {
+        return None;
+    }
+    let models = verified_models(&pool.models);
+    let model_hashes = models.iter().map(|(hash, _)| *hash).collect();
     let resident_model_sha256 = if pool.resident_model_sha256.is_empty() {
         None
     } else {
-        pool.resident_model_sha256.parse().ok()
+        pool.resident_model_sha256.parse::<ContentHash>().ok()
     };
-    let accelerator_memory_bytes =
-        (pool.accelerator_memory_bytes != 0).then_some(pool.accelerator_memory_bytes);
-    let custom_nodes = pool
-        .custom_nodes
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    let probes = pool
-        .probes
-        .iter()
-        .map(|(key, value)| (key.clone(), *value))
-        .collect();
-    let model_versions = pool
-        .model_sha256
+    // Explicit presence on the wire: absent stays `None`, present zero stays `Some(0)`.
+    let accelerator_memory_bytes = pool.accelerator_memory_bytes;
+    let image_loras = pool
+        .image_lora_sha256
         .iter()
         .filter_map(|hex| hex.parse::<ContentHash>().ok())
         .collect();
 
-    Some(PoolUpsert {
+    let upsert = PoolUpsert {
         pool_key: pool.pool_id.clone(),
-        backend_kind,
-        backend_version: pool.backend_version.clone(),
+        accelerator: pool.accelerator.clone(),
+        accelerator_version: pool.backend_version.clone(),
         ready: pool.ready,
         unready_reason: pool.unready_reason.clone(),
-        total_slots,
+        total_slots: u32::try_from(pool.slots.len()).unwrap_or(u32::MAX),
         resident_model_sha256,
         accelerator_memory_bytes,
-        custom_nodes,
-        probes,
-        model_versions,
-    })
+        probes: BTreeMap::new(),
+        model_hashes,
+        image_loras,
+        shape_limits: shape_limits_from_proto(pool.shape_limits.as_option()),
+    };
+    Some((upsert, models))
 }
 
 /// Awaits `fut`, logging any error as a warning naming `label` and
@@ -618,9 +773,12 @@ async fn handle_capability_report(
     state: &AppState,
     tenant_id: TenantId,
     worker_id: WorkerId,
+    credential_hash: &[u8],
     report: CapabilityReport,
 ) {
-    if let Err(err) = try_handle_capability_report(state, tenant_id, worker_id, report).await {
+    if let Err(err) =
+        try_handle_capability_report(state, tenant_id, worker_id, credential_hash, report).await
+    {
         tracing::warn!(%err, %worker_id, "failed to process CapabilityReport");
     }
 }
@@ -629,34 +787,27 @@ async fn try_handle_capability_report(
     state: &AppState,
     tenant_id: TenantId,
     worker_id: WorkerId,
+    credential_hash: &[u8],
     report: CapabilityReport,
 ) -> sqlx::Result<()> {
-    let pools: Vec<PoolUpsert> = report
-        .pools
-        .iter()
-        .filter_map(pool_upsert_from_proto)
-        .collect();
-
-    // ADR 0012: LLM Model Versions are automatically registered by content
-    // hash. ComfyUI's on-disk models are referenced through Tenant-registered
-    // Workflow Versions for registered workflows; raw prompts carry no catalog
-    // model identity, so they are not auto-registered here.
-    let llm_versions: Vec<(ContentHash, Modality, ExecutionLimits)> = report
-        .pools
-        .iter()
-        .filter(|pool| {
-            domain_backend_kind(pool.backend_kind)
-                .is_some_and(|kind| kind.satisfies(BackendKind::LlamaCpp))
-        })
-        .flat_map(|pool| pool.model_sha256.iter())
-        .filter_map(|hex| hex.parse::<ContentHash>().ok())
-        .map(|hash| (hash, Modality::Llm, ExecutionLimits::default()))
-        .collect();
+    let mut pools = Vec::with_capacity(report.pools.len());
+    // ADR 0012: Model Versions are registered by content hash before any
+    // Pool that names them is upserted, so every `model_hashes` entry refers
+    // to a registered version.
+    let mut versions = BTreeMap::new();
+    for pool in &report.pools {
+        if let Some((upsert, models)) = pool_upsert_from_proto(pool) {
+            pools.push(upsert);
+            versions.extend(models);
+        }
+    }
+    let versions: Vec<(ContentHash, ModelManifest)> = versions.into_iter().collect();
 
     let mut tx = state.db.begin_tenant(tenant_id).await?;
-    if !llm_versions.is_empty() {
-        crate::db::workers::register_model_versions(&mut tx, tenant_id, &llm_versions).await?;
+    if !lock_current_worker_credential(&mut tx, tenant_id, worker_id, credential_hash).await? {
+        return Ok(());
     }
+    crate::db::catalog::register_model_versions(&mut tx, tenant_id, &versions).await?;
     crate::db::workers::upsert_pools(&mut tx, tenant_id, worker_id, &pools).await?;
     crate::db::workers::touch_last_seen(&mut tx, tenant_id, worker_id).await?;
     tx.commit().await?;
@@ -674,10 +825,20 @@ async fn handle_heartbeat(
     state: &AppState,
     tenant_id: TenantId,
     worker_id: WorkerId,
+    credential_hash: &[u8],
     heartbeat: Heartbeat,
     outbound: &mpsc::Sender<RemoteMessage>,
 ) -> bool {
-    match try_handle_heartbeat(state, tenant_id, worker_id, heartbeat, outbound).await {
+    match try_handle_heartbeat(
+        state,
+        tenant_id,
+        worker_id,
+        credential_hash,
+        heartbeat,
+        outbound,
+    )
+    .await
+    {
         Ok(still_live) => {
             if !still_live {
                 tracing::warn!(%worker_id, "ending worker session: credential revoked mid-session");
@@ -701,6 +862,7 @@ async fn try_handle_heartbeat(
     state: &AppState,
     tenant_id: TenantId,
     worker_id: WorkerId,
+    credential_hash: &[u8],
     heartbeat: Heartbeat,
     outbound: &mpsc::Sender<RemoteMessage>,
 ) -> sqlx::Result<bool> {
@@ -713,7 +875,7 @@ async fn try_handle_heartbeat(
 
     let now = state.db.now().await?;
     let mut tx = state.db.begin_tenant(tenant_id).await?;
-    if !crate::db::workers::is_enrolled_and_unrevoked(&mut tx, tenant_id, worker_id).await? {
+    if !lock_current_worker_credential(&mut tx, tenant_id, worker_id, credential_hash).await? {
         return Ok(false);
     }
     let not_renewed =
@@ -749,16 +911,22 @@ fn not_renewed_cancel_messages(not_renewed: &[AttemptId]) -> Vec<RemoteMessage> 
 async fn try_handle_attempt_running(
     state: &AppState,
     tenant_id: TenantId,
+    worker_id: WorkerId,
+    credential_hash: &[u8],
     running: AttemptRunning,
 ) -> anyhow::Result<()> {
     let attempt_id = parse_uuid_id(&running.attempt_id, AttemptId::from_uuid)?;
     let now = state.db.now().await?;
     let mut tx = state.db.begin_tenant(tenant_id).await?;
-    if !crate::db::attempts::mark_running(&mut tx, tenant_id, attempt_id, now).await? {
+    if !lock_current_worker_credential(&mut tx, tenant_id, worker_id, credential_hash).await? {
+        return Ok(());
+    }
+    if !crate::db::attempts::mark_running(&mut tx, tenant_id, attempt_id, worker_id, now).await? {
         return Ok(());
     }
     let Some(generation_id) =
-        crate::db::attempts::generation_id_of(&mut tx, tenant_id, attempt_id).await?
+        crate::db::attempts::generation_id_of(&mut tx, tenant_id, attempt_id, worker_id, now)
+            .await?
     else {
         return Ok(());
     };
@@ -775,19 +943,25 @@ async fn try_handle_attempt_running(
 async fn try_handle_attempt_progress(
     state: &AppState,
     tenant_id: TenantId,
+    worker_id: WorkerId,
+    credential_hash: &[u8],
     progress: AttemptProgress,
 ) -> anyhow::Result<()> {
     let attempt_id = parse_uuid_id(&progress.attempt_id, AttemptId::from_uuid)?;
     let Some(progress) = progress.progress.into_option() else {
         return Ok(());
     };
+    let now = state.db.now().await?;
     let mut tx = state.db.begin_tenant(tenant_id).await?;
+    if !lock_current_worker_credential(&mut tx, tenant_id, worker_id, credential_hash).await? {
+        return Ok(());
+    }
     let Some(generation_id) =
-        crate::db::attempts::generation_id_of(&mut tx, tenant_id, attempt_id).await?
+        crate::db::attempts::generation_id_of(&mut tx, tenant_id, attempt_id, worker_id, now)
+            .await?
     else {
         return Ok(());
     };
-    let now = state.db.now().await?;
     crate::db::generations::record_progress(
         &mut tx,
         tenant_id,
@@ -820,35 +994,14 @@ async fn try_handle_attempt_progress(
     Ok(())
 }
 
-async fn try_handle_token_delta(
-    state: &AppState,
-    tenant_id: TenantId,
-    delta: AttemptTokenDelta,
-) -> sqlx::Result<()> {
-    // ADR 0008: token deltas are forwarded live and never persisted.
-    let attempt_id = parse_uuid_id(&delta.attempt_id, AttemptId::from_uuid)?;
-    let mut tx = state.db.begin_tenant(tenant_id).await?;
-    let Some(generation_id) =
-        crate::db::attempts::generation_id_of(&mut tx, tenant_id, attempt_id).await?
-    else {
-        return Ok(());
-    };
-    tx.commit().await?;
-
-    state
-        .events
-        .publish(generation_id, GenerationEvent::Token { text: delta.text });
-    Ok(())
-}
-
 /// What a result-commitment outcome means for the Worker's reported outputs
-/// (ADR 0003, ADR 0005): only the Attempt whose result became the
-/// Generation's Accepted Result keeps them; a stale lease, a duplicate, or
-/// an already-terminal Generation all mean the Worker must delete
-/// everything it tried to commit. Pure so the outcome-to-reply mapping is
-/// unit-testable without a database.
+/// (ADR 0003, ADR 0005): the accepted Attempt keeps its outputs, and a replay
+/// preserves only delivery tokens already referenced by that Accepted Result.
+/// Stale attempts, different Attempts after acceptance, and terminal
+/// Generations discard the unreferenced outputs.
 enum ResultReply {
     Accepted(GenerationId),
+    AcceptedReplay,
     Discard,
 }
 
@@ -857,6 +1010,7 @@ fn classify_result_outcome(outcome: crate::db::generations::AcceptOutcome) -> Re
         crate::db::generations::AcceptOutcome::Accepted(generation_id) => {
             ResultReply::Accepted(generation_id)
         }
+        crate::db::generations::AcceptOutcome::AcceptedReplay => ResultReply::AcceptedReplay,
         crate::db::generations::AcceptOutcome::StaleLease
         | crate::db::generations::AcceptOutcome::AlreadyAccepted
         | crate::db::generations::AcceptOutcome::Terminal => ResultReply::Discard,
@@ -865,44 +1019,14 @@ fn classify_result_outcome(outcome: crate::db::generations::AcceptOutcome) -> Re
 
 /// Which Worker an output Artifact's placement should be attributed to
 /// (ADR 0008): only Worker-local placement needs the owning Worker recorded,
-/// for that Worker's own startup reconciliation scan; object-store and
-/// inline-relay outputs are addressed by key/token instead.
+/// for that Worker's own startup reconciliation scan; object-store outputs
+/// are addressed by key instead.
 fn output_placement_worker(placement: ArtifactPlacement, worker_id: WorkerId) -> Option<WorkerId> {
     matches!(placement, ArtifactPlacement::WorkerLocal).then_some(worker_id)
 }
 
-fn rewrite_comfy_output_pointer(
-    outputs: &mut serde_json::Value,
-    pointer: &str,
-    artifact_id: ArtifactId,
-) -> anyhow::Result<()> {
-    let Some(entry) = outputs
-        .pointer_mut(pointer)
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        anyhow::bail!("raw ComfyUI output pointer does not identify an object");
-    };
-    let Some(filename) = entry.get("filename").and_then(serde_json::Value::as_str) else {
-        anyhow::bail!("raw ComfyUI output pointer has no filename");
-    };
-    entry.insert(
-        "filename".to_owned(),
-        serde_json::Value::String(format!("{artifact_id}_{filename}")),
-    );
-    entry.insert(
-        "subfolder".to_owned(),
-        serde_json::Value::String(String::new()),
-    );
-    entry.insert(
-        "type".to_owned(),
-        serde_json::Value::String("output".to_owned()),
-    );
-    Ok(())
-}
-
 /// Loads the authenticated Tenant's mutable settings, for the output-size
-/// gate in [`try_handle_attempt_result`] (mirrors `openai::tenant_settings`,
-/// but returns `sqlx::Result` to match this file's other DB helpers).
+/// gate in [`try_handle_attempt_result`].
 async fn load_tenant_settings(
     state: &AppState,
     tenant_id: TenantId,
@@ -923,8 +1047,7 @@ async fn load_tenant_settings(
 /// normal (permanent) Attempt failure, same as any other invalid input.
 async fn reject_oversized_outputs(
     state: &AppState,
-    tenant_id: TenantId,
-    worker_id: WorkerId,
+    worker: &AuthenticatedWorker<'_>,
     attempt_id: AttemptId,
     outputs: &[AttemptOutput],
     settings: &gpq_domain::TenantSettings,
@@ -941,7 +1064,7 @@ async fn reject_oversized_outputs(
             || !manifest.fits_within(settings.max_output_artifact_bytes)
         {
             tracing::warn!(
-                %worker_id,
+                worker_id = %worker.worker_id,
                 %attempt_id,
                 size_bytes = manifest.size_bytes,
                 limit_bytes = settings.max_output_artifact_bytes,
@@ -949,11 +1072,13 @@ async fn reject_oversized_outputs(
             );
             settle_attempt_failure(
                 state,
-                tenant_id,
+                worker,
                 attempt_id,
-                FailureKind::InvalidInput,
-                "output artifact exceeds the tenant's configured max_output_artifact_bytes",
-                false,
+                crate::db::attempts::FailureDetails {
+                    kind: FailureKind::InvalidInput,
+                    message: "output artifact exceeds the tenant's configured max_output_artifact_bytes",
+                    worker_retry_hint: false,
+                },
                 now,
             )
             .await?;
@@ -962,191 +1087,21 @@ async fn reject_oversized_outputs(
     }
     Ok(false)
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ComfyViewRef {
-    filename: String,
-    subfolder: String,
-    kind: String,
-}
-
-fn validate_comfy_view_ref(view: &ComfyViewRef) -> Result<(), String> {
-    if view.filename.is_empty()
-        || view.filename == "."
-        || view.filename == ".."
-        || view.filename.chars().any(|c| matches!(c, '/' | '\\' | ':'))
-        || view.filename.starts_with('/')
-        || view.filename.starts_with('\\')
-        || std::path::Path::new(&view.filename).is_absolute()
-    {
-        return Err("raw ComfyUI output filename is not a basename".to_owned());
-    }
-    if view.subfolder.starts_with('/')
-        || view.subfolder.starts_with('\\')
-        || view.subfolder.contains('\\')
-        || view.subfolder.contains(':')
-        || (!view.subfolder.is_empty()
-            && view
-                .subfolder
-                .split('/')
-                .any(|part| part.is_empty() || part == "." || part == ".."))
-    {
-        return Err("raw ComfyUI output subfolder is not relative".to_owned());
-    }
-    if !matches!(view.kind.as_str(), "input" | "output" | "temp") {
-        return Err("raw ComfyUI output type is unsupported".to_owned());
-    }
-    Ok(())
-}
-
-fn parse_comfy_view_ref(value: &serde_json::Value) -> Result<ComfyViewRef, String> {
-    let Some(object) = value.as_object() else {
-        return Err("raw ComfyUI file reference is not an object".to_owned());
-    };
-    let Some(filename) = object.get("filename").and_then(serde_json::Value::as_str) else {
-        return Err("raw ComfyUI file reference has no string filename".to_owned());
-    };
-    let subfolder = match object.get("subfolder") {
-        None => String::new(),
-        Some(value) => value
-            .as_str()
-            .ok_or_else(|| "raw ComfyUI file reference has an invalid subfolder".to_owned())?
-            .to_owned(),
-    };
-    let kind = match object.get("type") {
-        None => "output".to_owned(),
-        Some(value) => value
-            .as_str()
-            .ok_or_else(|| "raw ComfyUI file reference has an invalid type".to_owned())?
-            .to_owned(),
-    };
-    let view = ComfyViewRef {
-        filename: filename.to_owned(),
-        subfolder,
-        kind,
-    };
-    validate_comfy_view_ref(&view)?;
-    Ok(view)
-}
-
-fn collect_comfy_view_refs(
-    value: &serde_json::Value,
-    pointer: &str,
-    refs: &mut BTreeMap<String, ComfyViewRef>,
-) -> Result<(), String> {
-    match value {
-        serde_json::Value::Object(object) => {
-            if object.contains_key("filename") {
-                refs.insert(pointer.to_owned(), parse_comfy_view_ref(value)?);
-            }
-            for (key, child) in object {
-                let escaped = key.replace('~', "~0").replace('/', "~1");
-                collect_comfy_view_refs(child, &format!("{pointer}/{escaped}"), refs)?;
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for (index, child) in items.iter().enumerate() {
-                collect_comfy_view_refs(child, &format!("{pointer}/{index}"), refs)?;
-            }
-        }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => {}
-    }
-    Ok(())
-}
-
-fn validate_comfy_result(
-    generation: &crate::db::generations::GenerationRow,
-    result: &AttemptResult,
-) -> Result<Option<(serde_json::Value, Vec<String>)>, String> {
-    let raw = generation.target_kind == "comfy_prompt";
-    if !raw {
-        if !result.comfy_outputs_json.is_empty()
-            || !result.comfy_output_node_ids.is_empty()
-            || result
-                .outputs
-                .iter()
-                .any(|output| !output.comfy_output_pointers.is_empty())
-        {
-            return Err("non-raw result carries ComfyUI metadata".to_owned());
-        }
-        return Ok(None);
-    }
-    if result.comfy_outputs_json.is_empty() || result.comfy_outputs_json.len() > 2 * 1024 * 1024 {
-        return Err("raw ComfyUI outputs JSON is missing or exceeds the 2 MiB limit".to_owned());
-    }
-    let outputs: serde_json::Value = serde_json::from_slice(&result.comfy_outputs_json)
-        .map_err(|error| format!("raw ComfyUI outputs JSON is invalid: {error}"))?;
-    if !outputs.is_object() {
-        return Err("raw ComfyUI outputs JSON is not an object".to_owned());
-    }
-    let mut node_ids = BTreeSet::new();
-    for node_id in &result.comfy_output_node_ids {
-        if !node_ids.insert(node_id) {
-            return Err("raw ComfyUI output node ids contain duplicates".to_owned());
-        }
-    }
-    let mut refs = BTreeMap::new();
-    collect_comfy_view_refs(&outputs, "", &mut refs)?;
-    let mut covered = BTreeSet::new();
-    for output in &result.outputs {
-        if output
-            .manifest
-            .as_option()
-            .and_then(domain_manifest_from_proto)
-            .is_none()
-        {
-            return Err("raw ComfyUI result has an invalid artifact manifest".to_owned());
-        }
-        if domain_placement(output.placement) != Some(ArtifactPlacement::WorkerLocal)
-            || !output.object_key.is_empty()
-            || output.delivery_token.is_empty()
-            || output.comfy_output_pointers.is_empty()
-        {
-            return Err("raw ComfyUI result has an invalid artifact placement".to_owned());
-        }
-        let mut output_view = None;
-        for pointer in &output.comfy_output_pointers {
-            if !covered.insert(pointer) {
-                return Err("raw ComfyUI result repeats an output pointer".to_owned());
-            }
-            let Some(view) = refs.get(pointer) else {
-                return Err("raw ComfyUI result points outside history outputs".to_owned());
-            };
-            if output_view.is_some_and(|seen| seen != view) {
-                return Err("raw ComfyUI artifact pointers refer to different files".to_owned());
-            }
-            output_view = Some(view);
-        }
-    }
-    if covered.len() != refs.len() {
-        return Err(
-            "raw ComfyUI result does not cover every file reference exactly once".to_owned(),
-        );
-    }
-    Ok(Some((outputs, result.comfy_output_node_ids.clone())))
-}
 
 /// Records every output Artifact reported for an accepted result, deletes
 /// the now-terminal Generation's input Artifacts (ADR 0008: "Inputs are
 /// deleted when the Generation terminates"), commits `tx`, then publishes
 /// the resulting state transition and per-output availability events
-/// (ADR 0003, ADR 0005). Split out of [`try_handle_attempt_result`]'s
-/// `ResultReply::Accepted` arm to keep that function under the line-count
-/// lint; behavior is unchanged.
+/// (ADR 0003, ADR 0005).
 ///
 /// # Errors
 ///
 /// Returns an error if an object-store output's reported `object_key`
-/// does not match the key Remote presigned for this Generation
-/// (ADR 0008's confused-deputy prevention), or if recording an output,
-/// deleting inputs, reading the post-commit Generation snapshot,
-/// committing `tx`, or publishing the state transition fails.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "this helper mirrors the accepted-result transaction inputs and is kept separate from the session dispatcher"
-)]
+/// does not match the attempt-specific key Remote presigned for this Attempt
+/// (ADR 0008's confused-deputy prevention), if an output reports a placement
+/// Remote does not accept as an output, or if recording an output, deleting
+/// inputs, reading the post-commit Generation snapshot, committing `tx`, or
+/// publishing the state transition fails.
 async fn record_accepted_result(
     state: &AppState,
     tenant_id: TenantId,
@@ -1154,12 +1109,9 @@ async fn record_accepted_result(
     attempt_id: AttemptId,
     generation_id: GenerationId,
     outputs: &[AttemptOutput],
-    comfy_outputs: Option<&serde_json::Value>,
-    comfy_output_node_ids: &[String],
     mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
 ) -> anyhow::Result<()> {
-    let mut output_ids = Vec::new();
-    let mut public_outputs = comfy_outputs.cloned();
+    let mut output_count = 0_usize;
     for output in outputs {
         let Some(manifest_proto) = output.manifest.as_option() else {
             continue;
@@ -1171,34 +1123,47 @@ async fn record_accepted_result(
             continue;
         };
 
-        // Confused-deputy prevention (ADR 0008): the one legitimate
-        // object-store key for this Generation's output is the one
-        // `scheduler::leased_output_key` presigned and handed to
-        // the Worker; anything else — including an empty key —
-        // would let a Worker Credential redirect Remote's own S3
-        // credentials at an arbitrary key, across Tenants.
-        let object_key = if placement == ArtifactPlacement::ObjectStore {
-            let expected = leased_output_key(tenant_id, generation_id);
-            if output.object_key != expected {
-                tracing::warn!(
-                    %worker_id,
-                    reported_key = %output.object_key,
-                    expected_key = %expected,
-                    "rejecting AttemptResult: reported object_key does not match the key Remote leased"
-                );
+        // Confused-deputy prevention (ADR 0008): this Attempt's object-store
+        // key is the one Remote presigned and handed to its Worker; anything
+        // else — including an empty key — would let a Worker Credential
+        // redirect Remote's own S3 credentials at an arbitrary key, across
+        // Tenants. Only object-store outputs carry a key at all.
+        let object_key = match placement {
+            ArtifactPlacement::ObjectStore => {
+                let expected = leased_output_key(tenant_id, generation_id, attempt_id);
+                if output.object_key != expected {
+                    tracing::warn!(
+                        %worker_id,
+                        reported_key = %output.object_key,
+                        expected_key = %expected,
+                        "rejecting AttemptResult: reported object_key does not match the key Remote leased"
+                    );
+                    anyhow::bail!(
+                        "malformed AttemptResult: object_key does not match the leased key for generation {generation_id}"
+                    );
+                }
+                Some(output.object_key.as_str())
+            }
+            ArtifactPlacement::WorkerLocal => {
+                if !output.object_key.is_empty() {
+                    anyhow::bail!(
+                        "malformed AttemptResult: worker_local output carries an object_key"
+                    );
+                }
+                None
+            }
+            ArtifactPlacement::RemoteLocal => {
                 anyhow::bail!(
-                    "malformed AttemptResult: object_key does not match the leased key for generation {generation_id}"
+                    "malformed AttemptResult: {} is not an output placement",
+                    placement.as_str()
                 );
             }
-            Some(output.object_key.as_str())
-        } else {
-            (!output.object_key.is_empty()).then_some(output.object_key.as_str())
         };
         let delivery_token =
             (!output.delivery_token.is_empty()).then_some(output.delivery_token.as_str());
         let placement_worker = output_placement_worker(placement, worker_id);
 
-        let row = crate::db::artifacts::record_output(
+        crate::db::artifacts::record_output(
             &mut tx,
             tenant_id,
             generation_id,
@@ -1208,26 +1173,9 @@ async fn record_accepted_result(
             placement,
             object_key,
             delivery_token,
-            &output.comfy_output_pointers,
         )
         .await?;
-        if let Some(outputs) = public_outputs.as_mut() {
-            for pointer in &output.comfy_output_pointers {
-                rewrite_comfy_output_pointer(outputs, pointer, row.id)?;
-            }
-        }
-        output_ids.push(row.id);
-    }
-
-    if let Some(outputs) = public_outputs.as_ref() {
-        crate::db::comfy::update_outputs(
-            &mut tx,
-            tenant_id,
-            generation_id,
-            outputs,
-            comfy_output_node_ids,
-        )
-        .await?;
+        output_count += 1;
     }
 
     // ADR 0008: "Inputs are deleted when the Generation terminates".
@@ -1241,111 +1189,48 @@ async fn record_accepted_result(
     if let Some(snapshot) = snapshot {
         publish_state_event(state, tenant_id, generation_id, &snapshot).await?;
     }
-    release_deleted_inputs(&state.artifacts, deleted_inputs).await;
-    for artifact_id in output_ids {
-        tracing::info!(
-            %generation_id,
-            %artifact_id,
-            download_url = %output_download_url(state, artifact_id),
-            "output artifact available"
-        );
+    crate::expiry::release_deleted_inputs(&state.artifacts, tenant_id, deleted_inputs).await;
+    for _ in 0..output_count {
         state.events.publish(generation_id, GenerationEvent::Output);
     }
     state.scheduler.wake_tenant(tenant_id);
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "result acceptance, metadata validation, and stale-output cleanup form one transaction state machine"
-)]
 async fn try_handle_attempt_result(
     state: &AppState,
     tenant_id: TenantId,
     worker_id: WorkerId,
+    credential_hash: &[u8],
     result: AttemptResult,
     outbound: &mpsc::Sender<RemoteMessage>,
 ) -> anyhow::Result<()> {
     let attempt_id = parse_uuid_id(&result.attempt_id, AttemptId::from_uuid)?;
     let now = state.db.now().await?;
-    let usage = result.usage.as_option().map(|usage| {
-        (
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.total_tokens,
-        )
-    });
 
     // Bound every output manifest against the Tenant's configured size
-    // limit before opening the result-commit transaction below; see
-    // `reject_oversized_outputs` for why.
+    // limit before opening the result-commit transaction below.
     let settings = load_tenant_settings(state, tenant_id).await?;
-    if reject_oversized_outputs(
-        state,
+    let worker = AuthenticatedWorker {
         tenant_id,
         worker_id,
-        attempt_id,
-        &result.outputs,
-        &settings,
-        now,
-    )
-    .await?
+        credential_hash,
+    };
+    if reject_oversized_outputs(state, &worker, attempt_id, &result.outputs, &settings, now).await?
     {
         return Ok(());
     }
 
     let mut tx = state.db.begin_tenant(tenant_id).await?;
-    let generation_id =
-        crate::db::attempts::generation_id_of(&mut tx, tenant_id, attempt_id).await?;
-    let generation = match generation_id {
-        Some(generation_id) => {
-            crate::db::generations::get(&mut tx, tenant_id, generation_id).await?
-        }
-        None => None,
-    };
-    let outcome = crate::db::generations::accept_result(
-        &mut tx,
-        tenant_id,
-        attempt_id,
-        worker_id,
-        &result.output_text,
-        usage,
-        now,
-    )
-    .await?;
+    if !lock_current_worker_credential(&mut tx, tenant_id, worker_id, credential_hash).await? {
+        return Ok(());
+    }
+    let outcome =
+        crate::db::generations::accept_result(&mut tx, tenant_id, attempt_id, worker_id, now)
+            .await?;
 
     match classify_result_outcome(outcome) {
         ResultReply::Accepted(generation_id) => {
-            let metadata = generation
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("accepted attempt has no generation row"))
-                .and_then(|generation| {
-                    validate_comfy_result(generation, &result)
-                        .map_err(|message| anyhow::anyhow!("malformed raw result: {message}"))
-                });
-            let metadata = match metadata {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    tx.rollback().await?;
-                    settle_attempt_failure(
-                        state,
-                        tenant_id,
-                        attempt_id,
-                        FailureKind::InvalidInput,
-                        &error.to_string(),
-                        false,
-                        now,
-                    )
-                    .await?;
-                    discard_worker_outputs(outbound, &result.outputs, "malformed result metadata")
-                        .await;
-                    return Ok(());
-                }
-            };
-            let comfy_outputs = metadata.as_ref().map(|(outputs, _)| outputs);
-            let comfy_output_node_ids = metadata
-                .as_ref()
-                .map_or(&[][..], |(_, node_ids)| node_ids.as_slice());
             record_accepted_result(
                 state,
                 tenant_id,
@@ -1353,32 +1238,40 @@ async fn try_handle_attempt_result(
                 attempt_id,
                 generation_id,
                 &result.outputs,
-                comfy_outputs,
-                comfy_output_node_ids,
                 tx,
             )
             .await?;
         }
+        ResultReply::AcceptedReplay => {
+            let accepted_tokens: HashSet<String> = sqlx::query_scalar(
+                "SELECT delivery_token FROM artifacts \
+                 WHERE tenant_id = $1 AND attempt_id = $2 AND direction = 'output' \
+                    AND delivery_token IS NOT NULL",
+            )
+            .bind(tenant_id.as_uuid())
+            .bind(attempt_id.as_uuid())
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .collect();
+            tx.commit().await?;
+            discard_worker_outputs(
+                outbound,
+                &result.outputs,
+                &accepted_tokens,
+                "result replay included unreferenced outputs",
+            )
+            .await;
+        }
         ResultReply::Discard => {
             tx.commit().await?;
-            // The Worker must delete every output it tried to commit
-            // (ADR 0003, ADR 0008). Remote never recorded these Artifacts, so
-            // there is no Remote-assigned artifact_id to hand back; the
-            // Worker correlates by its own delivery_token.
-            for output in &result.outputs {
-                let discard = RemoteMessage {
-                    message: DiscardOutput {
-                        artifact_id: String::new(),
-                        delivery_token: output.delivery_token.clone(),
-                        reason: "result rejected: stale lease, duplicate, or terminal generation"
-                            .to_owned(),
-                        ..Default::default()
-                    }
-                    .into(),
-                    ..Default::default()
-                };
-                let _ = outbound.send(discard).await;
-            }
+            discard_worker_outputs(
+                outbound,
+                &result.outputs,
+                &HashSet::new(),
+                "result rejected: stale lease, duplicate, or terminal generation",
+            )
+            .await;
         }
     }
     Ok(())
@@ -1387,10 +1280,11 @@ async fn try_handle_attempt_result(
 async fn discard_worker_outputs(
     outbound: &mpsc::Sender<RemoteMessage>,
     outputs: &[AttemptOutput],
+    accepted_tokens: &HashSet<String>,
     reason: &str,
 ) {
     for output in outputs {
-        if output.delivery_token.is_empty() {
+        if output.delivery_token.is_empty() || accepted_tokens.contains(&output.delivery_token) {
             continue;
         }
         let discard = RemoteMessage {
@@ -1417,21 +1311,28 @@ async fn discard_worker_outputs(
 /// than reported by the Worker.
 async fn settle_attempt_failure(
     state: &AppState,
-    tenant_id: TenantId,
+    worker: &AuthenticatedWorker<'_>,
     attempt_id: AttemptId,
-    failure_kind: FailureKind,
-    message: &str,
-    worker_retry_hint: bool,
+    failure: crate::db::attempts::FailureDetails<'_>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<()> {
-    let mut tx = state.db.begin_tenant(tenant_id).await?;
-    let outcome = crate::db::attempts::record_failure(
+    let mut tx = state.db.begin_tenant(worker.tenant_id).await?;
+    if !lock_current_worker_credential(
         &mut tx,
-        tenant_id,
+        worker.tenant_id,
+        worker.worker_id,
+        worker.credential_hash,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let outcome = crate::db::attempts::record_failure_for_worker(
+        &mut tx,
+        worker.tenant_id,
         attempt_id,
-        failure_kind,
-        message,
-        worker_retry_hint,
+        worker.worker_id,
+        failure,
         now,
     )
     .await?;
@@ -1443,56 +1344,64 @@ async fn settle_attempt_failure(
     // once the retry policy has actually settled the Generation `Failed`;
     // `Requeue` leaves it live for another Attempt.
     let deleted_inputs = if decision == RetryDecision::Fail {
-        crate::db::artifacts::delete_inputs_for_generation(&mut tx, tenant_id, generation_id)
+        crate::db::artifacts::delete_inputs_for_generation(&mut tx, worker.tenant_id, generation_id)
             .await?
     } else {
         Vec::new()
     };
-    let snapshot = generation_snapshot(&mut tx, tenant_id, generation_id).await?;
+    let snapshot = generation_snapshot(&mut tx, worker.tenant_id, generation_id).await?;
     tx.commit().await?;
 
     if let Some(snapshot) = snapshot {
-        publish_state_event(state, tenant_id, generation_id, &snapshot).await?;
+        publish_state_event(state, worker.tenant_id, generation_id, &snapshot).await?;
     }
-    release_deleted_inputs(&state.artifacts, deleted_inputs).await;
-    state.scheduler.wake_tenant(tenant_id);
+    crate::expiry::release_deleted_inputs(&state.artifacts, worker.tenant_id, deleted_inputs).await;
+    state.scheduler.wake_tenant(worker.tenant_id);
     Ok(())
 }
 
 async fn try_handle_attempt_failure(
     state: &AppState,
     tenant_id: TenantId,
+    worker_id: WorkerId,
+    credential_hash: &[u8],
     failure: AttemptFailure,
 ) -> anyhow::Result<()> {
     let attempt_id = parse_uuid_id(&failure.attempt_id, AttemptId::from_uuid)?;
     let Some(failure) = failure.failure.into_option() else {
         return Ok(());
     };
-    let failure_kind = domain_failure_kind(failure.kind).unwrap_or(FailureKind::Internal);
+    let failure = crate::db::attempts::FailureDetails {
+        kind: domain_failure_kind(failure.kind).unwrap_or(FailureKind::Internal),
+        message: &failure.message,
+        worker_retry_hint: failure.worker_retry_hint,
+    };
     let now = state.db.now().await?;
-    settle_attempt_failure(
-        state,
+    let worker = AuthenticatedWorker {
         tenant_id,
-        attempt_id,
-        failure_kind,
-        &failure.message,
-        failure.worker_retry_hint,
-        now,
-    )
-    .await
+        worker_id,
+        credential_hash,
+    };
+    settle_attempt_failure(state, &worker, attempt_id, failure, now).await
 }
 
 async fn try_handle_cancel_acknowledged(
     state: &AppState,
     tenant_id: TenantId,
+    worker_id: WorkerId,
+    credential_hash: &[u8],
     ack: CancelAcknowledged,
 ) -> anyhow::Result<()> {
     let attempt_id = parse_uuid_id(&ack.attempt_id, AttemptId::from_uuid)?;
     let now = state.db.now().await?;
 
     let mut tx = state.db.begin_tenant(tenant_id).await?;
+    if !lock_current_worker_credential(&mut tx, tenant_id, worker_id, credential_hash).await? {
+        return Ok(());
+    }
     let generation_id =
-        crate::db::attempts::acknowledge_cancel(&mut tx, tenant_id, attempt_id, now).await?;
+        crate::db::attempts::acknowledge_cancel(&mut tx, tenant_id, attempt_id, worker_id, now)
+            .await?;
     let mut deleted_inputs = Vec::new();
     let snapshot = match generation_id {
         Some(generation_id) => {
@@ -1512,13 +1421,15 @@ async fn try_handle_cancel_acknowledged(
     if let (Some(generation_id), Some(snapshot)) = (generation_id, snapshot) {
         publish_state_event(state, tenant_id, generation_id, &snapshot).await?;
     }
-    release_deleted_inputs(&state.artifacts, deleted_inputs).await;
+    crate::expiry::release_deleted_inputs(&state.artifacts, tenant_id, deleted_inputs).await;
     Ok(())
 }
 
 async fn try_handle_lease_rejected(
     state: &AppState,
     tenant_id: TenantId,
+    worker_id: WorkerId,
+    credential_hash: &[u8],
     rejected: LeaseRejected,
 ) -> anyhow::Result<()> {
     let attempt_id = parse_uuid_id(&rejected.attempt_id, AttemptId::from_uuid)?;
@@ -1533,10 +1444,14 @@ async fn try_handle_lease_rejected(
     let now = state.db.now().await?;
 
     let mut tx = state.db.begin_tenant(tenant_id).await?;
+    if !lock_current_worker_credential(&mut tx, tenant_id, worker_id, credential_hash).await? {
+        return Ok(());
+    }
     let generation_id = crate::db::attempts::reject_lease(
         &mut tx,
         tenant_id,
         attempt_id,
+        worker_id,
         failure_kind,
         &failure.message,
         now,
@@ -1559,6 +1474,10 @@ async fn try_handle_lease_rejected(
 #[cfg(test)]
 mod tests {
     use buffa::MessageField;
+    use gpq_proto::gpq::v1::{
+        LoraSelection as ProtoLoraSelection, ModelAsset as ProtoModelAsset,
+        SamplingPreset as ProtoSamplingPreset,
+    };
     use gpq_proto::gpq::worker::v1::SlotAdvertisement;
 
     use super::*;
@@ -1626,14 +1545,6 @@ mod tests {
     }
 
     #[test]
-    fn backend_kind_maps_mlx_dspark() {
-        assert_eq!(
-            domain_backend_kind(EnumValue::Known(ProtoBackendKind::BACKEND_KIND_MLX_DSPARK)),
-            Some(BackendKind::MlxDspark)
-        );
-    }
-
-    #[test]
     fn manifest_conversion_rejects_malformed_digest() {
         let proto = ProtoArtifactManifest {
             size_bytes: 4,
@@ -1678,9 +1589,9 @@ mod tests {
         );
         assert_eq!(
             domain_placement(EnumValue::Known(
-                ProtoArtifactPlacement::ARTIFACT_PLACEMENT_INLINE_RELAY
+                ProtoArtifactPlacement::ARTIFACT_PLACEMENT_REMOTE_LOCAL
             )),
-            Some(ArtifactPlacement::InlineRelay)
+            Some(ArtifactPlacement::RemoteLocal)
         );
         assert_eq!(
             domain_placement(EnumValue::Known(
@@ -1698,47 +1609,123 @@ mod tests {
         }
     }
 
+    fn proto_manifest() -> ProtoModelManifest {
+        let asset = |role: ProtoModelAssetRole, bytes: &[u8]| ProtoModelAsset {
+            role: EnumValue::Known(role),
+            sha256: ContentHash::digest(bytes).to_hex(),
+            ..Default::default()
+        };
+        ProtoModelManifest {
+            family: EnumValue::Known(ProtoModelFamily::MODEL_FAMILY_QWEN_IMAGE21),
+            assets: vec![
+                asset(
+                    ProtoModelAssetRole::MODEL_ASSET_ROLE_DIFFUSION,
+                    b"diffusion",
+                ),
+                asset(ProtoModelAssetRole::MODEL_ASSET_ROLE_TEXT_ENCODER, b"text"),
+                asset(
+                    ProtoModelAssetRole::MODEL_ASSET_ROLE_VISION_ENCODER,
+                    b"vision",
+                ),
+                asset(ProtoModelAssetRole::MODEL_ASSET_ROLE_VAE, b"vae"),
+            ],
+            default_loras: vec![ProtoLoraSelection {
+                sha256: ContentHash::digest(b"lora").to_hex(),
+                scale: 0.5,
+                ..Default::default()
+            }],
+            sampling: MessageField::some(ProtoSamplingPreset {
+                steps: 40,
+                cfg_scale: 6.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn pool_upsert_takes_total_slots_and_ignores_worker_busy_flags() {
         let pool = PoolAdvertisement {
             pool_id: "gpu-0".to_owned(),
-            backend_kind: EnumValue::Known(ProtoBackendKind::BACKEND_KIND_LLAMA_CPP),
+            accelerator: "metal".to_owned(),
             ready: true,
             slots: vec![slot(false), slot(true), slot(false)],
             ..Default::default()
         };
-        let Some(upsert) = pool_upsert_from_proto(&pool) else {
+        let Some((upsert, models)) = pool_upsert_from_proto(&pool) else {
             panic!("expected a valid pool upsert");
         };
         // Total capacity is Worker-owned, so it is carried over verbatim.
         assert_eq!(upsert.total_slots, 3);
-        assert_eq!(upsert.backend_kind, BackendKind::LlamaCpp);
+        assert_eq!(upsert.accelerator, "metal");
+        assert_eq!(models, Vec::<(ContentHash, ModelManifest)>::new());
         // Free slots are Remote's to compute from `claimed_slots`: the two
         // idle flags in this report must not reach the upsert at all.
     }
 
     #[test]
-    fn pool_upsert_is_none_for_unspecified_backend_kind() {
+    fn pool_upsert_is_none_for_unset_accelerator() {
         let pool = PoolAdvertisement {
             pool_id: "gpu-0".to_owned(),
-            backend_kind: EnumValue::Known(ProtoBackendKind::BACKEND_KIND_UNSPECIFIED),
             ..Default::default()
         };
         assert!(pool_upsert_from_proto(&pool).is_none());
     }
 
     #[test]
-    fn pool_upsert_treats_zero_accelerator_memory_as_unknown() {
-        let pool = PoolAdvertisement {
+    fn pool_upsert_preserves_accelerator_memory_presence() {
+        let absent = PoolAdvertisement {
             pool_id: "gpu-0".to_owned(),
-            backend_kind: EnumValue::Known(ProtoBackendKind::BACKEND_KIND_COMFYUI),
-            accelerator_memory_bytes: 0,
+            accelerator: "metal".to_owned(),
+            accelerator_memory_bytes: None,
             ..Default::default()
         };
-        let Some(upsert) = pool_upsert_from_proto(&pool) else {
+        let present_zero = PoolAdvertisement {
+            accelerator_memory_bytes: Some(0),
+            ..absent.clone()
+        };
+        let Some((absent_upsert, _)) = pool_upsert_from_proto(&absent) else {
             panic!("expected a valid pool upsert");
         };
-        assert_eq!(upsert.accelerator_memory_bytes, None);
+        let Some((zero_upsert, _)) = pool_upsert_from_proto(&present_zero) else {
+            panic!("expected a valid pool upsert");
+        };
+        assert_eq!(absent_upsert.accelerator_memory_bytes, None);
+        assert_eq!(zero_upsert.accelerator_memory_bytes, Some(0));
+    }
+
+    #[test]
+    fn advertised_model_is_kept_when_its_manifest_hashes_to_its_version() {
+        let proto = proto_manifest();
+        let Some(manifest) = model_manifest_from_proto(&proto) else {
+            panic!("a well-formed manifest must convert");
+        };
+        let Ok(version) = manifest.canonical_hash() else {
+            panic!("a valid manifest must hash");
+        };
+        let advertisement = ModelAdvertisement {
+            version_sha256: version.to_hex(),
+            manifest: MessageField::some(proto),
+            ..Default::default()
+        };
+        let verified = verified_models(&[advertisement]);
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].0, version);
+    }
+
+    #[test]
+    fn advertised_model_whose_manifest_does_not_hash_to_its_version_is_dropped() {
+        // ADR 0012: an advertised version must be the manifest's own hash;
+        // a mismatch must never reach the catalog or a Pool's model set.
+        let advertisement = ModelAdvertisement {
+            version_sha256: ContentHash::digest(b"some other manifest").to_hex(),
+            manifest: MessageField::some(proto_manifest()),
+            ..Default::default()
+        };
+        assert_eq!(
+            verified_models(&[advertisement]),
+            Vec::<(ContentHash, ModelManifest)>::new()
+        );
     }
 
     #[test]
@@ -1770,6 +1757,14 @@ mod tests {
     }
 
     #[test]
+    fn replay_of_the_accepted_attempt_preserves_its_outputs() {
+        assert!(matches!(
+            classify_result_outcome(crate::db::generations::AcceptOutcome::AcceptedReplay),
+            ResultReply::AcceptedReplay
+        ));
+    }
+
+    #[test]
     fn stale_lease_duplicate_and_terminal_outcomes_all_discard() {
         for outcome in [
             crate::db::generations::AcceptOutcome::StaleLease,
@@ -1785,8 +1780,8 @@ mod tests {
 
     #[test]
     fn only_worker_local_placement_attributes_an_owning_worker() {
-        // ADR 0008: object-store and inline-relay outputs are addressed by
-        // key/token, not by owning Worker.
+        // ADR 0008: object-store and remote-local outputs are addressed by
+        // key or by the Remote's own row, not by owning Worker.
         let worker_id = WorkerId::new();
         assert_eq!(
             output_placement_worker(ArtifactPlacement::WorkerLocal, worker_id),
@@ -1797,7 +1792,7 @@ mod tests {
             None
         );
         assert_eq!(
-            output_placement_worker(ArtifactPlacement::InlineRelay, worker_id),
+            output_placement_worker(ArtifactPlacement::RemoteLocal, worker_id),
             None
         );
     }
@@ -1817,81 +1812,5 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(messages[0], expected);
-    }
-
-    #[test]
-    fn no_not_renewed_attempts_means_no_cancel_requests() {
-        assert!(not_renewed_cancel_messages(&[]).is_empty());
-    }
-
-    fn raw_generation_row() -> crate::db::generations::GenerationRow {
-        let now = chrono::Utc::now();
-        crate::db::generations::GenerationRow {
-            id: uuid::Uuid::nil(),
-            state: "running".to_owned(),
-            modality: "comfy".to_owned(),
-            caller_kind: "durable".to_owned(),
-            target_kind: "comfy_prompt".to_owned(),
-            alias: String::new(),
-            version_sha256: ContentHash::digest(b"raw").to_hex(),
-            parameters: serde_json::json!({}),
-            priority: 0,
-            seed: None,
-            execution_timeout: sqlx::postgres::types::PgInterval::default(),
-            output_placement: "worker_local".to_owned(),
-            stream_tokens: false,
-            attempt_count: 1,
-            output_text: String::new(),
-            usage: None,
-            latest_progress: None,
-            failure_kind: None,
-            failure_message: String::new(),
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    fn raw_attempt_output(pointer: &str) -> AttemptOutput {
-        AttemptOutput {
-            manifest: MessageField::some(ProtoArtifactManifest {
-                digest_sha256: ContentHash::digest(b"").to_hex(),
-                kind: EnumValue::Known(ProtoMediaKind::MEDIA_KIND_BINARY),
-                mime_type: "application/octet-stream".to_owned(),
-                ..Default::default()
-            }),
-            placement: EnumValue::Known(ProtoArtifactPlacement::ARTIFACT_PLACEMENT_WORKER_LOCAL),
-            delivery_token: "token".to_owned(),
-            comfy_output_pointers: vec![pointer.to_owned()],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn raw_result_accepts_a_complete_empty_outputs_object() {
-        let result = AttemptResult {
-            comfy_outputs_json: br"{}".to_vec(),
-            ..Default::default()
-        };
-        assert!(validate_comfy_result(&raw_generation_row(), &result).is_ok());
-    }
-
-    #[test]
-    fn raw_result_rejects_missing_and_duplicate_pointer_coverage() {
-        let outputs = serde_json::json!({"9": {"images": [{"filename": "x.png"}]}});
-        let missing = AttemptResult {
-            comfy_outputs_json: serde_json::to_vec(&outputs).unwrap_or_default(),
-            ..Default::default()
-        };
-        assert!(validate_comfy_result(&raw_generation_row(), &missing).is_err());
-
-        let duplicate = AttemptResult {
-            comfy_outputs_json: serde_json::to_vec(&outputs).unwrap_or_default(),
-            outputs: vec![
-                raw_attempt_output("/9/images/0"),
-                raw_attempt_output("/9/images/0"),
-            ],
-            ..Default::default()
-        };
-        assert!(validate_comfy_result(&raw_generation_row(), &duplicate).is_err());
     }
 }

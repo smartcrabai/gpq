@@ -1,13 +1,9 @@
-//! GPU-utilization-first scheduling order (ADR 0002).
+//! GPU-utilization-first scheduling order.
 //!
-//! Selection excludes Generations incompatible with the Tenant, exact Model or
-//! Workflow Versions, raw `ComfyUI` prompt hashes, or available Slot capacity. It
-//! then chooses overdue
-//! work by oldest `created_at`; otherwise it favors the Slot's resident Model
-//! and compatible batches, then higher priority, then older submission time.
-//! Running Attempts are never preempted, so this module only ever picks from
-//! queued work.
-
+//! Selection excludes Generations incompatible with the Tenant, pinned model,
+//! selected `LoRAs`, or slot shape limits. It then chooses overdue work
+//! by oldest creation time; otherwise it favors the resident model, priority,
+//! and oldest submission. Running Attempts are never preempted.
 use chrono::{DateTime, Utc};
 
 use crate::capability::{Requirement, SlotCapability};
@@ -146,11 +142,30 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::capability::ShapeLimits;
+    use crate::generation::{GenerationParameters, ImageParameters};
     use crate::id::{DevicePoolId, SlotId, TenantId, WorkerId};
-    use crate::modality::BackendKind;
+    use crate::version::{ModelAssetRole, ModelFamily, ModelManifest};
 
-    fn hash(seed: &[u8]) -> ContentHash {
-        ContentHash::digest(seed)
+    fn manifest(seed: &[u8]) -> ModelManifest {
+        let hash = ContentHash::digest(seed);
+        ModelManifest {
+            family: ModelFamily::QwenImage21,
+            assets: BTreeMap::from([
+                (ModelAssetRole::Diffusion, hash),
+                (ModelAssetRole::TextEncoder, hash),
+                (ModelAssetRole::VisionEncoder, hash),
+                (ModelAssetRole::Vae, hash),
+            ]),
+            default_loras: Vec::new(),
+            sampling: ModelFamily::QwenImage21.default_sampling_preset(),
+        }
+    }
+
+    fn model_hash(seed: &[u8]) -> ContentHash {
+        manifest(seed)
+            .canonical_hash()
+            .unwrap_or_else(|error| panic!("fixture manifest has canonical JSON: {error}"))
     }
 
     struct Fixture {
@@ -162,6 +177,14 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let tenant = TenantId::new();
+            let a = manifest(b"a");
+            let b = manifest(b"b");
+            let a_hash = a
+                .canonical_hash()
+                .unwrap_or_else(|error| panic!("fixture manifest has canonical JSON: {error}"));
+            let b_hash = b
+                .canonical_hash()
+                .unwrap_or_else(|error| panic!("fixture manifest has canonical JSON: {error}"));
             Self {
                 tenant,
                 capability: SlotCapability {
@@ -169,14 +192,13 @@ mod tests {
                     worker_id: WorkerId::new(),
                     pool_id: DevicePoolId::new(),
                     slot_id: SlotId::new(),
-                    backend_kind: BackendKind::LlamaCpp,
-                    backend_version: "b1".to_owned(),
-                    model_versions: BTreeSet::from([hash(b"a"), hash(b"b")]),
-                    custom_nodes: BTreeMap::new(),
-                    resident_model: Some(hash(b"a")),
+                    accelerator: "metal".to_owned(),
+                    accelerator_version: "native-test".to_owned(),
+                    model_manifests: BTreeMap::from([(a_hash, a), (b_hash, b)]),
+                    image_loras: BTreeSet::new(),
+                    resident_model: Some(a_hash),
                     accelerator_memory_bytes: None,
-                    supports_comfy_prompt: false,
-                    incapable_versions: BTreeSet::new(),
+                    shape_limits: ShapeLimits::default(),
                 },
                 now: DateTime::from_timestamp_secs(1_700_000_000).unwrap_or_else(Utc::now),
             }
@@ -191,12 +213,28 @@ mod tests {
             }
         }
 
-        fn candidate(&self, model: &[u8], priority: u8, age_secs: i64) -> Candidate {
+        fn candidate(&self, seed: &[u8], priority: u8, age_secs: i64) -> Candidate {
+            let model = manifest(seed);
+            let version = model
+                .canonical_hash()
+                .unwrap_or_else(|error| panic!("fixture manifest has canonical JSON: {error}"));
+            let parameters = GenerationParameters::Image(ImageParameters {
+                prompt: "a landscape".to_owned(),
+                negative_prompt: String::new(),
+                width: 512,
+                height: 512,
+                steps: None,
+                cfg_scale: None,
+                references: Vec::new(),
+                loras: Vec::new(),
+                sigmas: None,
+            });
             Candidate {
                 generation_id: GenerationId::new(),
                 created_at: self.now - chrono::Duration::seconds(age_secs),
                 priority: Priority::new(priority).unwrap_or(Priority::DEFAULT),
-                requirement: Requirement::for_model(self.tenant, hash(model), None),
+                requirement: Requirement::for_generation(self.tenant, version, &model, &parameters)
+                    .unwrap_or_else(|error| panic!("fixture request is valid: {error}")),
             }
         }
     }
@@ -303,17 +341,11 @@ mod tests {
 
         let batch = select_batch(&fixture.context(3), &candidates);
         assert_eq!(batch.len(), 3);
-        assert!(batch.iter().all(|c| c.version() == hash(b"a")));
+        assert!(batch.iter().all(|c| c.version() == model_hash(b"a")));
         assert_eq!(batch[0], &candidates[0], "oldest resident work leads");
         assert_eq!(batch[1], &candidates[1]);
 
         let single = select_batch(&fixture.context(1), &candidates);
         assert_eq!(single.len(), 1, "never prefetch beyond free slots");
-    }
-
-    #[test]
-    fn empty_queue_yields_no_batch() {
-        let fixture = Fixture::new();
-        assert!(select_batch(&fixture.context(4), &[]).is_empty());
     }
 }

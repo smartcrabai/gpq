@@ -1,8 +1,7 @@
 //! Assembles the single Axum router that serves every public surface on one
 //! port.
 //!
-//! ADR 0004: OpenAI-compatible routes, ComfyUI-compatible HTTP/WebSocket
-//! routes, one-shot Artifact download, and health checks are Axum; Native
+//! ADR 0004: Artifact upload/download and health checks are Axum; Native
 //! Generation/Catalog/Tenant use Connect, and Worker enrollment/Session/transfer
 //! use gRPC — but `connectrpc`'s content-type
 //! negotiation lets all of them share this one `axum::serve` listener (ADR
@@ -16,7 +15,7 @@ use axum::routing::get;
 
 use crate::state::AppState;
 
-/// Builds the fully assembled, state-erased router served by `gpq-remote serve`.
+/// Builds the fully assembled, state-erased router served by `gpq remote serve`.
 #[must_use = "the router does nothing until served with axum::serve"]
 pub fn router(state: AppState) -> axum::Router {
     let health = axum::Router::new()
@@ -37,9 +36,7 @@ pub fn router(state: AppState) -> axum::Router {
 
     health
         .merge(crate::tenant_console::router())
-        .merge(crate::openai::router(state.clone()))
-        .merge(crate::comfy::router(state.clone()))
-        .merge(crate::artifacts::download_router(state))
+        .merge(crate::artifacts::router(state))
         .merge(worker_and_native_rpc)
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
@@ -59,7 +56,7 @@ async fn healthz() -> StatusCode {
 /// Once `AppState::shutdown` is cancelled this reports unready immediately,
 /// without touching `PostgreSQL`, so an ingress stops routing new traffic —
 /// including new Worker enrollment/`Session` attempts — while the bounded
-/// drain in `main::run_serve` is under way.
+/// drain in `cli::run_serve` is under way.
 async fn readyz(State(state): State<AppState>) -> StatusCode {
     if state.shutdown.is_cancelled() {
         return StatusCode::SERVICE_UNAVAILABLE;

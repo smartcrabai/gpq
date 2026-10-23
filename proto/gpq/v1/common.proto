@@ -46,19 +46,10 @@ enum ArtifactState {
 // Derived after target resolution; never supplied by callers (ADR 0006).
 enum Modality {
   MODALITY_UNSPECIFIED = 0;
-  MODALITY_LLM = 1;
   MODALITY_IMAGE = 2;
   MODALITY_VIDEO = 3;
-  MODALITY_MUSIC = 4;
-  MODALITY_COMFY = 5;
-}
-
-// Runtime kind occupying a Device Pool (ADR 0005).
-enum BackendKind {
-  BACKEND_KIND_UNSPECIFIED = 0;
-  BACKEND_KIND_LLAMA_CPP = 1;
-  BACKEND_KIND_COMFYUI = 2;
-  BACKEND_KIND_MLX_DSPARK = 3;
+  reserved 1, 4, 5;
+  reserved MODALITY_LLM, MODALITY_MUSIC, MODALITY_COMFY;
 }
 
 // Coarse Artifact classification.
@@ -76,7 +67,9 @@ enum ArtifactPlacement {
   ARTIFACT_PLACEMENT_UNSPECIFIED = 0;
   ARTIFACT_PLACEMENT_OBJECT_STORE = 1;
   ARTIFACT_PLACEMENT_WORKER_LOCAL = 2;
-  ARTIFACT_PLACEMENT_INLINE_RELAY = 3;
+  ARTIFACT_PLACEMENT_REMOTE_LOCAL = 4;
+  reserved 3;
+  reserved ARTIFACT_PLACEMENT_INLINE_RELAY;
 }
 
 // Normalized backend failure causes (ADR 0003). Remote applies its retry policy
@@ -113,13 +106,6 @@ message ArtifactRef {
   ArtifactState state = 4;
   // One-shot download path served by Remote over HTTP (ADR 0006).
   string download_path = 5;
-}
-
-// Token accounting retained indefinitely for LLM work (ADR 0008).
-message Usage {
-  uint32 prompt_tokens = 1;
-  uint32 completion_tokens = 2;
-  uint32 total_tokens = 3;
 }
 
 // A normalized failure plus diagnostic detail.

@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use gpq_domain::{
-    ArtifactPlacement, AttemptId, AttemptState, CallerKind, Candidate, ContentHash, DevicePoolId,
-    ExecutionTarget, FailureKind, GenerationId, GenerationState, Modality, Priority, Requirement,
-    TenantId, WorkerId, WorkflowManifest, generation::PriorityOutOfRange, hash::ContentHashError,
-    state::UnknownState,
+    ArtifactPlacement, AttemptId, AttemptState, Candidate, ContentHash, DevicePoolId,
+    ExecutionTarget, FailureKind, GenerationId, GenerationParameters, GenerationState, Modality,
+    ModelManifest, Priority, Requirement, TenantId, WorkerId, generation::PriorityOutOfRange,
+    hash::ContentHashError, state::UnknownState,
 };
 use serde_json::Value as Json;
 use sqlx::PgConnection;
@@ -30,14 +30,9 @@ pub struct GenerationRow {
     pub state: String,
     /// Persisted `Modality` name.
     pub modality: String,
-    /// Persisted `CallerKind` name (ADR 0003).
-    pub caller_kind: String,
-    /// `"model"`, `"workflow"`, or `"comfy_prompt"` (ADR 0012).
-    pub target_kind: String,
-    /// The logical alias the caller requested, empty for a raw `ComfyUI` prompt.
+    /// The logical alias the caller requested.
     pub alias: String,
-    /// The Model or Workflow Version, or raw prompt content hash, pinned at
-    /// admission (ADR 0012).
+    /// The pinned Model Version's canonical manifest hash (ADR 0012).
     pub version_sha256: String,
     /// Opaque backend-shaped payload (ADR 0007).
     pub parameters: Json,
@@ -49,14 +44,8 @@ pub struct GenerationRow {
     pub execution_timeout: PgInterval,
     /// Persisted `ArtifactPlacement` name for outputs.
     pub output_placement: String,
-    /// Whether the caller wants incremental LLM token events.
-    pub stream_tokens: bool,
     /// Attempts created so far, at most `MAX_ATTEMPTS` (ADR 0003).
     pub attempt_count: i32,
-    /// Final LLM text, retained indefinitely (ADR 0008).
-    pub output_text: String,
-    /// Token accounting, when the modality reports it.
-    pub usage: Option<Json>,
     /// Latest progress snapshot (ADR 0008 retains only the latest).
     pub latest_progress: Option<Json>,
     /// Persisted `FailureKind` name, when failed.
@@ -72,15 +61,12 @@ pub struct GenerationRow {
 /// Failure to interpret a persisted column as its domain type.
 #[derive(Debug, thiserror::Error)]
 pub enum GenerationRowError {
-    /// A state, modality, caller-kind, or failure-kind column held an unknown name.
+    /// A state, modality, or failure-kind column held an unknown name.
     #[error(transparent)]
     State(#[from] UnknownState),
     /// `version_sha256` was not a valid hex-encoded SHA-256 digest.
     #[error(transparent)]
     Hash(#[from] ContentHashError),
-    /// `target_kind` held an unknown persisted target.
-    #[error("unknown target kind {0:?}")]
-    TargetKind(String),
     /// `priority` decoded but fell outside the accepted range.
     #[error(transparent)]
     Priority(#[from] PriorityOutOfRange),
@@ -116,16 +102,6 @@ impl GenerationRow {
         self.modality.parse()
     }
 
-    /// Parses the persisted `CallerKind`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`UnknownState`] if the persisted `caller_kind` column holds
-    /// a name that is not a recognized [`CallerKind`] variant.
-    pub fn caller_kind(&self) -> Result<CallerKind, UnknownState> {
-        self.caller_kind.parse()
-    }
-
     /// Parses the pinned version hash.
     ///
     /// # Errors
@@ -134,21 +110,6 @@ impl GenerationRow {
     /// hex-encoded SHA-256 digest.
     pub fn version(&self) -> Result<ContentHash, ContentHashError> {
         self.version_sha256.parse()
-    }
-
-    /// Rebuilds the pinned [`ExecutionTarget`] from its persisted kind and hash.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the hash or target kind is malformed.
-    pub fn target(&self) -> Result<ExecutionTarget, GenerationRowError> {
-        let version = self.version()?;
-        match self.target_kind.as_str() {
-            "model" => Ok(ExecutionTarget::Model { version }),
-            "workflow" => Ok(ExecutionTarget::Workflow { version }),
-            "comfy_prompt" => Ok(ExecutionTarget::ComfyPrompt { version }),
-            other => Err(GenerationRowError::TargetKind(other.to_owned())),
-        }
     }
 
     /// Parses the requested priority.
@@ -185,16 +146,11 @@ pub struct NewGeneration {
     pub id: GenerationId,
     /// Owning Tenant.
     pub tenant_id: TenantId,
-    /// Derived after target resolution (ADR 0006).
-    pub modality: Modality,
-    /// Whether the caller holds a connection open (ADR 0003).
-    pub caller_kind: CallerKind,
-    /// The logical alias the caller requested, empty for a raw `ComfyUI` prompt.
+    /// The logical alias the caller requested.
     pub alias: String,
-    /// The pinned Model or Workflow target or raw `ComfyUI` prompt content hash
-    /// (ADR 0012).
+    /// The pinned Model Version and derived modality (ADR 0012).
     pub target: ExecutionTarget,
-    /// Opaque backend-shaped payload (ADR 0007).
+    /// Typed `GenerationParameters` JSON (ADR 0007).
     pub parameters: Json,
     /// Resolved priority (the Tenant default is already applied by the caller).
     pub priority: Priority,
@@ -204,8 +160,6 @@ pub struct NewGeneration {
     pub execution_timeout: Duration,
     /// Where output Artifacts land.
     pub output_placement: ArtifactPlacement,
-    /// Whether the caller wants incremental LLM token events.
-    pub stream_tokens: bool,
 }
 
 /// Failure to insert a new Generation.
@@ -233,11 +187,6 @@ pub async fn insert(
     conn: &mut PgConnection,
     new: NewGeneration,
 ) -> Result<GenerationRow, InsertGenerationError> {
-    let (target_kind, version) = match new.target {
-        ExecutionTarget::Model { version } => ("model", version),
-        ExecutionTarget::Workflow { version } => ("workflow", version),
-        ExecutionTarget::ComfyPrompt { version } => ("comfy_prompt", version),
-    };
     let seed = match new.seed {
         Some(value) => {
             Some(i64::try_from(value).map_err(|_| InsertGenerationError::SeedOutOfRange(value))?)
@@ -251,24 +200,21 @@ pub async fn insert(
 
     let row = sqlx::query_as::<_, GenerationRow>(
         "INSERT INTO generations \
-            (tenant_id, id, state, modality, caller_kind, target_kind, alias, version_sha256, \
-             parameters, priority, seed, execution_timeout, output_placement, stream_tokens) \
-         VALUES ($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+            (tenant_id, id, state, modality, alias, version_sha256, \
+             parameters, priority, seed, execution_timeout, output_placement) \
+         VALUES ($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10) \
          RETURNING *",
     )
     .bind(new.tenant_id.as_uuid())
     .bind(new.id.as_uuid())
-    .bind(new.modality.as_str())
-    .bind(new.caller_kind.as_str())
-    .bind(target_kind)
+    .bind(new.target.modality().as_str())
     .bind(&new.alias)
-    .bind(version.to_hex())
+    .bind(new.target.version().to_hex())
     .bind(new.parameters)
     .bind(i16::from(new.priority))
     .bind(seed)
     .bind(execution_timeout)
     .bind(new.output_placement.as_str())
-    .bind(new.stream_tokens)
     .fetch_one(conn)
     .await?;
     Ok(row)
@@ -399,6 +345,8 @@ pub async fn requeue(
 pub enum AcceptOutcome {
     /// This Attempt's result became the Accepted Result of the named Generation.
     Accepted(GenerationId),
+    /// This Attempt is the already-accepted result; its persisted output must be preserved.
+    AcceptedReplay,
     /// The Attempt no longer holds a live lease; the Worker must delete its output.
     StaleLease,
     /// Another Attempt already committed the Accepted Result.
@@ -425,8 +373,6 @@ pub async fn accept_result(
     tenant_id: TenantId,
     attempt_id: AttemptId,
     worker_id: WorkerId,
-    output_text: &str,
-    usage: Option<(u32, u32, u32)>,
     now: DateTime<Utc>,
 ) -> sqlx::Result<AcceptOutcome> {
     #[derive(sqlx::FromRow)]
@@ -456,9 +402,6 @@ pub async fn accept_result(
     };
 
     let attempt_state: AttemptState = attempt.state.parse().unwrap_or(AttemptState::LeaseExpired);
-    if !attempt_state.is_live() || attempt.lease_expires_at <= now {
-        return Ok(AcceptOutcome::StaleLease);
-    }
 
     let Some(generation) = sqlx::query_as::<_, GenerationLock>(
         "SELECT state, accepted_attempt_id FROM generations WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
@@ -471,6 +414,14 @@ pub async fn accept_result(
         return Ok(AcceptOutcome::Terminal);
     };
 
+    if attempt_state == AttemptState::Succeeded
+        && generation.accepted_attempt_id == Some(attempt_id.as_uuid())
+    {
+        return Ok(AcceptOutcome::AcceptedReplay);
+    }
+    if !attempt_state.is_live() || attempt.lease_expires_at <= now {
+        return Ok(AcceptOutcome::StaleLease);
+    }
     if generation.accepted_attempt_id.is_some() {
         return Ok(AcceptOutcome::AlreadyAccepted);
     }
@@ -478,14 +429,6 @@ pub async fn accept_result(
     if !gen_state.can_transition_to(GenerationState::Succeeded) {
         return Ok(AcceptOutcome::Terminal);
     }
-
-    let usage_json = usage.map(|(prompt_tokens, completion_tokens, total_tokens)| {
-        serde_json::json!({
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-        })
-    });
 
     sqlx::query(
         "UPDATE attempts SET state = 'succeeded', finished_at = $4 \
@@ -503,14 +446,12 @@ pub async fn accept_result(
     let generation_id = GenerationId::from_uuid(attempt.generation_id);
     sqlx::query(
         "UPDATE generations SET state = 'succeeded', accepted_attempt_id = $3, \
-            output_text = $4, usage = $5, terminated_at = $6, updated_at = $6 \
+            terminated_at = $4, updated_at = $4 \
          WHERE tenant_id = $1 AND id = $2",
     )
     .bind(tenant_id.as_uuid())
     .bind(attempt.generation_id)
     .bind(attempt_id.as_uuid())
-    .bind(output_text)
-    .bind(usage_json)
     .bind(now)
     .execute(&mut *conn)
     .await?;
@@ -703,56 +644,7 @@ pub async fn record_progress(
     update_progress(conn, tenant_id, id, progress).await
 }
 
-/// Interprets one raw (`target_kind`, `version_sha256`, model VRAM, workflow
-/// manifest, or raw prompt) row as a [`Requirement`], shared by
-/// [`queued_candidates`] and [`requirement_of`].
-fn parse_requirement(
-    tenant_id: TenantId,
-    generation_id: Uuid,
-    target_kind: &str,
-    version_sha256: &str,
-    model_vram_bytes: Option<i64>,
-    workflow_manifest: Option<Json>,
-) -> Result<Requirement, CandidateRowError> {
-    let version: ContentHash = version_sha256.parse()?;
-    match target_kind {
-        "model" => {
-            let vram_bytes = model_vram_bytes.and_then(|v| u64::try_from(v).ok());
-            Ok(Requirement::for_model(tenant_id, version, vram_bytes))
-        }
-        "workflow" => {
-            let manifest_json = workflow_manifest
-                .ok_or(CandidateRowError::MissingWorkflowManifest(generation_id))?;
-            let manifest: WorkflowManifest =
-                serde_json::from_value(manifest_json).map_err(|source| {
-                    CandidateRowError::Manifest {
-                        generation: generation_id,
-                        source,
-                    }
-                })?;
-            Ok(Requirement::for_workflow(
-                tenant_id, version, &manifest, None,
-            ))
-        }
-        "comfy_prompt" => Ok(Requirement::for_comfy_prompt(tenant_id, version)),
-        other => Err(CandidateRowError::UnknownTargetKind(other.to_owned())),
-    }
-}
-
-/// One queued Generation joined against its pinned version's requirements.
-#[derive(sqlx::FromRow)]
-struct CandidateRow {
-    id: Uuid,
-    created_at: DateTime<Utc>,
-    priority: i16,
-    target_kind: String,
-    version_sha256: String,
-    model_vram_bytes: Option<i64>,
-    workflow_manifest: Option<Json>,
-}
-
-/// Failure to interpret one [`CandidateRow`] (or a single-row [`requirement_of`]
-/// lookup) as its domain type.
+/// Why one queued or requeued Generation cannot be rebuilt into a [`Requirement`].
 #[derive(Debug, thiserror::Error)]
 enum CandidateRowError {
     #[error(transparent)]
@@ -761,16 +653,62 @@ enum CandidateRowError {
     Priority(#[from] PriorityOutOfRange),
     #[error("priority {0} is outside 0..=9")]
     PriorityRange(i16),
-    #[error("unknown target kind {0:?}")]
-    UnknownTargetKind(String),
-    #[error("workflow target {0} is missing its manifest")]
-    MissingWorkflowManifest(Uuid),
-    #[error("workflow manifest for {generation} failed to parse: {source}")]
+    #[error("generation {0} pins a model version that is not registered")]
+    MissingManifest(Uuid),
+    #[error("model manifest for generation {generation} failed to parse: {source}")]
     Manifest {
         generation: Uuid,
         #[source]
         source: serde_json::Error,
     },
+    #[error("generation parameters for {generation} failed to parse: {source}")]
+    Parameters {
+        generation: Uuid,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("generation {generation} cannot be scheduled: {reason}")]
+    Requirement { generation: Uuid, reason: String },
+}
+
+/// Rebuilds one Generation's [`Requirement`] from its stored typed parameters
+/// and the immutable manifest its pinned version names (ADR 0012).
+fn requirement_from_parts(
+    tenant_id: TenantId,
+    generation_id: Uuid,
+    version_sha256: &str,
+    parameters: Json,
+    manifest: Option<Json>,
+) -> Result<Requirement, CandidateRowError> {
+    let version: ContentHash = version_sha256.parse()?;
+    let manifest_json = manifest.ok_or(CandidateRowError::MissingManifest(generation_id))?;
+    let manifest: ModelManifest =
+        serde_json::from_value(manifest_json).map_err(|source| CandidateRowError::Manifest {
+            generation: generation_id,
+            source,
+        })?;
+    let parameters: GenerationParameters =
+        serde_json::from_value(parameters).map_err(|source| CandidateRowError::Parameters {
+            generation: generation_id,
+            source,
+        })?;
+    Requirement::for_generation(tenant_id, version, &manifest, &parameters).map_err(|error| {
+        CandidateRowError::Requirement {
+            generation: generation_id,
+            reason: error.to_string(),
+        }
+    })
+}
+
+/// One queued Generation joined against its pinned Model Version.
+#[derive(sqlx::FromRow)]
+struct CandidateRow {
+    id: Uuid,
+    created_at: DateTime<Utc>,
+    priority: i16,
+    version_sha256: String,
+    parameters: Json,
+    manifest: Option<Json>,
 }
 
 impl CandidateRow {
@@ -778,13 +716,12 @@ impl CandidateRow {
         let priority_raw = u8::try_from(self.priority)
             .map_err(|_| CandidateRowError::PriorityRange(self.priority))?;
         let priority = Priority::new(priority_raw)?;
-        let requirement = parse_requirement(
+        let requirement = requirement_from_parts(
             tenant_id,
             self.id,
-            &self.target_kind,
             &self.version_sha256,
-            self.model_vram_bytes,
-            self.workflow_manifest,
+            self.parameters,
+            self.manifest,
         )?;
         Ok(Candidate {
             generation_id: GenerationId::from_uuid(self.id),
@@ -795,36 +732,25 @@ impl CandidateRow {
     }
 }
 
-// The `LEFT JOIN model_versions` / `LEFT JOIN workflow_versions` pair below is
-// spelled out in both `queued_candidates` and `requirement_of` because sqlx 0.9
-// only accepts static SQL strings: hoisting it into a `const` forces
-// `format!`, and hoisting it into a literal-producing macro costs more lines
-// than the join itself.
-
 /// The Tenant's queued Generations offered to the scheduler (ADR 0002, ADR 0013).
 ///
-/// A malformed row (e.g. a Workflow Version whose manifest failed to parse)
-/// is logged and skipped rather than failing the whole scheduling pass for
-/// every other Generation of the Tenant.
+/// A malformed row is logged and skipped rather than failing the whole
+/// scheduling pass for every other Generation of the Tenant.
 ///
 /// # Errors
 ///
-/// Returns [`sqlx::Error`] if the query fails. A malformed row does not
-/// produce an error; it is logged and skipped instead (see above).
+/// Returns [`sqlx::Error`] if the query fails.
 pub async fn queued_candidates(
     conn: &mut PgConnection,
     tenant_id: TenantId,
     limit: i64,
 ) -> sqlx::Result<Vec<Candidate>> {
     let rows = sqlx::query_as::<_, CandidateRow>(
-        "SELECT \
-            g.id, g.created_at, g.priority, g.target_kind, g.version_sha256, \
-            mv.estimated_vram_bytes AS model_vram_bytes, wv.manifest AS workflow_manifest \
+        "SELECT g.id, g.created_at, g.priority, g.version_sha256, g.parameters, \
+            mv.manifest \
          FROM generations g \
          LEFT JOIN model_versions mv \
-             ON g.target_kind = 'model' AND mv.tenant_id = g.tenant_id AND mv.content_sha256 = g.version_sha256 \
-         LEFT JOIN workflow_versions wv \
-             ON g.target_kind = 'workflow' AND wv.tenant_id = g.tenant_id AND wv.content_sha256 = g.version_sha256 \
+             ON mv.tenant_id = g.tenant_id AND mv.content_sha256 = g.version_sha256 \
          WHERE g.tenant_id = $1 AND g.state = 'queued' \
          ORDER BY g.created_at \
          LIMIT $2",
@@ -846,9 +772,9 @@ pub async fn queued_candidates(
         .collect())
 }
 
-/// Rebuilds the [`Requirement`] of one Generation, regardless of its current
-/// state. Used by the retry path (`db::attempts::record_failure`) to decide
-/// whether any other registered Slot can still run it (ADR 0003).
+/// Rebuilds the [`Requirement`] of one Generation regardless of its state.
+/// Used by the retry path (`db::attempts::record_failure`) to decide whether
+/// any other registered Slot can still run it (ADR 0003).
 pub(crate) async fn requirement_of(
     conn: &mut PgConnection,
     tenant_id: TenantId,
@@ -856,19 +782,15 @@ pub(crate) async fn requirement_of(
 ) -> sqlx::Result<Option<Requirement>> {
     #[derive(sqlx::FromRow)]
     struct Row {
-        target_kind: String,
         version_sha256: String,
-        model_vram_bytes: Option<i64>,
-        workflow_manifest: Option<Json>,
+        parameters: Json,
+        manifest: Option<Json>,
     }
     let Some(row) = sqlx::query_as::<_, Row>(
-        "SELECT g.target_kind, g.version_sha256, \
-            mv.estimated_vram_bytes AS model_vram_bytes, wv.manifest AS workflow_manifest \
+        "SELECT g.version_sha256, g.parameters, mv.manifest \
          FROM generations g \
          LEFT JOIN model_versions mv \
-             ON g.target_kind = 'model' AND mv.tenant_id = g.tenant_id AND mv.content_sha256 = g.version_sha256 \
-         LEFT JOIN workflow_versions wv \
-             ON g.target_kind = 'workflow' AND wv.tenant_id = g.tenant_id AND wv.content_sha256 = g.version_sha256 \
+             ON mv.tenant_id = g.tenant_id AND mv.content_sha256 = g.version_sha256 \
          WHERE g.tenant_id = $1 AND g.id = $2",
     )
     .bind(tenant_id.as_uuid())
@@ -879,13 +801,12 @@ pub(crate) async fn requirement_of(
         return Ok(None);
     };
 
-    match parse_requirement(
+    match requirement_from_parts(
         tenant_id,
         id.as_uuid(),
-        &row.target_kind,
         &row.version_sha256,
-        row.model_vram_bytes,
-        row.workflow_manifest,
+        row.parameters,
+        row.manifest,
     ) {
         Ok(requirement) => Ok(Some(requirement)),
         Err(error) => {
@@ -895,100 +816,9 @@ pub(crate) async fn requirement_of(
     }
 }
 
-/// Every nonterminal synchronous (`OpenAI`) Generation of a Tenant.
-///
-/// Used on Remote startup: their original HTTP connection cannot have
-/// survived the restart, so ADR 0003 requires cancelling all of them before
-/// Worker sessions are accepted.
-///
-/// # Errors
-///
-/// Returns [`sqlx::Error`] if the query fails or a row cannot be decoded
-/// into a [`GenerationRow`].
-pub async fn nonterminal_synchronous(
-    conn: &mut PgConnection,
-    tenant_id: TenantId,
-) -> sqlx::Result<Vec<GenerationRow>> {
-    sqlx::query_as::<_, GenerationRow>(
-        "SELECT * FROM generations \
-         WHERE tenant_id = $1 AND caller_kind = 'synchronous' \
-            AND state NOT IN ('succeeded', 'failed', 'cancelled', 'expired')",
-    )
-    .bind(tenant_id.as_uuid())
-    .fetch_all(conn)
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn candidate_row(target_kind: &str, version: &str) -> CandidateRow {
-        CandidateRow {
-            id: Uuid::nil(),
-            created_at: Utc::now(),
-            priority: 5,
-            target_kind: target_kind.to_owned(),
-            version_sha256: version.to_owned(),
-            model_vram_bytes: Some(8_000_000_000),
-            workflow_manifest: None,
-        }
-    }
-
-    fn hex_hash(byte: u8) -> String {
-        hex::encode([byte; 32])
-    }
-
-    #[test]
-    fn model_candidate_carries_the_vram_estimate() {
-        let hash = hex_hash(0xAB);
-        let row = candidate_row("model", &hash);
-        let Ok(candidate) = row.into_candidate(TenantId::new()) else {
-            panic!("expected a valid model candidate");
-        };
-        assert_eq!(
-            candidate.requirement.estimated_vram_bytes,
-            Some(8_000_000_000)
-        );
-        assert_eq!(
-            candidate.requirement.backend_kind,
-            gpq_domain::BackendKind::LlamaCpp
-        );
-    }
-
-    #[test]
-    fn workflow_candidate_without_a_manifest_is_rejected() {
-        let hash = hex_hash(0xCD);
-        let row = candidate_row("workflow", &hash);
-        assert!(row.into_candidate(TenantId::new()).is_err());
-    }
-
-    #[test]
-    fn workflow_candidate_parses_its_manifest() {
-        let hash = hex_hash(0xEF);
-        let mut row = candidate_row("workflow", &hash);
-        row.workflow_manifest = Some(serde_json::json!({
-            "output_node": "9",
-            "output_name": "images",
-            "artifact_kind": "image",
-            "artifact_mime": "image/png",
-            "required_models": [],
-            "required_custom_nodes": {},
-        }));
-        let Ok(candidate) = row.into_candidate(TenantId::new()) else {
-            panic!("expected a valid workflow candidate");
-        };
-        assert_eq!(
-            candidate.requirement.backend_kind,
-            gpq_domain::BackendKind::ComfyUi
-        );
-    }
-
-    #[test]
-    fn invalid_hash_is_rejected() {
-        let row = candidate_row("model", "not-a-hash");
-        assert!(row.into_candidate(TenantId::new()).is_err());
-    }
 
     #[test]
     fn accept_outcome_variants_are_distinct() {

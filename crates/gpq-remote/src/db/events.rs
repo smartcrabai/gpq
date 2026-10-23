@@ -1,9 +1,9 @@
 //! Generation event log persistence (ADR 0008).
 //!
 //! Only state transitions, progress snapshots, and Attempt creation are
-//! retained; token deltas and transport frames are not (ADR 0008 explicitly
-//! excludes them from durable storage - they only ever travel through the
-//! in-process [`crate::events::EventHub`]). Sequence numbers are monotonic
+//! retained; transient transport frames are not (ADR 0008 excludes them from
+//! durable storage - they only ever travel through the in-process
+//! [`crate::events::EventHub`]). Sequence numbers are monotonic
 //! per Generation so a resumed reader can ask for everything strictly after
 //! a known sequence without gaps or duplicates.
 

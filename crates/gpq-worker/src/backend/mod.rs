@@ -1,151 +1,65 @@
-//! Backend adapter trait, shared execution types, and generic transport-error
-//! normalization (ADR 0003, ADR 0005).
+//! Authenticated client for the managed native inference child.
 //!
-//! Adapters use only managed subprocesses and loopback HTTP/WebSocket APIs
-//! (ADR 0005); this module defines the boundary every adapter implements so
-//! `pool.rs` and `executor.rs` never depend on `llama-server`, `mlx-dspark`,
-//! or `ComfyUI` specifics directly.
+//! The child is always the `infer` role of this executable. It exposes only a
+//! loopback HTTP control protocol protected by a per-process bearer token.
 
-mod comfy;
-mod llama;
-mod mlx;
-
-use std::collections::BTreeMap;
-use std::future::Future;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use gpq_domain::{
-    ArtifactManifest, BackendKind, ContentHash, FailureKind, Modality, WorkflowManifest,
-};
+
+use gpq_domain::{ContentHash, FailureKind};
+use gpq_inference::{InferenceRequest, NativeOutput};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::PoolConfig;
 
-/// Everything a `Backend` needs to run one Attempt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ExecutionRequest {
-    /// The Attempt this execution belongs to, for correlation in adapter logs.
-    pub attempt_id: String,
-    /// The kind of result this Generation produces.
-    pub modality: Modality,
-    /// The pinned Model Version, when this Attempt uses a model (ADR 0012).
-    pub model_sha256: Option<ContentHash>,
-    /// Local path of the resolved Model Version, when applicable.
-    pub model_path: Option<PathBuf>,
-    /// Opaque `ComfyUI` raw Server API prompt payload, when this Attempt runs
-    /// an unregistered prompt.
-    pub comfy_prompt: Option<serde_json::Value>,
-    /// Opaque `ComfyUI` graph, when this Attempt runs a Workflow (ADR 0007).
-    pub workflow_graph: Option<serde_json::Value>,
-    /// The pinned Workflow Version's manifest, when applicable (ADR 0012).
-    pub workflow_manifest: Option<WorkflowManifest>,
-    /// Opaque, backend-specific parameters (ADR 0007: no universal schema).
-    pub parameters: serde_json::Value,
-    /// Input Artifacts already staged on local disk.
-    pub inputs: Vec<InputArtifact>,
-    /// Caller-requested seed, when applicable.
-    pub seed: Option<u64>,
-    /// Whether the caller wants incremental token deltas (LLM only).
-    pub stream_tokens: bool,
-    /// The resolved execution timeout for this Attempt (ADR 0003).
+    pub model_version: ContentHash,
+    pub inference: InferenceRequest,
+    #[serde(skip)]
     pub deadline: Duration,
 }
-
-/// One input Artifact staged on local disk before execution.
-#[derive(Debug, Clone)]
-pub struct InputArtifact {
-    /// The Artifact's remote identifier.
-    pub artifact_id: String,
-    /// Local path the Artifact bytes were staged to.
-    pub path: PathBuf,
-    /// The Artifact's immutable manifest.
-    pub manifest: ArtifactManifest,
+#[derive(Serialize)]
+struct NativeExecutionRequest<'a> {
+    job_id: &'a str,
+    model_version: ContentHash,
+    inference: &'a InferenceRequest,
 }
 
-/// One event emitted by a `Backend` while executing an Attempt.
+#[derive(Serialize)]
+struct NativeCancelRequest<'a> {
+    job_id: &'a str,
+}
+
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
-    /// Fractional progress toward completion (`ComfyUI` executions).
-    Progress {
-        fraction: f64,
-        stage: String,
-        step: u32,
-        total_steps: u32,
-    },
-    /// One incremental token delta (LLM streaming).
-    Token { text: String },
-    /// One produced output Artifact, staged on local disk.
-    Output {
-        path: PathBuf,
-        manifest: ArtifactManifest,
-        comfy_output_pointers: Vec<String>,
-    },
-    /// Complete raw `ComfyUI` outputs metadata and output node ids.
-    ComfyOutputs {
-        outputs: serde_json::Value,
-        output_node_ids: Vec<String>,
-    },
-    /// Complete non-streamed text output (LLM).
-    Text { text: String },
-    /// Token accounting for a completed LLM Attempt.
-    Usage {
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        total_tokens: u32,
-    },
+    Progress { fraction: f32 },
+    Output { output: NativeOutput },
 }
 
-/// A backend failure normalized to the closed [`FailureKind`] enum (ADR 0003).
-///
-/// Remote applies the authoritative retry policy from `kind`; `retry_hint` is
-/// advisory context only, never a substitute for `FailureKind::is_retryable`.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{kind}: {message}")]
 pub struct BackendError {
-    /// The normalized cause.
     pub kind: FailureKind,
-    /// Raw diagnostic text; never parsed by Remote for classification.
     pub message: String,
-    /// The adapter's advisory opinion on whether a retry might succeed.
     pub retry_hint: bool,
 }
 
-/// Observed capabilities of a probed or running backend (ADR 0005).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BackendCapabilities {
-    /// Backend-reported version string, advertised verbatim (ADR 0005: no
-    /// version allowlist).
     pub version: String,
-    /// Execution Slots this backend currently exposes.
-    pub slots: u32,
-    /// The Model Version currently loaded, if any.
-    pub resident_model: Option<ContentHash>,
-    /// Accelerator memory, when the backend reports it (optional, ADR 0005).
-    pub accelerator_memory_bytes: Option<u64>,
-    /// Installed `ComfyUI` custom-node package name to the discovered or
-    /// operator-declared version; `"unknown"` means unavailable.
-    pub custom_nodes: BTreeMap<String, String>,
-    /// Required-endpoint probe name to whether it succeeded (ADR 0005:
-    /// compatibility comes from probes, not version allowlists).
-    pub probes: BTreeMap<String, bool>,
+    pub accelerator: String,
+    pub accelerator_version: String,
+    pub probes: std::collections::BTreeMap<String, bool>,
 }
 
-/// A managed generation backend: llama.cpp, mlx-dspark, or `ComfyUI`, reached
-/// only through managed subprocesses and loopback HTTP/WebSocket APIs (ADR 0005).
 #[async_trait]
 pub trait Backend: Send + Sync {
-    /// Runs the required-endpoint probes and reports capabilities.
-    ///
-    /// Adapters report the core operations required by their protocol; a
-    /// missing operation is reported as false and makes the backend unready.
-    /// The caller decides readiness from `probes`; this method only reports
-    /// what it observed.
     async fn probe(&self) -> Result<BackendCapabilities, BackendError>;
 
-    /// Runs one Attempt to completion, emitting `events` as it progresses.
     async fn execute(
         &self,
         request: ExecutionRequest,
@@ -153,157 +67,266 @@ pub trait Backend: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<(), BackendError>;
 
-    /// Asks the backend to release its resident model through its own API.
-    ///
-    /// `Ok(false)` means the backend has no such API or it failed: the
-    /// caller must terminate the process instead, since process termination
-    /// is the universal memory-release fallback (ADR 0005).
+    async fn release_memory(&self) -> Result<bool, BackendError>;
+}
+
+#[derive(Clone)]
+pub struct NativeBackend {
+    client: reqwest::Client,
+    base_url: String,
+    token: String,
+    configured_backend: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HealthResponse {
+    ready: bool,
+    backend: String,
+    backend_version: String,
+    devices: Vec<gpq_inference::BackendDevice>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseResponse {
+    released: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum NativeEvent {
+    Progress { fraction: f32 },
+    Output { output: NativeOutput },
+    Complete,
+    Cancelled,
+    Error { kind: String, message: String },
+}
+
+impl NativeBackend {
+    pub fn new(pool: &PoolConfig, token: String) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .build()?;
+        Ok(Self {
+            client,
+            base_url: format!("http://{}", pool.listen),
+            token,
+            configured_backend: pool.backend.clone(),
+        })
+    }
+
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.client
+            .request(method, format!("{}{path}", self.base_url))
+            .bearer_auth(&self.token)
+    }
+}
+
+#[async_trait]
+impl Backend for NativeBackend {
+    async fn probe(&self) -> Result<BackendCapabilities, BackendError> {
+        let response = self
+            .request(reqwest::Method::GET, "/health")
+            .send()
+            .await
+            .map_err(|error| normalize_transport_error(&error))?
+            .error_for_status()
+            .map_err(|error| normalize_transport_error(&error))?;
+        let health: HealthResponse = response.json().await.map_err(|error| BackendError {
+            kind: FailureKind::BackendCrashed,
+            message: format!("invalid native health response: {error}"),
+            retry_hint: true,
+        })?;
+        let device = gpq_inference::resolve_device_id(&self.configured_backend, &health.devices)
+            .ok()
+            .and_then(|name| health.devices.iter().find(|device| device.name == name));
+        let ready = health.ready && health.backend == self.configured_backend && device.is_some();
+        let mut probes = std::collections::BTreeMap::new();
+        probes.insert("native_inference".to_owned(), ready);
+        if !ready {
+            let detail = health.detail.unwrap_or_else(|| {
+                device.map_or_else(
+                    || {
+                        format!(
+                            "configured device {} is unavailable",
+                            self.configured_backend
+                        )
+                    },
+                    |device| format!("native runtime {} is not ready", device.name),
+                )
+            });
+            tracing::warn!(backend = %self.configured_backend, detail, "native inference child is not ready");
+        }
+        let (accelerator, accelerator_version) = device.map_or_else(
+            || (self.configured_backend.clone(), String::new()),
+            |device| (device.name.clone(), device.description.clone()),
+        );
+        Ok(BackendCapabilities {
+            version: health.backend_version,
+            accelerator,
+            accelerator_version,
+            probes,
+        })
+    }
+
+    async fn execute(
+        &self,
+        request: ExecutionRequest,
+        events: mpsc::Sender<ExecutionEvent>,
+        cancel: CancellationToken,
+    ) -> Result<(), BackendError> {
+        let job_id = uuid::Uuid::now_v7().to_string();
+        let body = NativeExecutionRequest {
+            job_id: &job_id,
+            model_version: request.model_version,
+            inference: &request.inference,
+        };
+        let mut response = self
+            .request(reqwest::Method::POST, "/execute")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| normalize_transport_error(&error))?
+            .error_for_status()
+            .map_err(|error| normalize_transport_error(&error))?;
+        let mut pending = Vec::new();
+        let mut cancel_sent = false;
+        let mut terminal = false;
+        loop {
+            tokio::select! {
+                () = cancel.cancelled(), if !cancel_sent => {
+                    cancel_sent = true;
+                    let cancel_request = NativeCancelRequest { job_id: &job_id };
+                    if let Err(error) = self
+                        .request(reqwest::Method::POST, "/cancel")
+                        .json(&cancel_request)
+                        .send()
+                        .await
+                    {
+                        tracing::warn!(error = %error, "native cancellation request failed");
+                    }
+                }
+                chunk = response.chunk() => {
+                    let Some(chunk) = chunk.map_err(|error| normalize_transport_error(&error))? else {
+                        break;
+                    };
+                    pending.extend_from_slice(&chunk);
+                    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                        let line: Vec<u8> = pending.drain(..=newline).collect();
+                        let line = std::str::from_utf8(&line)
+                            .map_err(|error| protocol_error(format!("invalid SSE UTF-8: {error}")))?
+                            .trim();
+                        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                            continue;
+                        };
+                        let event: NativeEvent = serde_json::from_str(data)
+                            .map_err(|error| protocol_error(format!("invalid native event: {error}")))?;
+                        match event {
+                            NativeEvent::Progress { fraction } => {
+                                if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+                                    return Err(protocol_error("native progress fraction is out of range"));
+                                }
+                                let _ = events.send(ExecutionEvent::Progress { fraction }).await;
+                            }
+                            NativeEvent::Output { output } => {
+                                if !output.path.is_absolute() {
+                                    return Err(protocol_error("native output path is not absolute"));
+                                }
+                                let _ = events.send(ExecutionEvent::Output { output }).await;
+                            }
+                            NativeEvent::Complete => {
+                                terminal = true;
+                                break;
+                            }
+                            NativeEvent::Cancelled => {
+                                return Err(BackendError {
+                                    kind: FailureKind::Cancelled,
+                                    message: "native inference acknowledged cancellation".to_owned(),
+                                    retry_hint: false,
+                                });
+                            }
+                            NativeEvent::Error { kind, message } => {
+                                return Err(BackendError {
+                                    kind: parse_failure_kind(&kind),
+                                    message,
+                                    retry_hint: false,
+                                });
+                            }
+                        }
+                    }
+                    if terminal {
+                        break;
+                    }
+                }
+            }
+        }
+        if !terminal {
+            return Err(BackendError {
+                kind: FailureKind::BackendCrashed,
+                message: "native event stream ended without a terminal event".to_owned(),
+                retry_hint: true,
+            });
+        }
+        let _ = request.deadline;
+        Ok(())
+    }
+
     async fn release_memory(&self) -> Result<bool, BackendError> {
-        Ok(false)
-    }
-}
-
-/// Constructs the adapter matching `pool.backend` (ADR 0005: a Pool switches
-/// exclusively between backend kinds).
-#[must_use]
-pub fn build(pool: &PoolConfig) -> Box<dyn Backend> {
-    match pool.backend {
-        BackendKind::LlamaCpp => Box::new(llama::LlamaBackend::new(pool)),
-        BackendKind::MlxDspark => Box::new(mlx::MlxDsparkBackend::new(pool)),
-        BackendKind::ComfyUi => Box::new(comfy::ComfyBackend::new(pool)),
-    }
-}
-
-pub(super) fn endpoint(base_url: &url::Url, path: &str) -> String {
-    format!("{}{path}", base_url.as_str().trim_end_matches('/'))
-}
-
-/// Builds the HTTP client used for managed backend control planes. Backend
-/// URLs are validated as loopback-only configuration, and redirects are
-/// disabled so a backend cannot redirect a request to another host.
-pub(super) fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap_or_else(|err| panic!("building managed backend HTTP client: {err}"))
-}
-
-pub(super) async fn run_with_timeout<F>(deadline: Duration, future: F) -> Result<(), BackendError>
-where
-    F: Future<Output = Result<(), BackendError>>,
-{
-    match tokio::time::timeout(deadline, future).await {
-        Ok(outcome) => outcome,
-        Err(_) => Err(BackendError {
-            kind: FailureKind::ExecutionTimedOut,
-            message: format!("execution exceeded the {deadline:?} deadline (ADR 0003)"),
-            retry_hint: FailureKind::ExecutionTimedOut.is_retryable(),
-        }),
-    }
-}
-
-/// Normalizes a `reqwest` transport failure talking to a loopback backend to
-/// the closed [`FailureKind`] enum (ADR 0003).
-///
-/// A failed TCP connect to the backend's own loopback port means the managed
-/// process is not accepting connections (crashed or not yet up); a request
-/// timeout while talking to an already-connected backend is treated the same
-/// as a transient Artifact transfer failure, since both are retryable and
-/// carry no information about the Generation's validity.
-#[must_use]
-pub fn normalize_transport_error(error: &reqwest::Error) -> BackendError {
-    classify_transport_error(
-        error.is_timeout(),
-        error.is_connect(),
-        error.status().map(|status| status.is_server_error()),
-        error.to_string(),
-    )
-}
-
-fn classify_transport_error(
-    is_timeout: bool,
-    is_connect: bool,
-    server_error: Option<bool>,
-    message: String,
-) -> BackendError {
-    if is_timeout {
-        return BackendError {
-            kind: FailureKind::TransferFailed,
-            message,
-            retry_hint: true,
-        };
-    }
-    if is_connect {
-        return BackendError {
+        let response = self
+            .request(reqwest::Method::POST, "/release")
+            .send()
+            .await
+            .map_err(|error| normalize_transport_error(&error))?
+            .error_for_status()
+            .map_err(|error| normalize_transport_error(&error))?;
+        let release: ReleaseResponse = response.json().await.map_err(|error| BackendError {
             kind: FailureKind::BackendCrashed,
-            message,
+            message: format!("invalid native release response: {error}"),
             retry_hint: true,
-        };
-    }
-    match server_error {
-        Some(true) => BackendError {
-            kind: FailureKind::BackendCrashed,
-            message,
-            retry_hint: true,
-        },
-        _ => BackendError {
-            kind: FailureKind::Internal,
-            message,
-            retry_hint: false,
-        },
+        })?;
+        Ok(release.released)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use gpq_domain::FailureKind;
-
-    use super::classify_transport_error;
-
-    #[test]
-    fn timeout_normalizes_to_transfer_failed() {
-        let error = classify_transport_error(true, false, None, "timed out".to_string());
-
-        assert_eq!(error.kind, FailureKind::TransferFailed);
-        assert!(error.retry_hint);
+fn parse_failure_kind(value: &str) -> FailureKind {
+    match value {
+        "invalid_input" => FailureKind::InvalidInput,
+        "model_unavailable" => FailureKind::ModelUnavailable,
+        "unsupported_capability" => FailureKind::UnsupportedCapability,
+        "execution_timed_out" => FailureKind::ExecutionTimedOut,
+        "out_of_memory" => FailureKind::OutOfMemory,
+        "backend_crashed" => FailureKind::BackendCrashed,
+        "transfer_failed" => FailureKind::TransferFailed,
+        "cancelled" => FailureKind::Cancelled,
+        _ => FailureKind::Internal,
     }
+}
 
-    #[test]
-    fn connect_failure_normalizes_to_backend_crashed() {
-        let error = classify_transport_error(false, true, None, "connection refused".to_string());
-
-        assert_eq!(error.kind, FailureKind::BackendCrashed);
-        assert!(error.retry_hint);
+fn normalize_transport_error(error: &reqwest::Error) -> BackendError {
+    let kind = if error.is_timeout() {
+        FailureKind::TransferFailed
+    } else if error.is_connect() {
+        FailureKind::BackendCrashed
+    } else {
+        FailureKind::TransferFailed
+    };
+    BackendError {
+        kind,
+        message: error.to_string(),
+        retry_hint: kind.is_retryable(),
     }
+}
 
-    #[test]
-    fn server_error_status_normalizes_to_backend_crashed() {
-        let error = classify_transport_error(false, false, Some(true), "500".to_string());
-
-        assert_eq!(error.kind, FailureKind::BackendCrashed);
-        assert!(error.retry_hint);
+fn protocol_error(message: impl Into<String>) -> BackendError {
+    BackendError {
+        kind: FailureKind::BackendCrashed,
+        message: message.into(),
+        retry_hint: true,
     }
+}
 
-    #[test]
-    fn client_error_status_normalizes_to_internal() {
-        let error = classify_transport_error(false, false, Some(false), "400".to_string());
-
-        assert_eq!(error.kind, FailureKind::Internal);
-        assert!(!error.retry_hint);
-    }
-
-    #[test]
-    fn unclassified_failure_normalizes_to_internal() {
-        let error = classify_transport_error(false, false, None, "builder error".to_string());
-
-        assert_eq!(error.kind, FailureKind::Internal);
-        assert!(!error.retry_hint);
-    }
-
-    #[test]
-    fn timeout_takes_priority_over_connect_and_status() {
-        let error = classify_transport_error(true, true, Some(true), "ambiguous".to_string());
-
-        assert_eq!(error.kind, FailureKind::TransferFailed);
-    }
+pub fn build(pool: &PoolConfig, token: String) -> anyhow::Result<NativeBackend> {
+    NativeBackend::new(pool, token)
 }

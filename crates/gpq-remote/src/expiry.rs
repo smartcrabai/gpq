@@ -8,12 +8,13 @@
 //! from the one administrative read [`crate::scheduler::known_tenants`]
 //! already uses.
 
+use std::collections::HashSet;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
 use gpq_domain::{
-    ArtifactPlacement, AttemptId, FailureKind, GenerationId, GenerationState, RetryDecision,
-    TenantId, any_candidate_remains,
+    ArtifactPlacement, AttemptId, DevicePoolId, FailureKind, GenerationId, Requirement,
+    RetryDecision, SlotCapability, TenantId, any_candidate_remains,
 };
 use gpq_proto::gpq::worker::v1::{CancelRequest, RemoteMessage};
 use tokio::task::JoinHandle;
@@ -80,8 +81,8 @@ async fn sweep_tenant(state: &AppState, tenant: TenantId) {
 /// Re-delivers cooperative cancellation to the Workers still executing
 /// Attempts of `Cancelling` Generations (ADR 0003).
 ///
-/// Cancellation is requested by whoever observed it — an API call or an
-/// `OpenAI` client disconnecting — which only moves the Generation to
+/// Cancellation is requested by whoever observed it — an API call or a
+/// client disconnecting — which only moves the Generation to
 /// `Cancelling` in `PostgreSQL`. This sweep is what actually reaches the
 /// Worker, and re-sending every tick is what makes cancellation survive a
 /// Worker reconnect or a Remote restart. Repeating it is safe because ADR 0003
@@ -155,48 +156,36 @@ fn cancel_request_message(attempt_id: AttemptId, reason: &str) -> RemoteMessage 
     }
 }
 
-/// What discarding an already-deleted input Artifact's underlying bytes
-/// requires, by placement (ADR 0008): object-store bytes are deleted by
-/// key; inline-relay bytes are dropped from the in-process buffer;
-/// Worker-local placement never applies to inputs, so it needs no action.
-/// An object-store row missing its key is left alone rather than guessed
-/// at, mirroring the orphaned-row guard already in place. Pure so the
-/// per-placement branch is unit-testable without touching object storage.
-enum InputDiscardAction {
-    DeleteObjectStoreKey(String),
-    DiscardLocal,
-    None,
-}
-
-fn input_discard_action(artifact: &ArtifactRow) -> InputDiscardAction {
+/// The object-store key whose bytes must be deleted along with an input
+/// Artifact's row (ADR 0008). Remote-local inputs keep their bytes in the row
+/// itself and are removed with it; Worker-local placement never applies to
+/// inputs. An object-store row missing its key is left alone rather than
+/// guessed at. Pure so the per-placement rule is unit-testable without
+/// touching object storage.
+fn input_object_key(artifact: &ArtifactRow) -> Option<&str> {
     match artifact.placement {
-        ArtifactPlacement::ObjectStore => artifact.object_key.clone().map_or(
-            InputDiscardAction::None,
-            InputDiscardAction::DeleteObjectStoreKey,
-        ),
-        ArtifactPlacement::InlineRelay => InputDiscardAction::DiscardLocal,
-        ArtifactPlacement::WorkerLocal => InputDiscardAction::None,
+        ArtifactPlacement::ObjectStore => artifact.object_key.as_deref(),
+        ArtifactPlacement::WorkerLocal | ArtifactPlacement::RemoteLocal => None,
     }
 }
 
-/// Deletes the underlying bytes of Artifacts already deleted from `PostgreSQL`
-/// (ADR 0008): object-store bytes are removed directly; bytes relayed inline
-/// through a connected request are dropped from the in-process buffer.
-/// Worker-local placement never applies to inputs (ADR 0008), so it needs no
-/// action here.
-async fn discard_input_artifacts(state: &AppState, tenant: TenantId, rows: Vec<ArtifactRow>) {
+/// Deletes the object-store bytes of input Artifacts already deleted from
+/// `PostgreSQL` at a Generation's terminal transition (ADR 0008). Shared by
+/// every terminal path that removes inputs, including the Worker session.
+pub(crate) async fn release_deleted_inputs(
+    artifacts: &crate::artifacts::ArtifactService,
+    tenant: TenantId,
+    rows: Vec<ArtifactRow>,
+) {
     for artifact in rows {
-        match input_discard_action(&artifact) {
-            InputDiscardAction::DeleteObjectStoreKey(key) => {
-                if let Err(error) = state.artifacts.delete(&key).await {
-                    tracing::warn!(
-                        %tenant, %error, key,
-                        "failed to delete a terminated generation's input artifact"
-                    );
-                }
-            }
-            InputDiscardAction::DiscardLocal => state.artifacts.discard_local(artifact.id),
-            InputDiscardAction::None => {}
+        let Some(key) = input_object_key(&artifact) else {
+            continue;
+        };
+        if let Err(error) = artifacts.delete(key).await {
+            tracing::warn!(
+                %tenant, %error, key,
+                "failed to delete a terminated generation's input artifact"
+            );
         }
     }
 }
@@ -286,7 +275,7 @@ async fn expire_leases(state: &AppState, tenant: TenantId) -> anyhow::Result<()>
         expired
     };
 
-    discard_input_artifacts(state, tenant, deleted_inputs).await;
+    release_deleted_inputs(&state.artifacts, tenant, deleted_inputs).await;
     for generation_id in changed_generations {
         publish_generation_state(state, tenant, generation_id).await;
     }
@@ -336,9 +325,11 @@ async fn enforce_execution_deadlines(state: &AppState, tenant: TenantId) -> anyh
                 &mut tx,
                 tenant,
                 attempt.attempt_id(),
-                FailureKind::ExecutionTimedOut,
-                "execution exceeded its resolved timeout",
-                false,
+                crate::db::attempts::FailureDetails {
+                    kind: FailureKind::ExecutionTimedOut,
+                    message: "execution exceeded its resolved timeout",
+                    worker_retry_hint: false,
+                },
                 now,
             )
             .await?
@@ -359,7 +350,7 @@ async fn enforce_execution_deadlines(state: &AppState, tenant: TenantId) -> anyh
         overdue
     };
 
-    discard_input_artifacts(state, tenant, deleted_inputs).await;
+    release_deleted_inputs(&state.artifacts, tenant, deleted_inputs).await;
     for generation_id in changed_generations {
         publish_generation_state(state, tenant, generation_id).await;
     }
@@ -383,9 +374,23 @@ async fn enforce_execution_deadlines(state: &AppState, tenant: TenantId) -> anyh
     Ok(())
 }
 
+/// Returns whether any Pool capable of the Generation remains after exclusions.
+fn has_unrejected_candidate<'a>(
+    capabilities: impl IntoIterator<Item = &'a SlotCapability>,
+    requirement: &Requirement,
+    excluded: Option<&HashSet<DevicePoolId>>,
+) -> bool {
+    any_candidate_remains(
+        capabilities.into_iter().filter(|capability| {
+            !excluded.is_some_and(|pools| pools.contains(&capability.pool_id))
+        }),
+        requirement,
+    )
+}
+
 /// Expires `Queued` Generations old enough that ADR 0002's starvation guard
-/// has long since kicked in, but for which no registered Slot could ever
-/// satisfy the Requirement at all (a capable-but-busy fleet is not expired
+/// has long since kicked in, but for which no registered, unrejected Slot
+/// could ever satisfy the Requirement (a capable-but-busy fleet is not expired
 /// here — `select_next` already prioritizes it ahead of everything else).
 async fn expire_starved_queue(state: &AppState, tenant: TenantId) -> anyhow::Result<()> {
     let now = state.db.now().await?;
@@ -414,14 +419,26 @@ async fn expire_starved_queue(state: &AppState, tenant: TenantId) -> anyhow::Res
             return Ok(());
         }
         let capabilities = crate::db::workers::pool_capabilities(&mut tx, tenant).await?;
+        let generation_ids: Vec<GenerationId> = candidates
+            .iter()
+            .map(|candidate| candidate.generation_id)
+            .collect();
+        let exclusions = crate::db::native_exclusions::excluded_pools_for_generations(
+            &mut tx,
+            tenant,
+            &generation_ids,
+        )
+        .await?;
 
         for candidate in candidates
             .iter()
             .filter(|candidate| candidate.created_at <= cutoff)
         {
-            let has_candidate = any_candidate_remains(
+            let excluded = exclusions.get(&candidate.generation_id);
+            let has_candidate = has_unrejected_candidate(
                 capabilities.iter().map(|(capability, ..)| capability),
                 &candidate.requirement,
+                excluded,
             );
             if !has_candidate
                 && crate::db::generations::expire(&mut tx, tenant, candidate.generation_id, now)
@@ -440,7 +457,7 @@ async fn expire_starved_queue(state: &AppState, tenant: TenantId) -> anyhow::Res
         tx.commit().await?;
     }
 
-    discard_input_artifacts(state, tenant, deleted_inputs).await;
+    release_deleted_inputs(&state.artifacts, tenant, deleted_inputs).await;
     for generation_id in expired_generations {
         publish_generation_state(state, tenant, generation_id).await;
     }
@@ -470,81 +487,65 @@ async fn expire_artifacts(state: &AppState, tenant: TenantId) -> anyhow::Result<
     Ok(())
 }
 
-/// Cancels every nonterminal synchronous (`OpenAI`) Generation across every
-/// Tenant before Worker sessions are accepted (ADR 0003): their original HTTP
-/// connection cannot have survived a Remote restart, so leaving them `Running`
-/// or `Queued` would leak invisible work with no client left to deliver to.
-///
-/// # Errors
-///
-/// Currently infallible: it never returns `Err`. Per-tenant cancellation
-/// failures (a database fault fetching or updating that Tenant's
-/// Generations) are logged and skipped rather than propagated, so one
-/// Tenant's failure does not stop startup cancellation for the rest.
-pub async fn cancel_synchronous_on_startup(state: &AppState) -> anyhow::Result<()> {
-    let tenants = crate::scheduler::known_tenants(state).await;
-    for tenant in tenants {
-        if let Err(error) = cancel_synchronous_for_tenant(state, tenant).await {
-            tracing::error!(
-                %tenant, %error,
-                "failed to cancel nonterminal synchronous generations on startup"
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn cancel_synchronous_for_tenant(state: &AppState, tenant: TenantId) -> anyhow::Result<()> {
-    let now = state.db.now().await?;
-    let mut deleted_inputs = Vec::new();
-    let mut changed_generations = Vec::new();
-    {
-        let mut tx = state.db.begin_tenant(tenant).await?;
-        for row in crate::db::generations::nonterminal_synchronous(&mut tx, tenant).await? {
-            let id = row.generation_id();
-            let caller_kind = row.caller_kind();
-            let priority = row.priority();
-            match row.state() {
-                Ok(GenerationState::Queued) => {
-                    if crate::db::generations::cancel_queued(&mut tx, tenant, id, now).await? {
-                        tracing::info!(
-                            %tenant, %id, ?caller_kind, ?priority,
-                            "cancelled a queued synchronous generation on startup"
-                        );
-                        changed_generations.push(id);
-                        let rows =
-                            crate::db::artifacts::delete_inputs_for_generation(&mut tx, tenant, id)
-                                .await?;
-                        deleted_inputs.extend(rows);
-                    }
-                }
-                Ok(GenerationState::Running | GenerationState::Cancelling) => {
-                    if crate::db::generations::request_cancel_running(&mut tx, tenant, id, now)
-                        .await?
-                    {
-                        tracing::info!(
-                            %tenant, %id, ?caller_kind, ?priority,
-                            "requested cooperative cancellation for a running synchronous generation on startup"
-                        );
-                        changed_generations.push(id);
-                    }
-                }
-                Ok(_) | Err(_) => {}
-            }
-        }
-        tx.commit().await?;
-    }
-
-    discard_input_artifacts(state, tenant, deleted_inputs).await;
-    for generation_id in changed_generations {
-        publish_generation_state(state, tenant, generation_id).await;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn starvation_sees_no_candidates_only_after_every_capable_pool_is_excluded() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let tenant_id = TenantId::new();
+        let worker_id = gpq_domain::WorkerId::new();
+        let pool_a = DevicePoolId::new();
+        let pool_b = DevicePoolId::new();
+        let version = gpq_domain::ContentHash::from_bytes([1; 32]);
+        let manifest = gpq_domain::ModelManifest {
+            family: gpq_domain::ModelFamily::QwenImage21,
+            assets: BTreeMap::new(),
+            default_loras: Vec::new(),
+            sampling: gpq_domain::ModelFamily::QwenImage21.default_sampling_preset(),
+        };
+        let capability = |pool_id| SlotCapability {
+            tenant_id,
+            worker_id,
+            pool_id,
+            slot_id: gpq_domain::SlotId::new(),
+            accelerator: "metal".to_owned(),
+            accelerator_version: "test".to_owned(),
+            model_manifests: BTreeMap::from([(version, manifest.clone())]),
+            image_loras: BTreeSet::new(),
+            resident_model: None,
+            accelerator_memory_bytes: None,
+            shape_limits: gpq_domain::ShapeLimits::default(),
+        };
+        let requirement = Requirement {
+            tenant_id,
+            modality: gpq_domain::Modality::Image,
+            version,
+            required_loras: BTreeSet::new(),
+            shape: gpq_domain::GenerationShape {
+                width: 64,
+                height: 64,
+                steps: Some(4),
+                frames: None,
+            },
+        };
+        let capabilities = [capability(pool_a), capability(pool_b)];
+        let only_first_rejected = HashSet::from([pool_a]);
+        assert!(has_unrejected_candidate(
+            capabilities.iter(),
+            &requirement,
+            Some(&only_first_rejected)
+        ));
+
+        let all_rejected = HashSet::from([pool_a, pool_b]);
+        assert!(!has_unrejected_candidate(
+            capabilities.iter(),
+            &requirement,
+            Some(&all_rejected)
+        ));
+    }
 
     #[test]
     fn starvation_multiplier_widens_the_tenant_configured_queue_age() {
@@ -580,7 +581,6 @@ mod tests {
             object_key: object_key.map(str::to_owned),
             worker_id: None,
             delivery_token: None,
-            comfy_output_pointers: Vec::new(),
             committed_offset: 0,
         }
     }
@@ -589,10 +589,7 @@ mod tests {
     fn object_store_input_with_a_key_is_deleted_by_key() {
         // ADR 0008: an object-store input's bytes are removed directly.
         let row = sample_input_row(ArtifactPlacement::ObjectStore, Some("tenant/gen/input"));
-        assert!(matches!(
-            input_discard_action(&row),
-            InputDiscardAction::DeleteObjectStoreKey(key) if key == "tenant/gen/input"
-        ));
+        assert_eq!(input_object_key(&row), Some("tenant/gen/input"));
     }
 
     #[test]
@@ -600,30 +597,22 @@ mod tests {
         // An orphaned row (placement says object store, but no key was ever
         // recorded) must not be guessed at; it is simply left alone.
         let row = sample_input_row(ArtifactPlacement::ObjectStore, None);
-        assert!(matches!(
-            input_discard_action(&row),
-            InputDiscardAction::None
-        ));
+        assert_eq!(input_object_key(&row), None);
     }
 
     #[test]
-    fn inline_relay_input_discards_the_in_process_buffer() {
-        // ADR 0008: inline-relay bytes only ever live in Remote's memory.
-        let row = sample_input_row(ArtifactPlacement::InlineRelay, None);
-        assert!(matches!(
-            input_discard_action(&row),
-            InputDiscardAction::DiscardLocal
-        ));
+    fn remote_local_input_is_released_with_its_row() {
+        // ADR 0008: remote-local bytes live in the row itself, so deleting
+        // the row is the whole cleanup and there is no external key.
+        let row = sample_input_row(ArtifactPlacement::RemoteLocal, None);
+        assert_eq!(input_object_key(&row), None);
     }
 
     #[test]
     fn worker_local_input_never_applies_and_takes_no_action() {
         // ADR 0008: Worker-local placement never applies to inputs.
         let row = sample_input_row(ArtifactPlacement::WorkerLocal, None);
-        assert!(matches!(
-            input_discard_action(&row),
-            InputDiscardAction::None
-        ));
+        assert_eq!(input_object_key(&row), None);
     }
 
     #[test]

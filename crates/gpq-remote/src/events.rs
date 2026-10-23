@@ -2,12 +2,12 @@
 //! and (ADR 0008) persistence of the durable subset before fanout.
 //!
 //! ADR 0006: a reconnected Native event stream begins with the current
-//! snapshot and then live events; token deltas are not replayed, and
+//! snapshot and then live events, and
 //! discontinuity is explicit. [`EventHub::record`] is the single choke
 //! point every Generation event publication should go through: it appends
 //! the persistable form of `event` (`State`/`Progress`; ADR 0008 excludes
-//! token deltas from durable storage, and an output Artifact's own row is
-//! already durable) through [`crate::db::events::append`] and then fans it
+//! outputs, whose Artifact row is already the durable record) through
+//! [`crate::db::events::append`] and then fans it
 //! out live via [`EventHub::publish`]. The current-snapshot-then-replay
 //! sequencing itself lives in the Native Generation service
 //! (`crate::native::generation`), which reads the row, replays anything
@@ -56,12 +56,6 @@ pub enum GenerationEvent {
         /// The total number of steps, for step-counted backends.
         total_steps: u32,
     },
-    /// One incremental piece of streamed LLM output. Never replayed on
-    /// reconnect (ADR 0006).
-    Token {
-        /// The token text.
-        text: String,
-    },
     /// An output Artifact became available for download. Carries no
     /// payload: the wire protocol has no partial-output update, so a
     /// `WatchGeneration` watcher (the only consumer) always responds by
@@ -100,10 +94,9 @@ struct ProgressPayload {
     total_steps: u32,
 }
 
-/// The persisted `(kind, payload)` for `event`, or `None` for the two
-/// variants ADR 0008 excludes from durable storage: `Token` (token deltas
-/// are explicitly not retained) and `Output` (the Artifact row it names is
-/// already the durable record).
+/// The persisted `(kind, payload)` for `event`, or `None` for the variants
+/// ADR 0008 excludes from durable storage: `Output` (the Artifact row it
+/// names is already the durable record) and `Discontinuity` (never stored).
 ///
 /// # Errors
 /// Returns an error if `event`'s fields cannot be encoded as JSON (in
@@ -140,9 +133,7 @@ fn persisted_form(
             })?;
             Ok(Some((EventKind::Progress, payload)))
         }
-        GenerationEvent::Token { .. }
-        | GenerationEvent::Output
-        | GenerationEvent::Discontinuity { .. } => Ok(None),
+        GenerationEvent::Output | GenerationEvent::Discontinuity { .. } => Ok(None),
     }
 }
 
@@ -229,9 +220,10 @@ impl EventHub {
     /// [`EventHub::publish`] — the single choke point every Generation
     /// event publication should go through, so that ADR 0008's "state
     /// transitions and progress snapshots are retained" holds no matter
-    /// which caller reports the transition. `Token` and `Output` are never
-    /// persisted (ADR 0008): they are published live only, identically to
-    /// calling [`EventHub::publish`] directly.
+    /// which caller reports the transition. `Output` is never persisted:
+    /// its Artifact row is already the durable record (ADR 0008), so it is
+    /// published live only, identically to calling [`EventHub::publish`]
+    /// directly.
     ///
     /// If the append itself fails, `event` is never published as if nothing
     /// happened — that would let a client believe a transition it can never
@@ -424,14 +416,6 @@ mod tests {
         assert_eq!(stage, "denoise");
         assert_eq!(step, 3);
         assert_eq!(total_steps, 10);
-    }
-
-    #[test]
-    fn token_deltas_are_never_persisted() {
-        let event = GenerationEvent::Token {
-            text: "hi".to_owned(),
-        };
-        assert_eq!(persisted_form(&event).ok(), Some(None));
     }
 
     #[test]

@@ -1,23 +1,22 @@
-//! Worker, Device Pool, pool-Model, and Model Version persistence.
+//! Worker, Device Pool, and pool-Model persistence.
 //!
 //! ADR 0001/0011: every query below is scoped to a `tenant_id` and is meant
 //! to run inside a tenant-scoped transaction (`Db::begin_tenant`); RLS refuses
 //! rows for any other Tenant regardless. ADR 0005 models one row per Device
 //! Pool (`device_pools`) with a `free_slots` counter rather than a per-Slot
 //! table — the domain's [`gpq_domain::SlotCapability`] is therefore
-//! synthesized one-per-Pool, not one-per-Slot. ADR 0003 tracks per-Pool
-//! Model incapability in `pool_models.incapable_since`. ADR 0009 stores only
-//! keyed hashes of Worker Credentials. ADR 0012 registers immutable Model
-//! Versions by content hash.
+//! synthesized one-per-Pool, not one-per-Slot. Runtime OOM never persists
+//! capability here; retry exclusion is scoped to the Generation (ADR 0003). ADR 0009 stores only
+//! keyed hashes of Worker Credentials. ADR 0012 pins every pool-Model row to
+//! an immutable Model Version registered by [`crate::db::catalog`] under the
+//! canonical hash of its `ModelManifest`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use gpq_domain::hash::ContentHashError;
-use gpq_domain::state::UnknownState;
 use gpq_domain::{
-    BackendKind, ContentHash, DevicePoolId, ExecutionLimits, Modality, ModelVersionId,
-    SlotCapability, TenantId, WorkerId,
+    ContentHash, DevicePoolId, ModelManifest, ShapeLimits, SlotCapability, TenantId, WorkerId,
 };
 use sqlx::types::Json;
 use uuid::Uuid;
@@ -26,12 +25,6 @@ use uuid::Uuid;
 fn decode_hash(hex: &str) -> Result<ContentHash, sqlx::Error> {
     hex.parse::<ContentHash>()
         .map_err(|err: ContentHashError| sqlx::Error::Decode(Box::new(err)))
-}
-
-/// Wraps a parse failure from a stored column as a `sqlx` decode error.
-fn decode_backend_kind(text: &str) -> Result<BackendKind, sqlx::Error> {
-    text.parse::<BackendKind>()
-        .map_err(|err: UnknownState| sqlx::Error::Decode(Box::new(err)))
 }
 
 /// A Worker's self-reported enrollment identity (ADR 0009), grouped so
@@ -191,18 +184,19 @@ pub async fn list_workers(
     .await
 }
 
-/// One Device Pool and its advertised Model Versions, for catalog listings.
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// Raw row shape of the `list_pools` query, before domain mapping.
+#[derive(Debug, sqlx::FromRow)]
 struct PoolRowRaw {
     worker_id: Uuid,
     pool_id: Uuid,
-    backend_kind: String,
-    backend_version: String,
+    accelerator: String,
+    accelerator_version: String,
     total_slots: i32,
     free_slots: i32,
     resident_model_sha256: Option<String>,
     accelerator_memory_bytes: Option<i64>,
-    custom_nodes: Json<BTreeMap<String, String>>,
+    shape_limits: Json<ShapeLimits>,
+    image_lora_sha256: Vec<String>,
     model_hashes: Vec<String>,
 }
 
@@ -213,23 +207,24 @@ pub struct PoolRow {
     pub worker_id: WorkerId,
     /// Surrogate identifier assigned by Remote.
     pub pool_id: DevicePoolId,
-    /// Runtime kind occupying the Pool.
-    pub backend_kind: BackendKind,
-    /// Observed backend version string.
-    pub backend_version: String,
+    /// Accelerator the Pool runs on, as advertised by its Worker.
+    pub accelerator: String,
+    /// Observed accelerator or runtime version string.
+    pub accelerator_version: String,
     /// Total concurrent Execution Slots.
     pub total_slots: u32,
     /// Currently free Execution Slots.
     pub free_slots: u32,
     /// Model Version currently loaded, if any.
     pub resident_model_sha256: Option<ContentHash>,
-    /// Accelerator memory reported by the backend, when known.
+    /// Accelerator memory reported by the Worker, when known.
     pub accelerator_memory_bytes: Option<u64>,
-    /// Installed custom nodes, package name to the discovered or
-    /// operator-declared version; `"unknown"` means unavailable.
-    pub custom_nodes: BTreeMap<String, String>,
+    /// Shape limits the Pool advertises for native generation.
+    pub shape_limits: ShapeLimits,
+    /// Content hashes of every image `LoRA` installed for this Pool.
+    pub image_loras: Vec<ContentHash>,
     /// Content hashes of every Model Version installed for this Pool.
-    pub model_hashes: Vec<String>,
+    pub model_hashes: Vec<ContentHash>,
 }
 
 impl TryFrom<PoolRowRaw> for PoolRow {
@@ -241,32 +236,42 @@ impl TryFrom<PoolRowRaw> for PoolRow {
             .as_deref()
             .map(decode_hash)
             .transpose()?;
+        let image_loras: Vec<ContentHash> = row
+            .image_lora_sha256
+            .iter()
+            .map(|hex| decode_hash(hex))
+            .collect::<Result<_, _>>()?;
+        let model_hashes: Vec<ContentHash> = row
+            .model_hashes
+            .iter()
+            .map(|hex| decode_hash(hex))
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             worker_id: WorkerId::from_uuid(row.worker_id),
             pool_id: DevicePoolId::from_uuid(row.pool_id),
-            backend_kind: decode_backend_kind(&row.backend_kind)?,
-            backend_version: row.backend_version,
+            accelerator: row.accelerator,
+            accelerator_version: row.accelerator_version,
             total_slots: u32::try_from(row.total_slots).unwrap_or(0),
             free_slots: u32::try_from(row.free_slots).unwrap_or(0),
             resident_model_sha256,
             accelerator_memory_bytes: row
                 .accelerator_memory_bytes
                 .and_then(|value| u64::try_from(value).ok()),
-            custom_nodes: row.custom_nodes.0,
-            model_hashes: row.model_hashes,
+            shape_limits: row.shape_limits.0,
+            image_loras,
+            model_hashes,
         })
     }
 }
 
 /// Every Device Pool of `tenant_id`'s Workers, with their installed Model
-/// Versions, for Native Catalog listings.
+/// Versions and image `LoRAs`, for Native Catalog listings.
 ///
 /// # Errors
 /// Returns [`sqlx::Error`] if the query fails, or if a row's
-/// `resident_model_sha256` or `backend_kind` column holds a value that
-/// cannot be decoded (see [`decode_hash`], [`decode_backend_kind`]) — in
-/// practice only possible if the stored column was corrupted or a
-/// [`BackendKind`] variant was retired without a migration.
+/// `resident_model_sha256`, `image_lora_sha256`, or model hash column holds a
+/// value that cannot be decoded (see [`decode_hash`]) — in practice only
+/// possible if the stored column was corrupted.
 pub async fn list_pools(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -275,24 +280,53 @@ pub async fn list_pools(
         "SELECT \
             dp.worker_id AS worker_id, \
             dp.id AS pool_id, \
-            dp.backend_kind AS backend_kind, \
-            dp.backend_version AS backend_version, \
+            dp.accelerator AS accelerator, \
+            dp.backend_version AS accelerator_version, \
             dp.total_slots AS total_slots, \
             dp.free_slots AS free_slots, \
             dp.resident_model_sha256 AS resident_model_sha256, \
             dp.accelerator_memory_bytes AS accelerator_memory_bytes, \
-            dp.custom_nodes AS custom_nodes, \
-            COALESCE(array_agg(pm.content_sha256) FILTER (WHERE pm.content_sha256 IS NOT NULL), ARRAY[]::text[]) AS model_hashes \
+            dp.shape_limits AS shape_limits, \
+            dp.image_lora_sha256 AS image_lora_sha256, \
+            COALESCE(( \
+                SELECT array_agg(pm.content_sha256) \
+                FROM pool_models pm \
+                WHERE pm.tenant_id = dp.tenant_id AND pm.pool_id = dp.id \
+            ), ARRAY[]::text[]) AS model_hashes \
          FROM device_pools dp \
-         LEFT JOIN pool_models pm ON pm.tenant_id = dp.tenant_id AND pm.pool_id = dp.id \
-         WHERE dp.tenant_id = $1 \
-         GROUP BY dp.worker_id, dp.id, dp.backend_kind, dp.backend_version, \
-                  dp.total_slots, dp.free_slots, dp.resident_model_sha256, dp.accelerator_memory_bytes, dp.custom_nodes",
+         WHERE dp.tenant_id = $1",
     )
     .bind(tenant_id.as_uuid())
     .fetch_all(&mut *conn)
     .await?;
     rows.into_iter().map(PoolRow::try_from).collect()
+}
+
+/// Verifies the Worker's credential and serializes messages that mutate its row.
+///
+/// Lock before the caller's update: concurrent `FOR SHARE` locks deadlock when
+/// both message handlers then upgrade them.
+/// Keep this lock until the caller commits so credential revocation cannot race
+/// with an authenticated message.
+///
+/// # Errors
+/// Returns [`sqlx::Error`] if the query fails (e.g. connection lost).
+pub async fn lock_current_worker_credential(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    worker_id: WorkerId,
+    credential_hash: &[u8],
+) -> sqlx::Result<bool> {
+    let live: Option<bool> = sqlx::query_scalar(
+        "SELECT credential_hash = $3 AND revoked_at IS NULL \
+         FROM workers WHERE tenant_id = $1 AND id = $2 FOR NO KEY UPDATE",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(worker_id.as_uuid())
+    .bind(credential_hash)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(live.unwrap_or(false))
 }
 
 /// Records the Worker's freshly opened control session.
@@ -351,16 +385,20 @@ pub async fn touch_last_seen(
     Ok(())
 }
 
-/// One Device Pool as advertised in a Worker's `CapabilityReport`
+/// One Device Pool as advertised in a Worker's capability report
 /// (ADR 0005), ready to persist.
+///
+/// Callers register every hash in `model_hashes` and `image_loras` with
+/// their owning tables before upserting (Model Versions via
+/// [`crate::db::catalog::register_model_versions`]).
 #[derive(Debug, Clone)]
 pub struct PoolUpsert {
     /// Pool identity as configured on the Worker host.
     pub pool_key: String,
-    /// Runtime kind occupying the Pool.
-    pub backend_kind: BackendKind,
-    /// Observed backend version string.
-    pub backend_version: String,
+    /// Accelerator the Pool runs on, as advertised by its Worker.
+    pub accelerator: String,
+    /// Observed accelerator or runtime version string.
+    pub accelerator_version: String,
     /// Whether the Pool currently accepts work.
     pub ready: bool,
     /// Human-readable reason when `ready` is false.
@@ -369,15 +407,16 @@ pub struct PoolUpsert {
     pub total_slots: u32,
     /// Model Version currently loaded, if any.
     pub resident_model_sha256: Option<ContentHash>,
-    /// Accelerator memory reported by the backend, when known.
+    /// Accelerator memory reported by the Worker, when known.
     pub accelerator_memory_bytes: Option<u64>,
-    /// Installed custom nodes, package name to the discovered or
-    /// operator-declared version; `"unknown"` means unavailable.
-    pub custom_nodes: BTreeMap<String, String>,
-    /// Probe results per required backend operation.
+    /// Probe results per required native operation.
     pub probes: BTreeMap<String, bool>,
     /// Content hashes of every Model Version installed for this Pool.
-    pub model_versions: Vec<ContentHash>,
+    pub model_hashes: Vec<ContentHash>,
+    /// Content hashes of every image `LoRA` installed for this Pool.
+    pub image_loras: Vec<ContentHash>,
+    /// Shape limits the Pool advertises for native generation.
+    pub shape_limits: ShapeLimits,
 }
 
 /// Replaces `worker_id`'s Device Pools and their pool-Model rows with the
@@ -386,9 +425,9 @@ pub struct PoolUpsert {
 /// Pools no longer advertised are deleted (cascading to their `pool_models`
 /// rows); Pools that remain keep their surrogate id. Advertised Models not
 /// previously tracked for a Pool are added; Models no longer advertised are
-/// removed; Models that remain keep their `incapable_since` marker untouched,
-/// so a Model proven incapable by a runtime OOM (ADR 0003) stays incapable
-/// across capability reports that still advertise it.
+/// removed. Pool-Model rows carry no failure state: a runtime OOM is scoped to
+/// the Generation that hit it (ADR 0003), so re-advertising never resurrects or
+/// hides capability.
 ///
 /// Deliberately never writes `claimed_slots`/`free_slots`: a Worker's
 /// self-reported free-Slot count raced with Remote's own
@@ -431,22 +470,25 @@ pub async fn upsert_pools(
         let accelerator_memory_bytes = pool
             .accelerator_memory_bytes
             .and_then(|bytes| i64::try_from(bytes).ok());
+        let image_lora_hex: Vec<String> =
+            pool.image_loras.iter().map(ContentHash::to_hex).collect();
 
         let pool_id: Uuid = sqlx::query_scalar(
             "INSERT INTO device_pools \
-                (tenant_id, id, worker_id, pool_key, backend_kind, backend_version, ready, \
+                (tenant_id, id, worker_id, pool_key, accelerator, backend_version, ready, \
                  unready_reason, total_slots, resident_model_sha256, \
-                 accelerator_memory_bytes, custom_nodes, probes, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now()) \
+                 accelerator_memory_bytes, shape_limits, image_lora_sha256, probes, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now()) \
              ON CONFLICT (tenant_id, worker_id, pool_key) DO UPDATE SET \
-                backend_kind = excluded.backend_kind, \
+                accelerator = excluded.accelerator, \
                 backend_version = excluded.backend_version, \
                 ready = excluded.ready, \
                 unready_reason = excluded.unready_reason, \
                 total_slots = excluded.total_slots, \
                 resident_model_sha256 = excluded.resident_model_sha256, \
                 accelerator_memory_bytes = excluded.accelerator_memory_bytes, \
-                custom_nodes = excluded.custom_nodes, \
+                shape_limits = excluded.shape_limits, \
+                image_lora_sha256 = excluded.image_lora_sha256, \
                 probes = excluded.probes, \
                 updated_at = now() \
              RETURNING id",
@@ -455,23 +497,20 @@ pub async fn upsert_pools(
         .bind(DevicePoolId::new().as_uuid())
         .bind(worker_id.as_uuid())
         .bind(&pool.pool_key)
-        .bind(pool.backend_kind.as_str())
-        .bind(&pool.backend_version)
+        .bind(&pool.accelerator)
+        .bind(&pool.accelerator_version)
         .bind(pool.ready)
         .bind(&pool.unready_reason)
         .bind(total_slots)
         .bind(resident_model_sha256)
         .bind(accelerator_memory_bytes)
-        .bind(Json(&pool.custom_nodes))
+        .bind(Json(&pool.shape_limits))
+        .bind(&image_lora_hex)
         .bind(Json(&pool.probes))
         .fetch_one(&mut *conn)
         .await?;
 
-        let model_hex: Vec<String> = pool
-            .model_versions
-            .iter()
-            .map(ContentHash::to_hex)
-            .collect();
+        let model_hex: Vec<String> = pool.model_hashes.iter().map(ContentHash::to_hex).collect();
 
         sqlx::query(
             "DELETE FROM pool_models WHERE tenant_id = $1 AND pool_id = $2 AND NOT (content_sha256 = ANY($3))",
@@ -555,50 +594,21 @@ pub async fn release_slot(
     Ok(())
 }
 
-/// Marks `version_hash` incapable on `pool_id` (ADR 0003): a runtime OOM
-/// proved the Pool cannot host this Model or Workflow Version, or raw prompt
-/// target.
-///
-/// Upserts the `pool_models` row so a target that had not yet been recorded
-/// (e.g. a stale advertisement) is still marked.
-///
-/// # Errors
-/// Returns [`sqlx::Error`] if the upsert fails (e.g. connection lost).
-pub async fn mark_pool_incapable(
-    conn: &mut sqlx::PgConnection,
-    tenant_id: TenantId,
-    pool_id: DevicePoolId,
-    version_hash: ContentHash,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        "INSERT INTO pool_models (tenant_id, pool_id, content_sha256, incapable_since) \
-         VALUES ($1, $2, $3, now()) \
-         ON CONFLICT (tenant_id, pool_id, content_sha256) \
-            DO UPDATE SET incapable_since = COALESCE(pool_models.incapable_since, excluded.incapable_since)",
-    )
-    .bind(tenant_id.as_uuid())
-    .bind(pool_id.as_uuid())
-    .bind(version_hash.to_hex())
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
-}
-
 /// Raw row shape of the `pool_capabilities` query, before domain mapping.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct PoolCapabilityRow {
     pool_id: Uuid,
     worker_id: Uuid,
     pool_key: String,
-    backend_kind: String,
-    backend_version: String,
+    accelerator: String,
+    accelerator_version: String,
     free_slots: i32,
     resident_model_sha256: Option<String>,
     accelerator_memory_bytes: Option<i64>,
-    custom_nodes: Json<BTreeMap<String, String>>,
-    probes: Json<BTreeMap<String, bool>>,
-    capable_models: Vec<String>,
-    incapable_models: Vec<String>,
+    shape_limits: Json<ShapeLimits>,
+    image_lora_sha256: Vec<String>,
+    /// Manifests of this Pool's capable Model Versions, keyed by hex hash.
+    model_manifests: Json<BTreeMap<String, ModelManifest>>,
 }
 
 /// Builds the domain [`SlotCapability`] for one ready Pool from its raw row.
@@ -610,18 +620,23 @@ struct PoolCapabilityRow {
 /// "one Slot-shaped capability plus a free-count" this way.
 fn build_slot_capability(
     tenant_id: TenantId,
-    row: &PoolCapabilityRow,
+    row: PoolCapabilityRow,
 ) -> Result<(SlotCapability, u32, WorkerId, String), sqlx::Error> {
-    let model_versions = row
-        .capable_models
+    let model_manifests = row
+        .model_manifests
+        .0
+        .into_iter()
+        .map(
+            |(hex, manifest)| -> Result<(ContentHash, ModelManifest), sqlx::Error> {
+                Ok((decode_hash(&hex)?, manifest))
+            },
+        )
+        .collect::<Result<BTreeMap<_, _>, sqlx::Error>>()?;
+    let image_loras = row
+        .image_lora_sha256
         .iter()
         .map(|hex| decode_hash(hex))
-        .collect::<Result<_, _>>()?;
-    let incapable_versions = row
-        .incapable_models
-        .iter()
-        .map(|hex| decode_hash(hex))
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<BTreeSet<_>, _>>()?;
     let resident_model = row
         .resident_model_sha256
         .as_deref()
@@ -632,23 +647,22 @@ fn build_slot_capability(
         worker_id: WorkerId::from_uuid(row.worker_id),
         pool_id: DevicePoolId::from_uuid(row.pool_id),
         slot_id: gpq_domain::SlotId::from_uuid(row.pool_id),
-        backend_kind: decode_backend_kind(&row.backend_kind)?,
-        backend_version: row.backend_version.clone(),
-        model_versions,
-        custom_nodes: row.custom_nodes.0.clone(),
+        accelerator: row.accelerator,
+        accelerator_version: row.accelerator_version,
+        model_manifests,
+        image_loras,
         resident_model,
         accelerator_memory_bytes: row
             .accelerator_memory_bytes
             .and_then(|value| u64::try_from(value).ok()),
-        supports_comfy_prompt: row.probes.0.get("comfy_prompt").copied().unwrap_or(false),
-        incapable_versions,
+        shape_limits: row.shape_limits.0,
     };
     let free_slots = u32::try_from(row.free_slots).unwrap_or(0);
     Ok((
         capability,
         free_slots,
         WorkerId::from_uuid(row.worker_id),
-        row.pool_key.clone(),
+        row.pool_key,
     ))
 }
 
@@ -664,9 +678,13 @@ fn build_slot_capability(
 /// session (`WorkerRegistry::is_online`) — a ready row here only reflects
 /// the last capability report, not current connectivity.
 ///
+/// Each capability's `model_manifests` holds every Model Version the Pool
+/// advertises. No runtime failure is persisted as capability: retry decisions
+/// are scoped to the Generation (see `db::attempts`).
+///
 /// # Errors
-/// Returns [`sqlx::Error`] if the query fails, or if a row's content-hash
-/// or backend-kind column cannot be decoded (see
+/// Returns [`sqlx::Error`] if the query fails, or if a row's content hash,
+/// shape-limit, or manifest column cannot be decoded (see
 /// [`build_slot_capability`]).
 pub async fn pool_capabilities(
     conn: &mut sqlx::PgConnection,
@@ -677,82 +695,45 @@ pub async fn pool_capabilities(
             dp.id AS pool_id, \
             dp.worker_id AS worker_id, \
             dp.pool_key AS pool_key, \
-            dp.backend_kind AS backend_kind, \
-            dp.backend_version AS backend_version, \
+            dp.accelerator AS accelerator, \
+            dp.backend_version AS accelerator_version, \
             dp.free_slots AS free_slots, \
             dp.resident_model_sha256 AS resident_model_sha256, \
             dp.accelerator_memory_bytes AS accelerator_memory_bytes, \
-            dp.custom_nodes AS custom_nodes, \
-            dp.probes AS probes, \
-            COALESCE(array_agg(pm.content_sha256) FILTER (WHERE pm.content_sha256 IS NOT NULL AND pm.incapable_since IS NULL), ARRAY[]::text[]) AS capable_models, \
-            COALESCE(array_agg(pm.content_sha256) FILTER (WHERE pm.content_sha256 IS NOT NULL AND pm.incapable_since IS NOT NULL), ARRAY[]::text[]) AS incapable_models \
+            dp.shape_limits AS shape_limits, \
+            dp.image_lora_sha256 AS image_lora_sha256, \
+            COALESCE(( \
+                SELECT jsonb_object_agg(mv.content_sha256, mv.manifest) \
+                FROM pool_models pm \
+                JOIN model_versions mv ON mv.tenant_id = pm.tenant_id AND mv.content_sha256 = pm.content_sha256 \
+                WHERE pm.tenant_id = dp.tenant_id AND pm.pool_id = dp.id \
+            ), '{}'::jsonb) AS model_manifests \
          FROM device_pools dp \
          JOIN workers w ON w.tenant_id = dp.tenant_id AND w.id = dp.worker_id \
-         LEFT JOIN pool_models pm ON pm.tenant_id = dp.tenant_id AND pm.pool_id = dp.id \
-         WHERE dp.tenant_id = $1 AND dp.ready AND w.revoked_at IS NULL \
-         GROUP BY dp.id, dp.worker_id, dp.pool_key, dp.backend_kind, dp.backend_version, \
-                  dp.free_slots, dp.resident_model_sha256, dp.accelerator_memory_bytes, dp.custom_nodes, dp.probes",
+         WHERE dp.tenant_id = $1 AND dp.ready AND w.revoked_at IS NULL",
     )
     .bind(tenant_id.as_uuid())
     .fetch_all(&mut *conn)
     .await?;
 
-    rows.iter()
+    rows.into_iter()
         .map(|row| build_slot_capability(tenant_id, row))
         .collect()
 }
 
-/// Registers Model Versions a Worker advertised, by content hash (ADR 0012).
-///
-/// Existing versions (matched by `(tenant_id, content_sha256)`) are left
-/// untouched: a Model Version's execution limits are fixed at first sight.
-///
-/// # Errors
-/// Returns [`sqlx::Error::Encode`] if an `ExecutionLimits::execution_timeout`
-/// does not fit a Postgres `interval` (see
-/// [`sqlx::postgres::types::PgInterval::try_from`]), or [`sqlx::Error`] if
-/// the insert fails.
-pub async fn register_model_versions(
-    conn: &mut sqlx::PgConnection,
-    tenant_id: TenantId,
-    versions: &[(ContentHash, Modality, ExecutionLimits)],
-) -> sqlx::Result<()> {
-    for (hash, modality, limits) in versions {
-        let execution_timeout = limits
-            .execution_timeout
-            .map(sqlx::postgres::types::PgInterval::try_from)
-            .transpose()
-            .map_err(sqlx::Error::Encode)?;
-        let estimated_vram_bytes = limits
-            .estimated_vram_bytes
-            .and_then(|bytes| i64::try_from(bytes).ok());
-        sqlx::query(
-            "INSERT INTO model_versions (tenant_id, id, content_sha256, modality, execution_timeout, estimated_vram_bytes) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (tenant_id, content_sha256) DO NOTHING",
-        )
-        .bind(tenant_id.as_uuid())
-        .bind(ModelVersionId::new().as_uuid())
-        .bind(hash.to_hex())
-        .bind(modality.as_str())
-        .bind(execution_timeout)
-        .bind(estimated_vram_bytes)
-        .execute(&mut *conn)
-        .await?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
-    use gpq_domain::ContentHash;
-
     use super::*;
 
     fn hash(byte: u8) -> ContentHash {
         ContentHash::from_bytes([byte; 32])
+    }
+
+    fn empty_shape_limits() -> ShapeLimits {
+        let Ok(limits) = serde_json::from_str("{}") else {
+            panic!("an empty object is a valid ShapeLimits");
+        };
+        limits
     }
 
     fn sample_row() -> PoolCapabilityRow {
@@ -760,25 +741,24 @@ mod tests {
             pool_id: Uuid::nil(),
             worker_id: Uuid::nil(),
             pool_key: "gpu-0".to_owned(),
-            backend_kind: "llama_cpp".to_owned(),
-            backend_version: "b1".to_owned(),
+            accelerator: "cuda".to_owned(),
+            accelerator_version: "12.4".to_owned(),
             free_slots: 3,
             resident_model_sha256: Some(hash(1).to_hex()),
             accelerator_memory_bytes: Some(1024),
-            custom_nodes: Json(BTreeMap::new()),
-            probes: Json(BTreeMap::new()),
-            capable_models: vec![hash(1).to_hex()],
-            incapable_models: vec![hash(2).to_hex()],
+            shape_limits: Json(empty_shape_limits()),
+            image_lora_sha256: vec![hash(3).to_hex()],
+            model_manifests: Json(BTreeMap::new()),
         }
     }
 
     #[test]
-    fn builds_slot_capability_with_incapable_versions_split_out() {
+    fn builds_slot_capability_from_the_pool_row() {
         let tenant_id = TenantId::new();
         let row = sample_row();
 
         let Ok((capability, free_slots, worker_id, pool_key)) =
-            build_slot_capability(tenant_id, &row)
+            build_slot_capability(tenant_id, row)
         else {
             panic!("expected a valid capability row");
         };
@@ -786,17 +766,13 @@ mod tests {
         assert_eq!(free_slots, 3);
         assert_eq!(pool_key, "gpu-0");
         assert_eq!(worker_id, WorkerId::from_uuid(Uuid::nil()));
-        assert_eq!(capability.backend_kind, BackendKind::LlamaCpp);
+        assert_eq!(capability.accelerator, "cuda");
+        assert_eq!(capability.accelerator_version, "12.4");
         assert_eq!(capability.resident_model, Some(hash(1)));
         assert_eq!(
-            capability.model_versions,
-            BTreeSet::from([hash(1)]),
-            "capable_models feeds model_versions"
-        );
-        assert_eq!(
-            capability.incapable_versions,
-            BTreeSet::from([hash(2)]),
-            "incapable pool_models rows are split into incapable_versions"
+            capability.image_loras,
+            BTreeSet::from([hash(3)]),
+            "image_lora_sha256 feeds image_loras"
         );
     }
 
@@ -806,19 +782,10 @@ mod tests {
         let mut row = sample_row();
         row.free_slots = -1;
 
-        let Ok((_, free_slots, _, _)) = build_slot_capability(tenant_id, &row) else {
+        let Ok((_, free_slots, _, _)) = build_slot_capability(tenant_id, row) else {
             panic!("expected a valid capability row");
         };
         assert_eq!(free_slots, 0);
-    }
-
-    #[test]
-    fn unknown_backend_kind_is_a_decode_error() {
-        let tenant_id = TenantId::new();
-        let mut row = sample_row();
-        row.backend_kind = "not-a-backend".to_owned();
-
-        assert!(build_slot_capability(tenant_id, &row).is_err());
     }
 
     #[test]

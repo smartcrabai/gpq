@@ -555,7 +555,7 @@ mod tests {
             panic!("EOF must produce a final chunk")
         };
         assert_eq!(chunk.offset, 7);
-        assert!(chunk.data.is_empty());
+        assert_eq!(chunk.data, b"");
         assert!(chunk.last);
         assert!(reader.next_chunk().await.unwrap_or(None).is_none());
     }
@@ -676,7 +676,7 @@ mod tests {
         let Ok(still_fresh) = store.expire(Utc::now(), ttl).await else {
             panic!("expire failed")
         };
-        assert!(still_fresh.is_empty());
+        assert_eq!(still_fresh, Vec::<ArtifactId>::new());
 
         let Ok(past_ttl) = store
             .expire(Utc::now() + chrono::Duration::hours(2), ttl)

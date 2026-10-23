@@ -1,75 +1,97 @@
 edition = "2024";
 
-// Catalog API (ADR 0012): Workers register immutable Model Versions by content
-// hash; Tenant APIs register immutable Workflow graphs and map aliases. Alias
-// deletion or reassignment never mutates versions or past Generations.
+// Catalog API (ADR 0012): Workers advertise immutable Model Versions by
+// content hash; Tenant APIs map model aliases. Alias deletion or reassignment
+// never mutates versions or past Generations.
 package gpq.v1;
 
 import "google/protobuf/duration.proto";
-import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
-import "gpq/v1/common.proto";
 
 option features.field_presence = IMPLICIT;
+
+enum ModelFamily {
+  MODEL_FAMILY_UNSPECIFIED = 0;
+  MODEL_FAMILY_QWEN_IMAGE21 = 1;
+  MODEL_FAMILY_MINIMAX_H3 = 2;
+}
+
+enum ModelAssetRole {
+  MODEL_ASSET_ROLE_UNSPECIFIED = 0;
+  MODEL_ASSET_ROLE_DIFFUSION = 1;
+  MODEL_ASSET_ROLE_TEXT_ENCODER = 2;
+  MODEL_ASSET_ROLE_VISION_ENCODER = 3;
+  MODEL_ASSET_ROLE_VAE = 4;
+  MODEL_ASSET_ROLE_AUDIO_VAE = 5;
+}
+
+message ModelAsset {
+  ModelAssetRole role = 1;
+  string sha256 = 2;
+}
+
+message LoraSelection {
+  string sha256 = 1;
+  float scale = 2;
+}
+
+message SamplingPreset {
+  uint32 steps = 1;
+  float cfg_scale = 2;
+  repeated float sigmas = 3;
+}
+
+message ModelManifest {
+  ModelFamily family = 1;
+  repeated ModelAsset assets = 2;
+  repeated LoraSelection default_loras = 3;
+  SamplingPreset sampling = 4;
+}
+
+message ModelAdvertisement {
+  string version_sha256 = 1;
+  ModelManifest manifest = 2;
+}
+
+message ShapeLimits {
+  uint64 max_image_pixels = 1 [features.field_presence = EXPLICIT];
+  uint64 max_video_pixels = 2 [features.field_presence = EXPLICIT];
+  uint32 max_video_frames = 3 [features.field_presence = EXPLICIT];
+  uint32 max_steps = 4 [features.field_presence = EXPLICIT];
+}
 
 // Exact model material advertised by capable Workers.
 message ModelVersion {
   string content_sha256 = 1;
-  Modality modality = 2;
-  google.protobuf.Duration execution_timeout = 3;
-  uint64 estimated_vram_bytes = 4;
+  google.protobuf.Duration execution_timeout = 3 [features.field_presence = EXPLICIT];
+  uint64 estimated_memory_bytes = 4 [features.field_presence = EXPLICIT];
   // Workers that currently advertise this version and hold an online session.
   uint32 online_worker_count = 5;
   google.protobuf.Timestamp first_seen_at = 6;
-}
-
-// The minimal output and execution manifest Remote stores for a Workflow
-// Version (ADR 0007).
-message WorkflowManifest {
-  string output_node = 1;
-  string output_name = 2;
-  MediaKind artifact_kind = 3;
-  string artifact_mime = 4;
-  // Content hashes of Model Versions the graph loads.
-  repeated string required_model_sha256 = 5;
-  // Custom-node package name to exact installed version (ADR 0018).
-  map<string, string> required_custom_nodes = 6;
-  uint64 estimated_vram_bytes = 7;
-  google.protobuf.Duration execution_timeout = 8;
-}
-
-message WorkflowVersion {
-  string content_sha256 = 1;
-  Modality modality = 2;
-  WorkflowManifest manifest = 3;
-  google.protobuf.Timestamp created_at = 4;
-  // Whether an online Worker satisfies the manifest right now.
-  bool available = 5;
+  ModelManifest manifest = 7;
+  reserved 2;
+  reserved modality, estimated_vram_bytes;
 }
 
 message ModelAlias {
   string alias = 1;
   string content_sha256 = 2;
-  Modality modality = 3;
   bool available = 4;
+  reserved 3;
+  reserved modality;
 }
 
-message WorkflowAlias {
-  string alias = 1;
-  string content_sha256 = 2;
-  Modality modality = 3;
-  bool available = 4;
-}
-
-// A Device Pool's Active Runtime and Execution Slots as last reported.
+// A Device Pool's Active Accelerator and Execution Slots as last reported.
 message PoolSummary {
   string pool_id = 1;
-  BackendKind backend_kind = 2;
   string backend_version = 3;
   uint32 total_slots = 4;
   uint32 free_slots = 5;
   string resident_model_sha256 = 6;
-  uint64 accelerator_memory_bytes = 7;
+  uint64 accelerator_memory_bytes = 7 [features.field_presence = EXPLICIT];
+  string accelerator = 8;
+  reserved 2;
+  reserved backend_kind;
 }
 
 message WorkerSummary {
@@ -80,18 +102,8 @@ message WorkerSummary {
   google.protobuf.Timestamp last_seen_at = 5;
   repeated PoolSummary pools = 6;
   repeated string model_sha256 = 7;
-  map<string, string> custom_nodes = 8;
-}
-
-message RegisterWorkflowVersionRequest {
-  // ComfyUI API-format graph, stored opaquely (ADR 0007).
-  google.protobuf.Struct graph = 1;
-  WorkflowManifest manifest = 2;
-  Modality modality = 3;
-}
-
-message RegisterWorkflowVersionResponse {
-  WorkflowVersion version = 1;
+  reserved 8;
+  reserved custom_nodes;
 }
 
 message SetModelAliasRequest {
@@ -101,15 +113,6 @@ message SetModelAliasRequest {
 
 message SetModelAliasResponse {
   ModelAlias alias = 1;
-}
-
-message SetWorkflowAliasRequest {
-  string alias = 1;
-  string content_sha256 = 2;
-}
-
-message SetWorkflowAliasResponse {
-  WorkflowAlias alias = 1;
 }
 
 message DeleteAliasRequest {
@@ -125,13 +128,6 @@ message ListModelsResponse {
   repeated ModelVersion versions = 2;
 }
 
-message ListWorkflowsRequest {}
-
-message ListWorkflowsResponse {
-  repeated WorkflowAlias aliases = 1;
-  repeated WorkflowVersion versions = 2;
-}
-
 message ListWorkersRequest {}
 
 message ListWorkersResponse {
@@ -139,12 +135,8 @@ message ListWorkersResponse {
 }
 
 service CatalogService {
-  rpc RegisterWorkflowVersion(RegisterWorkflowVersionRequest) returns (RegisterWorkflowVersionResponse);
   rpc SetModelAlias(SetModelAliasRequest) returns (SetModelAliasResponse);
-  rpc SetWorkflowAlias(SetWorkflowAliasRequest) returns (SetWorkflowAliasResponse);
   rpc DeleteModelAlias(DeleteAliasRequest) returns (DeleteAliasResponse);
-  rpc DeleteWorkflowAlias(DeleteAliasRequest) returns (DeleteAliasResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
-  rpc ListWorkflows(ListWorkflowsRequest) returns (ListWorkflowsResponse);
   rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
 }

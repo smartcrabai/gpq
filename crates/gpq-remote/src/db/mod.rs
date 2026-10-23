@@ -12,9 +12,9 @@
 pub mod artifacts;
 pub mod attempts;
 pub mod catalog;
-pub mod comfy;
 pub mod events;
 pub mod generations;
+pub mod native_exclusions;
 pub mod tenants;
 pub mod workers;
 
@@ -32,7 +32,7 @@ use crate::auth::KeyedHasher;
 use crate::config::RemoteConfig;
 
 /// Embedded migrations from `crates/gpq-remote/migrations`, run by
-/// `gpq-remote migrate` and consulted by [`Db::assert_schema_current`].
+/// `gpq remote migrate` and consulted by [`Db::assert_schema_current`].
 pub const MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
 /// Track of applied migrations, matching the table `sqlx::migrate!()` creates.
@@ -172,7 +172,7 @@ impl Db {
             .context("failed to read migration state")?
         {
             bail!(
-                "migration {dirty_version} is dirty (a prior `gpq-remote migrate` run did not \
+                "migration {dirty_version} is dirty (a prior `gpq remote migrate` run did not \
                  complete); repair it before serving"
             );
         }
@@ -185,7 +185,7 @@ impl Db {
         if applied_max != expected_max {
             bail!(
                 "database schema is at version {applied_max:?} but this binary expects \
-                 {expected_max:?}; run `gpq-remote migrate` first"
+                 {expected_max:?}; run `gpq remote migrate` first"
             );
         }
         Ok(())

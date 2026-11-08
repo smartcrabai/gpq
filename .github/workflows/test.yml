@@ -33,7 +33,7 @@ jobs:
           bash scripts/install-spirv-headers.sh "$RUNNER_TEMP/spirv-headers"
 
       - name: Install buf
-        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1
+        uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1
         with:
           setup_only: true
 
@@ -71,7 +71,7 @@ jobs:
         run: taplo fmt --check --option reorder_keys=true Cargo.toml crates/*/Cargo.toml
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: gpq-ci
           add-job-id-key: false
@@ -124,7 +124,7 @@ jobs:
           bash scripts/install-spirv-headers.sh "$RUNNER_TEMP/spirv-headers"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: gpq-ci
           add-job-id-key: false
@@ -157,7 +157,7 @@ jobs:
           bash scripts/install-spirv-headers.sh "$RUNNER_TEMP/spirv-headers"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: gpq-ci
           add-job-id-key: false

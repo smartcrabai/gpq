@@ -672,7 +672,7 @@ fn pool_advertisement(data: &PoolAdvertisementData) -> PoolAdvertisement {
         slots.push(SlotAdvertisement {
             slot_id: format!("{}-slot-{index}", data.pool_key),
             busy: busy_attempt.is_some(),
-            attempt_id: busy_attempt.map(|id| id.to_string()).unwrap_or_default(),
+            attempt_id: busy_attempt.map_or_else(String::new, |id| id.to_string()),
             ..Default::default()
         });
     }
@@ -723,8 +723,7 @@ fn lease_ttl_chrono() -> chrono::Duration {
 
 fn live_attempt_ids(live: &LiveAttempts) -> Vec<AttemptId> {
     live.lock()
-        .map(|guard| guard.keys().copied().collect())
-        .unwrap_or_default()
+        .map_or_else(|_| Vec::new(), |guard| guard.keys().copied().collect())
 }
 
 /// Optimistically renews every live Attempt's locally-tracked lease expiry

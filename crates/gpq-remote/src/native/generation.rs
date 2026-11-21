@@ -596,8 +596,7 @@ impl GenerationService for GenerationApi {
 
         let next_page_token = if rows.len() == page_size as usize {
             rows.last()
-                .map(|row| row.id.to_string())
-                .unwrap_or_default()
+                .map_or_else(String::new, |row| row.id.to_string())
         } else {
             String::new()
         };

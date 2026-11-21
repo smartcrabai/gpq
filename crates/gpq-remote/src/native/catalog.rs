@@ -310,8 +310,7 @@ impl CatalogService for CatalogApi {
                     free_slots: pool.free_slots,
                     resident_model_sha256: pool
                         .resident_model_sha256
-                        .map(|hash| hash.to_hex())
-                        .unwrap_or_default(),
+                        .map_or_else(String::new, |hash| hash.to_hex()),
                     accelerator_memory_bytes: pool.accelerator_memory_bytes,
                     ..Default::default()
                 });

@@ -163,6 +163,11 @@ targets = [
   "x86_64-pc-windows-msvc",
   "aarch64-pc-windows-msvc",
 ]
+
+[workspace.metadata.dist.github-custom-runners.global]
+host = "x86_64-unknown-linux-gnu"
+runner = "ubuntu-26.04"
+
 # The ARM64 MSVC build needs the Windows SDK and the x64-hosted MSVC
 # import-library generation in build-setup.yml; build it on Windows, not xwin.
 [workspace.metadata.dist.github-custom-runners.aarch64-pc-windows-msvc]
